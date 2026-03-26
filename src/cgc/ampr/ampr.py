@@ -194,6 +194,12 @@ class AMPR(AMPRBase):
     def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the AMPR device."""
         try:
+            if self.connected:
+                self.logger.info(
+                    f"AMPR device {self.device_id} is already connected; skipping open_port"
+                )
+                return True
+
             self.logger.info(f"Connecting to AMPR device {self.device_id} on COM{self.com}")
 
             open_port = super().open_port
@@ -271,14 +277,25 @@ class AMPR(AMPRBase):
 
     def initialize(self, timeout_s: float = 5.0, poll_s: float = 0.2) -> None:
         """Run the recommended AMPR startup sequence."""
-        self.connect(timeout_s=timeout_s)
-        psu_enabled = False
-
         get_scanned_module_state = super().get_scanned_module_state
         rescan_modules = super().rescan_modules
         set_scanned_module_state = super().set_scanned_module_state
         enable_psu = super().enable_psu
         get_state = super().get_state
+        psu_enabled = False
+
+        if self.connected:
+            status, _, state = self._call_locked_with_timeout(
+                get_state, timeout_s, "get_state_before_initialize"
+            )
+            if status == self.NO_ERR and state == "ST_ON":
+                self.logger.info(
+                    f"AMPR device {self.device_id} is already initialized (ST_ON); "
+                    "skipping startup sequence"
+                )
+                return
+        else:
+            self.connect(timeout_s=timeout_s)
 
         try:
             status, mismatch, rating_failure = self._call_locked_with_timeout(

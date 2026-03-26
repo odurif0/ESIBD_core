@@ -50,6 +50,14 @@ def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     dll.COM_AMPR_12_Close.assert_called_once()
 
 
+def test_connect_is_noop_when_already_connected(monkeypatch):
+    ampr, dll = make_ampr(monkeypatch)
+    ampr.connected = True
+
+    assert ampr.connect() is True
+    dll.COM_AMPR_12_Open.assert_not_called()
+
+
 def test_connect_times_out_when_open_port_blocks(monkeypatch):
     ampr, _dll = make_ampr(monkeypatch)
 
@@ -116,6 +124,27 @@ def test_initialize_disables_psu_before_disconnect_on_failure(monkeypatch):
 
     assert enable_calls == [True, False]
     ampr.disconnect.assert_called_once()
+
+
+def test_initialize_is_noop_when_already_on(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    ampr.connected = True
+
+    monkeypatch.setattr(ampr, "connect", Mock(side_effect=AssertionError("connect should not be called")))
+
+    state_calls = []
+
+    def fake_locked_timeout(_method, _timeout_s, step_name, *args, **kwargs):
+        state_calls.append(step_name)
+        if step_name == "get_state_before_initialize":
+            return ampr.NO_ERR, 0, "ST_ON"
+        raise AssertionError(f"Unexpected step: {step_name}")
+
+    monkeypatch.setattr(ampr, "_call_locked_with_timeout", fake_locked_timeout)
+
+    ampr.initialize(timeout_s=0.01, poll_s=0.001)
+
+    assert state_calls == ["get_state_before_initialize"]
 
 
 def test_initialize_timeout_poisoned_transport_disconnects(monkeypatch):
