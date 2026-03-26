@@ -14,7 +14,7 @@ Current implemented instrument:
 
 ## Repository Layout
 
-- `src/cgc/`: driver packages grouped by manufacturer
+- `src/<manufacturer>/`: driver packages for each manufacturer
 - `tests/`: regression tests
 - `examples/`: small usage examples
 
