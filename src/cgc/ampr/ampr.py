@@ -156,19 +156,23 @@ class AMPR(AMPRBase):
         """Connect to the AMPR device."""
         try:
             self.logger.info(f"Connecting to AMPR device {self.device_id} on COM{self.com}")
-            
+
+            open_port = super().open_port
+            set_baud_rate = super().set_baud_rate
+            close_port = super().close_port
+
             status = self._call_with_timeout(
-                lambda: self._call_locked(super().open_port, self.com),
+                lambda: self._call_locked(open_port, self.com),
                 timeout_s,
                 "open_port",
             )
-            
+
             if status == self.NO_ERR:
                 self.connected = True
                 self.logger.info(f"Successfully connected to AMPR device {self.device_id}")
-                
+
                 baud_status, actual_baud = self._call_with_timeout(
-                    lambda: self._call_locked(super().set_baud_rate, self.baudrate),
+                    lambda: self._call_locked(set_baud_rate, self.baudrate),
                     timeout_s,
                     "set_baud_rate",
                 )
@@ -178,7 +182,7 @@ class AMPR(AMPRBase):
 
                 self.logger.error(f"Failed to set baud rate: {baud_status}")
                 close_status = self._call_with_timeout(
-                    lambda: self._call_locked(super().close_port),
+                    lambda: self._call_locked(close_port),
                     timeout_s,
                     "close_port",
                 )
