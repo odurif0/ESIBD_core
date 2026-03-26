@@ -15,7 +15,6 @@ Python driver for the CGC AMPR unit.
 
 - `ampr_base.py`: low-level DLL wrapper
 - `ampr.py`: high-level AMPR API
-- `helpers.py`: startup/shutdown helpers
 - `vendor/`: vendor-provided DLL and header
 
 ## Platform

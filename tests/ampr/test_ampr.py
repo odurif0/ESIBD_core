@@ -4,7 +4,6 @@ from unittest.mock import Mock
 import pytest
 
 from cgc.ampr import AMPR, AMPRBase, AMPRDllLoadError, AMPRPlatformError
-from cgc.ampr.helpers import initialize_ampr
 
 
 ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "src" / "cgc" / "error_codes.json"
@@ -57,14 +56,34 @@ def test_disconnect_marks_instance_disconnected_even_on_close_failure(monkeypatc
     assert ampr.connected is False
 
 
-def test_initialize_ampr_disconnects_on_failure():
+def test_initialize_disconnects_on_failure():
     ampr = Mock()
     ampr.NO_ERR = 0
     ampr.connect.return_value = True
     ampr.get_scanned_module_state.return_value = (0, False, False)
     ampr.enable_psu.return_value = (-1, False)
+    ampr._call_with_timeout.side_effect = lambda func, *_args: func()
 
     with pytest.raises(RuntimeError, match="enable_psu"):
-        initialize_ampr(ampr)
+        AMPR.initialize(ampr)
+
+    ampr.disconnect.assert_called_once()
+
+
+def test_initialize_times_out_and_disconnects():
+    ampr = Mock()
+    ampr.NO_ERR = 0
+    ampr.connect.return_value = True
+
+    def fake_timeout(_func, timeout_s, step_name):
+        raise RuntimeError(
+            f"AMPR initialization timed out during '{step_name}'. "
+            "The device may be powered off or unresponsive."
+        )
+
+    ampr._call_with_timeout.side_effect = fake_timeout
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        AMPR.initialize(ampr, timeout_s=0.01, poll_s=0.001)
 
     ampr.disconnect.assert_called_once()

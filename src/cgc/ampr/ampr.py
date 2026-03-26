@@ -6,7 +6,9 @@ devices via the AMPR base hardware interface with added logging functionality.
 """
 from typing import Optional
 import logging
+import queue
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -119,6 +121,32 @@ class AMPR(AMPRBase):
 
         super().__init__(com=com, log=None, idn=device_id, dll_path=dll_path)
 
+    @staticmethod
+    def _call_with_timeout(func, timeout_s, step_name):
+        """Run a potentially blocking call with a hard timeout."""
+        result_queue = queue.Queue(maxsize=1)
+
+        def runner():
+            try:
+                result_queue.put(("result", func()))
+            except Exception as exc:  # pragma: no cover - forwarded to caller
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+        thread.join(timeout_s)
+
+        if thread.is_alive():
+            raise RuntimeError(
+                f"AMPR initialization timed out during '{step_name}'. "
+                "The device may be powered off or unresponsive."
+            )
+
+        kind, payload = result_queue.get()
+        if kind == "error":
+            raise payload
+        return payload
+
     def _call_locked(self, method, *args, **kwargs):
         """Serialize DLL access through the shared communication lock."""
         with self.thread_lock:
@@ -188,15 +216,67 @@ class AMPR(AMPRBase):
 
     def initialize(self, timeout_s: float = 5.0, poll_s: float = 0.2) -> None:
         """Run the recommended AMPR startup sequence."""
-        from .helpers import initialize_ampr
+        if not self.connect():
+            raise RuntimeError("AMPR connection failed")
 
-        initialize_ampr(self, timeout_s=timeout_s, poll_s=poll_s)
+        try:
+            status, mismatch, rating_failure = self._call_with_timeout(
+                self.get_scanned_module_state, timeout_s, "get_scanned_module_state"
+            )
+            if status != self.NO_ERR:
+                raise RuntimeError(f"Unable to read scanned module state: {status}")
+
+            if mismatch or rating_failure:
+                status = self._call_with_timeout(
+                    self.rescan_modules, timeout_s, "rescan_modules"
+                )
+                if status != self.NO_ERR:
+                    raise RuntimeError(f"AMPR rescan failed: {status}")
+
+                status = self._call_with_timeout(
+                    self.set_scanned_module_state, timeout_s, "set_scanned_module_state"
+                )
+                if status != self.NO_ERR:
+                    raise RuntimeError(f"AMPR set scanned module state failed: {status}")
+
+            status, _ = self._call_with_timeout(
+                lambda: self.enable_psu(True), timeout_s, "enable_psu"
+            )
+            if status != self.NO_ERR:
+                raise RuntimeError(f"AMPR enable_psu failed: {status}")
+
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                status, _, state = self._call_with_timeout(
+                    self.get_state, timeout_s, "get_state"
+                )
+                if status == self.NO_ERR and state == "ST_ON":
+                    return
+                time.sleep(poll_s)
+
+            raise RuntimeError("AMPR did not reach ST_ON")
+        except Exception:
+            self.disconnect()
+            raise
 
     def shutdown(self) -> None:
         """Run the recommended AMPR shutdown sequence."""
-        from .helpers import shutdown_ampr
+        modules = self.scan_modules()
 
-        shutdown_ampr(self)
+        for module in modules:
+            for channel in range(1, 5):
+                status = self.set_module_voltage(module, channel, 0.0)
+                if status != self.NO_ERR:
+                    raise RuntimeError(
+                        f"Failed to set AMPR module {module} channel {channel} to 0 V: {status}"
+                    )
+
+        status, _ = self.enable_psu(False)
+        if status != self.NO_ERR:
+            raise RuntimeError(f"AMPR disable_psu failed: {status}")
+
+        if not self.disconnect():
+            raise RuntimeError("AMPR disconnect failed")
 
     def _hk_worker(self):
         """
