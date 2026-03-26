@@ -152,26 +152,36 @@ class AMPR(AMPRBase):
         with self.thread_lock:
             return method(*args, **kwargs)
 
-    def connect(self) -> bool:
+    def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the AMPR device."""
         try:
             self.logger.info(f"Connecting to AMPR device {self.device_id} on COM{self.com}")
             
-            status = self._call_locked(super().open_port, self.com)
+            status = self._call_with_timeout(
+                lambda: self._call_locked(super().open_port, self.com),
+                timeout_s,
+                "open_port",
+            )
             
             if status == self.NO_ERR:
                 self.connected = True
                 self.logger.info(f"Successfully connected to AMPR device {self.device_id}")
                 
-                baud_status, actual_baud = self._call_locked(
-                    super().set_baud_rate, self.baudrate
+                baud_status, actual_baud = self._call_with_timeout(
+                    lambda: self._call_locked(super().set_baud_rate, self.baudrate),
+                    timeout_s,
+                    "set_baud_rate",
                 )
                 if baud_status == self.NO_ERR:
                     self.logger.info(f"Baud rate set to {actual_baud}")
                     return True
 
                 self.logger.error(f"Failed to set baud rate: {baud_status}")
-                close_status = self._call_locked(super().close_port)
+                close_status = self._call_with_timeout(
+                    lambda: self._call_locked(super().close_port),
+                    timeout_s,
+                    "close_port",
+                )
                 if close_status != self.NO_ERR:
                     self.logger.warning(
                         f"AMPR port rollback after baud-rate failure also failed: {close_status}"
@@ -216,7 +226,7 @@ class AMPR(AMPRBase):
 
     def initialize(self, timeout_s: float = 5.0, poll_s: float = 0.2) -> None:
         """Run the recommended AMPR startup sequence."""
-        if not self.connect():
+        if not self.connect(timeout_s=timeout_s):
             raise RuntimeError("AMPR connection failed")
 
         try:

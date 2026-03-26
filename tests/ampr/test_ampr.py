@@ -43,6 +43,25 @@ def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     dll.COM_AMPR_12_Close.assert_called_once()
 
 
+def test_connect_times_out_when_open_port_blocks(monkeypatch):
+    monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
+    dll = Mock()
+    monkeypatch.setattr("cgc.ampr.ampr_base.ctypes.WinDLL", lambda _path: dll)
+
+    ampr = AMPR("ampr_test", com=5)
+
+    def fake_timeout(_func, timeout_s, step_name):
+        raise RuntimeError(
+            f"AMPR initialization timed out during '{step_name}'. "
+            "The device may be powered off or unresponsive."
+        )
+
+    ampr._call_with_timeout = fake_timeout
+
+    assert ampr.connect(timeout_s=0.01) is False
+    assert ampr.connected is False
+
+
 def test_disconnect_marks_instance_disconnected_even_on_close_failure(monkeypatch):
     monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
     dll = Mock()
