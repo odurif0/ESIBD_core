@@ -26,7 +26,6 @@ def main() -> None:
 
         print(f"Setting module {module} channel {channel} to {test_voltage} V")
         ampr.set_module_voltage(module, channel, test_voltage)
-        time.sleep(wait_s)
 
         print(f"Voltages after setting channel {channel}:")
         print(ampr.get_module_voltages(module))
