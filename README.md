@@ -37,3 +37,9 @@ pip install -e .
 ```powershell
 pip install -e git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
 ```
+
+## Updating
+
+```powershell
+pip install -U git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
+```
