@@ -1,4 +1,5 @@
 from pathlib import Path
+import tempfile
 from unittest.mock import Mock
 
 import pytest
@@ -13,7 +14,8 @@ def make_ampr(monkeypatch):
     monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
     dll = Mock()
     monkeypatch.setattr("cgc.ampr.ampr_base.ctypes.WinDLL", lambda _path: dll, raising=False)
-    return AMPR("ampr_test", com=5, log_dir=Path("/tmp/esibd_core_test_logs")), dll
+    log_dir = Path(tempfile.gettempdir()) / "esibd_core_test_logs"
+    return AMPR("ampr_test", com=5, log_dir=log_dir), dll
 
 
 def test_ampr_base_rejects_non_windows(monkeypatch):
