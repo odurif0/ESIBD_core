@@ -24,21 +24,13 @@ Current implemented instrument:
 
 ## Installation
 
-### From a local clone
-
-```powershell
-git clone https://github.com/odurif0/ESIBD_core.git
-cd ESIBD_core
-pip install -e .
-```
-
-### Directly from GitHub
+### Install
 
 ```powershell
 pip install -e git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
 ```
 
-## Updating
+### Update
 
 ```powershell
 pip install -U git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
