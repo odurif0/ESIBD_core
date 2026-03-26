@@ -187,16 +187,16 @@ class AMPR(AMPRBase):
                         f"AMPR port rollback after baud-rate failure also failed: {close_status}"
                     )
                 self.connected = False
-                return False
+                raise RuntimeError(f"AMPR set_baud_rate failed: {baud_status}")
 
             self.logger.error(f"Failed to connect to AMPR device {self.device_id}: {status}")
             self.connected = False
-            return False
+            raise RuntimeError(f"AMPR open_port failed: {status}")
                 
         except Exception as e:
             self.logger.error(f"Connection error: {e}")
             self.connected = False
-            return False
+            raise
 
     def disconnect(self) -> bool:
         """Disconnect from the AMPR device."""
@@ -226,8 +226,7 @@ class AMPR(AMPRBase):
 
     def initialize(self, timeout_s: float = 5.0, poll_s: float = 0.2) -> None:
         """Run the recommended AMPR startup sequence."""
-        if not self.connect(timeout_s=timeout_s):
-            raise RuntimeError("AMPR connection failed")
+        self.connect(timeout_s=timeout_s)
 
         try:
             status, mismatch, rating_failure = self._call_with_timeout(

@@ -38,7 +38,9 @@ def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
 
     ampr = AMPR("ampr_test", com=5)
 
-    assert ampr.connect() is False
+    with pytest.raises(RuntimeError, match="set_baud_rate failed"):
+        ampr.connect()
+
     assert ampr.connected is False
     dll.COM_AMPR_12_Close.assert_called_once()
 
@@ -58,7 +60,9 @@ def test_connect_times_out_when_open_port_blocks(monkeypatch):
 
     ampr._call_with_timeout = fake_timeout
 
-    assert ampr.connect(timeout_s=0.01) is False
+    with pytest.raises(RuntimeError, match="timed out"):
+        ampr.connect(timeout_s=0.01)
+
     assert ampr.connected is False
 
 
