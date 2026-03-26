@@ -27,11 +27,11 @@ Current implemented instrument:
 ### Install
 
 ```powershell
-pip install -e git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
+python -m pip install --no-cache-dir git+https://github.com/odurif0/ESIBD_core.git
 ```
 
 ### Update
 
 ```powershell
-pip install -U git+https://github.com/odurif0/ESIBD_core.git#egg=esibd-core
+python -m pip install --force-reinstall --no-cache-dir git+https://github.com/odurif0/ESIBD_core.git
 ```

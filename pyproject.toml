@@ -19,6 +19,10 @@ dev = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+cgc = ["error_codes.json"]
+"cgc.ampr" = ["vendor/COM-AMPR-12.h", "vendor/x64/COM-AMPR-12.dll", "README.md"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
