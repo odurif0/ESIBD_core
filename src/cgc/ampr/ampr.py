@@ -64,6 +64,8 @@ class AMPR(AMPRBase):
         
         # Connection status
         self.connected = False
+        self._transport_poisoned = False
+        self._transport_error = None
         
         # Housekeeping setup
         self.hk_running = False
@@ -121,14 +123,44 @@ class AMPR(AMPRBase):
 
         super().__init__(com=com, log=None, idn=device_id, dll_path=dll_path)
 
-    @staticmethod
-    def _call_with_timeout(func, timeout_s, step_name):
-        """Run a potentially blocking call with a hard timeout."""
+    def _raise_if_transport_poisoned(self):
+        """Refuse further DLL access after a timed-out native call."""
+        if self._transport_poisoned:
+            detail = self._transport_error or "unknown transport failure"
+            raise RuntimeError(
+                "AMPR transport is unusable after a timed-out DLL call. "
+                f"{detail} Recreate the AMPR instance before retrying."
+            )
+
+    def _poison_transport(self, step_name):
+        """Mark the DLL transport unusable after a timed-out native call."""
+        self._transport_poisoned = True
+        self._transport_error = (
+            f"Timed out during '{step_name}'. "
+            "The device may be powered off or unresponsive."
+        )
+        self.connected = False
+
+    def _call_locked_with_timeout(self, method, timeout_s, step_name, *args, **kwargs):
+        """
+        Serialize a DLL call and fail fast if it blocks too long.
+
+        If the native call times out, the transport is marked unusable and the
+        AMPR instance must be recreated before any further hardware access.
+        """
+        self._raise_if_transport_poisoned()
+
+        if not self.thread_lock.acquire(timeout=timeout_s):
+            raise RuntimeError(
+                f"AMPR transport lock timed out during '{step_name}'. "
+                "A previous DLL call may still be blocked."
+            )
+
         result_queue = queue.Queue(maxsize=1)
 
         def runner():
             try:
-                result_queue.put(("result", func()))
+                result_queue.put(("result", method(*args, **kwargs)))
             except Exception as exc:  # pragma: no cover - forwarded to caller
                 result_queue.put(("error", exc))
 
@@ -136,20 +168,27 @@ class AMPR(AMPRBase):
         thread.start()
         thread.join(timeout_s)
 
-        if thread.is_alive():
-            raise RuntimeError(
-                f"AMPR initialization timed out during '{step_name}'. "
-                "The device may be powered off or unresponsive."
-            )
+        try:
+            if thread.is_alive():
+                self._poison_transport(step_name)
+                raise RuntimeError(
+                    f"AMPR DLL call timed out during '{step_name}'. "
+                    "The device may be powered off or unresponsive. "
+                    "The AMPR instance is now marked unusable."
+                )
 
-        kind, payload = result_queue.get()
-        if kind == "error":
-            raise payload
-        return payload
+            kind, payload = result_queue.get()
+            if kind == "error":
+                raise payload
+            return payload
+        finally:
+            self.thread_lock.release()
 
     def _call_locked(self, method, *args, **kwargs):
         """Serialize DLL access through the shared communication lock."""
+        self._raise_if_transport_poisoned()
         with self.thread_lock:
+            self._raise_if_transport_poisoned()
             return method(*args, **kwargs)
 
     def connect(self, timeout_s: float = 5.0) -> bool:
@@ -161,30 +200,24 @@ class AMPR(AMPRBase):
             set_baud_rate = super().set_baud_rate
             close_port = super().close_port
 
-            status = self._call_with_timeout(
-                lambda: self._call_locked(open_port, self.com),
-                timeout_s,
-                "open_port",
+            status = self._call_locked_with_timeout(
+                open_port, timeout_s, "open_port", self.com
             )
 
             if status == self.NO_ERR:
                 self.connected = True
                 self.logger.info(f"Successfully connected to AMPR device {self.device_id}")
 
-                baud_status, actual_baud = self._call_with_timeout(
-                    lambda: self._call_locked(set_baud_rate, self.baudrate),
-                    timeout_s,
-                    "set_baud_rate",
+                baud_status, actual_baud = self._call_locked_with_timeout(
+                    set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
                 )
                 if baud_status == self.NO_ERR:
                     self.logger.info(f"Baud rate set to {actual_baud}")
                     return True
 
                 self.logger.error(f"Failed to set baud rate: {baud_status}")
-                close_status = self._call_with_timeout(
-                    lambda: self._call_locked(close_port),
-                    timeout_s,
-                    "close_port",
+                close_status = self._call_locked_with_timeout(
+                    close_port, timeout_s, "close_port"
                 )
                 if close_status != self.NO_ERR:
                     self.logger.warning(
@@ -208,6 +241,14 @@ class AMPR(AMPRBase):
             self.stop_housekeeping()
             
             self.logger.info(f"Disconnecting AMPR device {self.device_id}")
+
+            if self._transport_poisoned:
+                self.connected = False
+                self.logger.error(
+                    "Skipping AMPR close_port because the transport is unusable "
+                    "after a timed-out DLL call. Recreate the AMPR instance."
+                )
+                return False
             
             status = self._call_locked(super().close_port)
             
@@ -231,37 +272,45 @@ class AMPR(AMPRBase):
     def initialize(self, timeout_s: float = 5.0, poll_s: float = 0.2) -> None:
         """Run the recommended AMPR startup sequence."""
         self.connect(timeout_s=timeout_s)
+        psu_enabled = False
+
+        get_scanned_module_state = super().get_scanned_module_state
+        rescan_modules = super().rescan_modules
+        set_scanned_module_state = super().set_scanned_module_state
+        enable_psu = super().enable_psu
+        get_state = super().get_state
 
         try:
-            status, mismatch, rating_failure = self._call_with_timeout(
-                self.get_scanned_module_state, timeout_s, "get_scanned_module_state"
+            status, mismatch, rating_failure = self._call_locked_with_timeout(
+                get_scanned_module_state, timeout_s, "get_scanned_module_state"
             )
             if status != self.NO_ERR:
                 raise RuntimeError(f"Unable to read scanned module state: {status}")
 
             if mismatch or rating_failure:
-                status = self._call_with_timeout(
-                    self.rescan_modules, timeout_s, "rescan_modules"
+                status = self._call_locked_with_timeout(
+                    rescan_modules, timeout_s, "rescan_modules"
                 )
                 if status != self.NO_ERR:
                     raise RuntimeError(f"AMPR rescan failed: {status}")
 
-                status = self._call_with_timeout(
-                    self.set_scanned_module_state, timeout_s, "set_scanned_module_state"
+                status = self._call_locked_with_timeout(
+                    set_scanned_module_state, timeout_s, "set_scanned_module_state"
                 )
                 if status != self.NO_ERR:
                     raise RuntimeError(f"AMPR set scanned module state failed: {status}")
 
-            status, _ = self._call_with_timeout(
-                lambda: self.enable_psu(True), timeout_s, "enable_psu"
+            status, enabled = self._call_locked_with_timeout(
+                enable_psu, timeout_s, "enable_psu", True
             )
             if status != self.NO_ERR:
                 raise RuntimeError(f"AMPR enable_psu failed: {status}")
+            psu_enabled = bool(enabled)
 
             deadline = time.time() + timeout_s
             while time.time() < deadline:
-                status, _, state = self._call_with_timeout(
-                    self.get_state, timeout_s, "get_state"
+                status, _, state = self._call_locked_with_timeout(
+                    get_state, timeout_s, "get_state"
                 )
                 if status == self.NO_ERR and state == "ST_ON":
                     return
@@ -269,6 +318,31 @@ class AMPR(AMPRBase):
 
             raise RuntimeError("AMPR did not reach ST_ON")
         except Exception:
+            if psu_enabled:
+                if self._transport_poisoned:
+                    self.logger.critical(
+                        "AMPR initialization failed after enabling the PSU, and the "
+                        "transport is now unusable. Manually verify that the hardware "
+                        "is in a safe state before continuing."
+                    )
+                else:
+                    try:
+                        disable_status, _ = self._call_locked_with_timeout(
+                            enable_psu,
+                            timeout_s,
+                            "disable_psu_after_initialize_failure",
+                            False,
+                        )
+                        if disable_status != self.NO_ERR:
+                            self.logger.error(
+                                "AMPR cleanup failed to disable PSU after initialization "
+                                f"error: {disable_status}"
+                            )
+                    except Exception as cleanup_error:
+                        self.logger.error(
+                            "AMPR cleanup failed while disabling PSU after initialization "
+                            f"error: {cleanup_error}"
+                        )
             self.disconnect()
             raise
 
@@ -566,6 +640,7 @@ class AMPR(AMPRBase):
             "com": self.com,
             "baudrate": self.baudrate,
             "connected": self.connected,
+            "transport_poisoned": self._transport_poisoned,
             "hk_running": self.hk_running,
             "hk_interval": self.hk_interval,
             "external_thread": self.external_thread,
@@ -610,6 +685,18 @@ class AMPR(AMPRBase):
         except Exception as e:
             self.logger.error(f"Error restarting device: {e}")
             raise
+
+    def get_scanned_module_state(self):
+        """Get the scanned module state through the shared DLL lock."""
+        return self._call_locked(super().get_scanned_module_state)
+
+    def rescan_modules(self):
+        """Rescan module addresses through the shared DLL lock."""
+        return self._call_locked(super().rescan_modules)
+
+    def set_scanned_module_state(self):
+        """Persist the current module scan through the shared DLL lock."""
+        return self._call_locked(super().set_scanned_module_state)
 
     # Module management convenience methods with logging
     
