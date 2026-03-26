@@ -149,14 +149,21 @@ class AMPR(AMPRBase):
         AMPR instance must be recreated before any further hardware access.
         """
         self._raise_if_transport_poisoned()
-
-        if not self.thread_lock.acquire(timeout=timeout_s):
-            raise RuntimeError(
-                f"AMPR transport lock timed out during '{step_name}'. "
-                "A previous DLL call may still be blocked."
-            )
+        lock_deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = lock_deadline - time.monotonic()
+            if remaining <= 0:
+                self._raise_if_transport_poisoned()
+                raise RuntimeError(
+                    f"AMPR transport lock timed out during '{step_name}'. "
+                    "A previous DLL call may still be blocked."
+                )
+            if self.thread_lock.acquire(timeout=min(0.1, remaining)):
+                break
+            self._raise_if_transport_poisoned()
 
         result_queue = queue.Queue(maxsize=1)
+        release_lock = True
 
         def runner():
             try:
@@ -171,6 +178,7 @@ class AMPR(AMPRBase):
         try:
             if thread.is_alive():
                 self._poison_transport(step_name)
+                release_lock = False
                 raise RuntimeError(
                     f"AMPR DLL call timed out during '{step_name}'. "
                     "The device may be powered off or unresponsive. "
@@ -182,14 +190,20 @@ class AMPR(AMPRBase):
                 raise payload
             return payload
         finally:
-            self.thread_lock.release()
+            if release_lock:
+                self.thread_lock.release()
 
     def _call_locked(self, method, *args, **kwargs):
         """Serialize DLL access through the shared communication lock."""
         self._raise_if_transport_poisoned()
-        with self.thread_lock:
+        while True:
+            if self.thread_lock.acquire(timeout=0.1):
+                try:
+                    self._raise_if_transport_poisoned()
+                    return method(*args, **kwargs)
+                finally:
+                    self.thread_lock.release()
             self._raise_if_transport_poisoned()
-            return method(*args, **kwargs)
 
     def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the AMPR device."""
@@ -283,21 +297,22 @@ class AMPR(AMPRBase):
         enable_psu = super().enable_psu
         get_state = super().get_state
         psu_enabled = False
-
-        if self.connected:
-            status, _, state = self._call_locked_with_timeout(
-                get_state, timeout_s, "get_state_before_initialize"
-            )
-            if status == self.NO_ERR and state == "ST_ON":
-                self.logger.info(
-                    f"AMPR device {self.device_id} is already initialized (ST_ON); "
-                    "skipping startup sequence"
-                )
-                return
-        else:
-            self.connect(timeout_s=timeout_s)
+        was_connected = self.connected
 
         try:
+            if self.connected:
+                status, _, state = self._call_locked_with_timeout(
+                    get_state, timeout_s, "get_state_before_initialize"
+                )
+                if status == self.NO_ERR and state == "ST_ON":
+                    self.logger.info(
+                        f"AMPR device {self.device_id} is already initialized (ST_ON); "
+                        "skipping startup sequence"
+                    )
+                    return
+            else:
+                self.connect(timeout_s=timeout_s)
+
             status, mismatch, rating_failure = self._call_locked_with_timeout(
                 get_scanned_module_state, timeout_s, "get_scanned_module_state"
             )
@@ -360,7 +375,8 @@ class AMPR(AMPRBase):
                             "AMPR cleanup failed while disabling PSU after initialization "
                             f"error: {cleanup_error}"
                         )
-            self.disconnect()
+            if was_connected or self.connected or self._transport_poisoned:
+                self.disconnect()
             raise
 
     def shutdown(self) -> None:

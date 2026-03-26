@@ -1,5 +1,6 @@
 from pathlib import Path
 import tempfile
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -78,6 +79,20 @@ def test_connect_times_out_when_open_port_blocks(monkeypatch):
     assert ampr._transport_poisoned is True
 
 
+def test_timeout_poison_keeps_lock_abandoned_and_blocks_reuse(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    blocker = threading.Event()
+
+    with pytest.raises(RuntimeError, match="marked unusable"):
+        ampr._call_locked_with_timeout(blocker.wait, 0.01, "blocked_call", 1.0)
+
+    assert ampr._transport_poisoned is True
+    assert ampr.thread_lock.acquire(blocking=False) is False
+
+    with pytest.raises(RuntimeError, match="transport is unusable"):
+        ampr._call_locked(lambda: None)
+
+
 def test_disconnect_marks_instance_disconnected_even_on_close_failure(monkeypatch):
     ampr, dll = make_ampr(monkeypatch)
     dll.COM_AMPR_12_Close.return_value = AMPRBase.ERR_CLOSE
@@ -101,7 +116,11 @@ def test_initialize_disables_psu_before_disconnect_on_failure(monkeypatch):
     ampr, _dll = make_ampr(monkeypatch)
     enable_calls = []
 
-    monkeypatch.setattr(ampr, "connect", Mock(return_value=True))
+    def fake_connect(**kwargs):
+        ampr.connected = True
+        return True
+
+    monkeypatch.setattr(ampr, "connect", Mock(side_effect=fake_connect))
     monkeypatch.setattr(ampr, "disconnect", Mock(return_value=True))
     monkeypatch.setattr(
         AMPRBase,
@@ -145,6 +164,24 @@ def test_initialize_is_noop_when_already_on(monkeypatch):
     ampr.initialize(timeout_s=0.01, poll_s=0.001)
 
     assert state_calls == ["get_state_before_initialize"]
+
+
+def test_initialize_disconnects_when_precheck_fails_on_existing_connection(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    ampr.connected = True
+    monkeypatch.setattr(ampr, "disconnect", Mock(return_value=True))
+
+    def fake_locked_timeout(_method, _timeout_s, step_name, *args, **kwargs):
+        if step_name == "get_state_before_initialize":
+            raise RuntimeError("boom")
+        raise AssertionError(f"Unexpected step: {step_name}")
+
+    monkeypatch.setattr(ampr, "_call_locked_with_timeout", fake_locked_timeout)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        ampr.initialize(timeout_s=0.01, poll_s=0.001)
+
+    ampr.disconnect.assert_called_once()
 
 
 def test_initialize_timeout_poisoned_transport_disconnects(monkeypatch):
