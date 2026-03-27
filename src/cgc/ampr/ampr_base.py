@@ -109,6 +109,7 @@ class AMPRBase:
     
     # Module constants
     MODULE_NUM = 12          # Maximum module number
+    CHANNEL_NUM = 4          # Channels per module
     ADDR_BASE = 0x80        # Base-module address
     ADDR_BROADCAST = 0xFF   # Broadcasting address
     
@@ -137,7 +138,7 @@ class AMPRBase:
             Optional identifier suffix.
         """
         
-        self.class_dir = Path(__file__).resolve().parent
+        class_dir = Path(__file__).resolve().parent
 
         if not sys.platform.startswith("win"):
             raise AMPRPlatformError(
@@ -145,7 +146,7 @@ class AMPRBase:
             )
 
         self.ampr_dll_path = Path(dll_path) if dll_path is not None else (
-            self.class_dir / "vendor" / "x64" / "COM-AMPR-12.dll"
+            class_dir / "vendor" / "x64" / "COM-AMPR-12.dll"
         )
         try:
             self.ampr_dll = ctypes.WinDLL(str(self.ampr_dll_path))
@@ -154,15 +155,23 @@ class AMPRBase:
                 f"Unable to load CGC AMPR DLL from '{self.ampr_dll_path}'."
             ) from exc
 
-        self.err_path = Path(error_codes_path) if error_codes_path is not None else (
-            self.class_dir.parent / "error_codes.json"
+        err_path = Path(error_codes_path) if error_codes_path is not None else (
+            class_dir.parent / "error_codes.json"
         )
-        with self.err_path.open("rb") as f:
+        with err_path.open("rb") as f:
             self.err_dict = json.load(f)
 
         self.com = com
         self.log = log
         self.idn = idn
+
+    def describe_error(self, status):
+        """Return the vendor message for a driver status code."""
+        return self.err_dict.get(str(status), "Unknown status code")
+
+    def format_status(self, status):
+        """Return a compact '<code> (<message>)' representation."""
+        return f"{status} ({self.describe_error(status)})"
 
     def open_port(self, com_number):
         """
@@ -909,9 +918,6 @@ class AMPRBase:
             ctypes.c_uint(address), ctypes.byref(fw_version))
         return status, fw_version.value
 
-    # Additional module methods would be added here based on the full header file
-    # These would include voltage setting/getting methods, module housekeeping, etc.
-    
     def get_module_product_no(self, address):
         """
         Get the module product number.
@@ -1049,7 +1055,7 @@ class AMPRBase:
             Status code.
 
         """
-        if not 1 <= channel <= 4:
+        if not 1 <= channel <= self.CHANNEL_NUM:
             return self.ERR_ARGUMENT
 
         status = self.ampr_dll.COM_AMPR_12_SetModuleOutputVoltage(
@@ -1073,7 +1079,7 @@ class AMPRBase:
             (status, voltage).
 
         """
-        if not 1 <= channel <= 4:
+        if not 1 <= channel <= self.CHANNEL_NUM:
             return self.ERR_ARGUMENT, None
 
         voltage = ctypes.c_double()
@@ -1098,18 +1104,37 @@ class AMPRBase:
             (status, voltage).
 
         """
-        if not 1 <= channel <= 4:
+        if not 1 <= channel <= self.CHANNEL_NUM:
             return self.ERR_ARGUMENT, None
 
-        voltages = (ctypes.c_double * 4)()
-        status = self.ampr_dll.COM_AMPR_12_GetMeasuredModuleOutputVoltages(
-            ctypes.c_uint(address), voltages)
+        status, voltages = self.get_all_module_voltage_measured(address)
         if status != self.NO_ERR:
             return status, None
 
         return status, voltages[channel - 1]
 
-    # Convenience methods for easier module access
+    def get_all_module_voltage_measured(self, address):
+        """
+        Get all measured voltages for one module in a single DLL call.
+
+        Parameters
+        ----------
+        address : int
+            Module address (0-11).
+
+        Returns
+        -------
+        tuple
+            (status, voltages) where voltages is a list of the 4 channel values.
+
+        """
+        voltages = (ctypes.c_double * self.CHANNEL_NUM)()
+        status = self.ampr_dll.COM_AMPR_12_GetMeasuredModuleOutputVoltages(
+            ctypes.c_uint(address), voltages)
+        if status != self.NO_ERR:
+            return status, None
+
+        return status, [float(voltage) for voltage in voltages]
     
     def scan_all_modules(self):
         """
@@ -1178,12 +1203,14 @@ class AMPRBase:
 
         """
         voltages = {}
+        meas_status, measured_voltages = self.get_all_module_voltage_measured(address)
         
-        for channel in range(1, 5):  # Channels 1-4
+        for channel in range(1, self.CHANNEL_NUM + 1):
             # Get setpoint
             set_status, setpoint = self.get_module_voltage_setpoint(address, channel)
-            # Get measured value
-            meas_status, measured = self.get_module_voltage_measured(address, channel)
+            measured = None
+            if meas_status == self.NO_ERR:
+                measured = measured_voltages[channel - 1]
             
             if set_status == self.NO_ERR and meas_status == self.NO_ERR:
                 voltages[channel] = {
@@ -1225,7 +1252,7 @@ class AMPRBase:
         
         if isinstance(voltages, list):
             # List format: [ch1, ch2, ch3, ch4]
-            for i, voltage in enumerate(voltages[:4]):  # Max 4 channels
+            for i, voltage in enumerate(voltages[: self.CHANNEL_NUM]):
                 channel = i + 1
                 if voltage is not None:
                     status = self.set_module_voltage(address, channel, voltage)
@@ -1233,7 +1260,7 @@ class AMPRBase:
         elif isinstance(voltages, dict):
             # Dictionary format: {channel: voltage}
             for channel, voltage in voltages.items():
-                if 1 <= channel <= 4 and voltage is not None:
+                if 1 <= channel <= self.CHANNEL_NUM and voltage is not None:
                     status = self.set_module_voltage(address, channel, voltage)
                     results[channel] = status
         

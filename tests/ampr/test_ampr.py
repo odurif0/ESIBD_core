@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 import tempfile
 import threading
 from unittest.mock import Mock
@@ -36,6 +37,35 @@ def test_ampr_base_raises_clear_error_when_dll_fails(monkeypatch):
 
     with pytest.raises(AMPRDllLoadError):
         AMPRBase(com=5, error_codes_path=ERROR_CODES_PATH)
+
+
+def test_ampr_base_formats_vendor_error_codes(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+
+    assert ampr.describe_error(AMPRBase.ERR_RATE) == "Error setting baud rate"
+    assert ampr.format_status(AMPRBase.ERR_RATE) == "-16 (Error setting baud rate)"
+
+
+def test_ampr_rejects_unknown_init_kwargs():
+    with pytest.raises(TypeError, match="Unexpected AMPR init kwargs: unexpected"):
+        AMPR("ampr_test", com=5, unexpected=True)
+
+
+def test_ampr_external_logger_prefixes_device_id(monkeypatch, caplog):
+    monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
+    monkeypatch.setattr(
+        "cgc.ampr.ampr_base.ctypes.WinDLL",
+        lambda _path: Mock(),
+        raising=False,
+    )
+    logger = logging.getLogger("test_ampr_external_logger")
+
+    ampr = AMPR("ampr_test", com=5, logger=logger)
+
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        ampr.logger.info("hello")
+
+    assert "ampr_test - hello" in caplog.messages
 
 
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
@@ -210,3 +240,93 @@ def test_initialize_timeout_poisoned_transport_disconnects(monkeypatch):
 
     assert ampr._transport_poisoned is True
     ampr.disconnect.assert_called_once()
+
+
+def test_housekeeping_monitor_does_not_deadlock_on_wrapped_methods(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    ampr.connected = True
+
+    monkeypatch.setattr(AMPRBase, "get_product_no", lambda self: (self.NO_ERR, 1234))
+    monkeypatch.setattr(AMPRBase, "get_state", lambda self: (self.NO_ERR, "0x0", "ST_ON"))
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_device_state",
+        lambda self: (self.NO_ERR, "0x0", ["DEVICE_OK"]),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_housekeeping",
+        lambda self: (self.NO_ERR, *([0.0] * 14)),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_voltage_state",
+        lambda self: (self.NO_ERR, "0x0", ["VOLTAGE_OK"]),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_temperature_state",
+        lambda self: (self.NO_ERR, "0x0", ["TEMPERATURE_OK"]),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_interlock_state",
+        lambda self: (self.NO_ERR, "0x0", []),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_fan_data",
+        lambda self: (self.NO_ERR, False, 0, 0, 0, 0),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_led_data",
+        lambda self: (self.NO_ERR, False, False, False),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_cpu_data",
+        lambda self: (self.NO_ERR, 0.0, 0.0),
+    )
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_module_presence",
+        lambda self: (self.NO_ERR, True, 0, [0] * (self.MODULE_NUM + 1)),
+    )
+
+    worker = threading.Thread(target=ampr.hk_monitor, daemon=True)
+    worker.start()
+    worker.join(timeout=0.5)
+
+    assert worker.is_alive() is False
+    assert ampr.thread_lock.acquire(blocking=False) is True
+    ampr.thread_lock.release()
+
+
+def test_get_all_module_voltages_reads_measured_values_once(monkeypatch):
+    ampr, dll = make_ampr(monkeypatch)
+    measured_call_addresses = []
+
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_module_voltage_setpoint",
+        lambda self, address, channel: (self.NO_ERR, float(channel)),
+    )
+
+    def fake_get_measured(address, voltages):
+        measured_call_addresses.append(address.value)
+        for index, value in enumerate((10.0, 20.0, 30.0, 40.0)):
+            voltages[index] = value
+        return AMPRBase.NO_ERR
+
+    dll.COM_AMPR_12_GetMeasuredModuleOutputVoltages.side_effect = fake_get_measured
+
+    voltages = AMPRBase.get_all_module_voltages(ampr, 2)
+
+    assert measured_call_addresses == [2]
+    assert voltages == {
+        1: {"setpoint": 1.0, "measured": 10.0},
+        2: {"setpoint": 2.0, "measured": 20.0},
+        3: {"setpoint": 3.0, "measured": 30.0},
+        4: {"setpoint": 4.0, "measured": 40.0},
+    }

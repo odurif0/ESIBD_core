@@ -15,6 +15,13 @@ from pathlib import Path
 from .ampr_base import AMPRBase
 
 
+class _DeviceLoggerAdapter(logging.LoggerAdapter):
+    """Prefix log messages with the device identifier."""
+
+    def process(self, msg, kwargs):
+        return f"{self.extra['device_id']} - {msg}", kwargs
+
+
 class AMPR(AMPRBase):
     """
     AMPR device communication class with logging functionality.
@@ -56,6 +63,10 @@ class AMPR(AMPRBase):
         """
         Initialize AMPR device with logging and threading support.
         """
+        if kwargs:
+            unexpected = ", ".join(sorted(kwargs))
+            raise TypeError(f"Unexpected AMPR init kwargs: {unexpected}")
+
         # Store parameters for AMPR functionality
         self.device_id = device_id
         self.com = com
@@ -95,12 +106,8 @@ class AMPR(AMPRBase):
 
         # Setup logger
         if logger is not None:
-            adapter = logging.LoggerAdapter(logger, {"device_id": device_id})
-            adapter.process = lambda msg, kwargs: (f"{device_id} - {msg}", kwargs)
-            self.logger = adapter
-            self._external_logger_provided = True
+            self.logger = _DeviceLoggerAdapter(logger, {"device_id": device_id})
         else:
-            self._external_logger_provided = False
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             logger_name = f"AMPR_{device_id}_{timestamp}"
             self.logger = logging.getLogger(logger_name)
@@ -235,20 +242,30 @@ class AMPR(AMPRBase):
                     self.logger.info(f"Baud rate set to {actual_baud}")
                     return True
 
-                self.logger.error(f"Failed to set baud rate: {baud_status}")
+                self.logger.error(
+                    f"Failed to set baud rate: {self.format_status(baud_status)}"
+                )
                 close_status = self._call_locked_with_timeout(
                     close_port, timeout_s, "close_port"
                 )
                 if close_status != self.NO_ERR:
                     self.logger.warning(
-                        f"AMPR port rollback after baud-rate failure also failed: {close_status}"
+                        "AMPR port rollback after baud-rate failure also failed: "
+                        f"{self.format_status(close_status)}"
                     )
                 self.connected = False
-                raise RuntimeError(f"AMPR set_baud_rate failed: {baud_status}")
+                raise RuntimeError(
+                    f"AMPR set_baud_rate failed: {self.format_status(baud_status)}"
+                )
 
-            self.logger.error(f"Failed to connect to AMPR device {self.device_id}: {status}")
+            self.logger.error(
+                "Failed to connect to AMPR device "
+                f"{self.device_id}: {self.format_status(status)}"
+            )
             self.connected = False
-            raise RuntimeError(f"AMPR open_port failed: {status}")
+            raise RuntimeError(
+                f"AMPR open_port failed: {self.format_status(status)}"
+            )
                 
         except Exception as e:
             self.logger.error(f"Connection error: {e}")
@@ -279,7 +296,8 @@ class AMPR(AMPRBase):
 
             self.connected = False
             self.logger.error(
-                f"Failed to disconnect AMPR device {self.device_id}: {status}. "
+                "Failed to disconnect AMPR device "
+                f"{self.device_id}: {self.format_status(status)}. "
                 "Object marked disconnected locally to avoid further unsafe reuse."
             )
             return False
@@ -317,26 +335,35 @@ class AMPR(AMPRBase):
                 get_scanned_module_state, timeout_s, "get_scanned_module_state"
             )
             if status != self.NO_ERR:
-                raise RuntimeError(f"Unable to read scanned module state: {status}")
+                raise RuntimeError(
+                    f"Unable to read scanned module state: {self.format_status(status)}"
+                )
 
             if mismatch or rating_failure:
                 status = self._call_locked_with_timeout(
                     rescan_modules, timeout_s, "rescan_modules"
                 )
                 if status != self.NO_ERR:
-                    raise RuntimeError(f"AMPR rescan failed: {status}")
+                    raise RuntimeError(
+                        f"AMPR rescan failed: {self.format_status(status)}"
+                    )
 
                 status = self._call_locked_with_timeout(
                     set_scanned_module_state, timeout_s, "set_scanned_module_state"
                 )
                 if status != self.NO_ERR:
-                    raise RuntimeError(f"AMPR set scanned module state failed: {status}")
+                    raise RuntimeError(
+                        "AMPR set scanned module state failed: "
+                        f"{self.format_status(status)}"
+                    )
 
             status, enabled = self._call_locked_with_timeout(
                 enable_psu, timeout_s, "enable_psu", True
             )
             if status != self.NO_ERR:
-                raise RuntimeError(f"AMPR enable_psu failed: {status}")
+                raise RuntimeError(
+                    f"AMPR enable_psu failed: {self.format_status(status)}"
+                )
             psu_enabled = bool(enabled)
 
             deadline = time.time() + timeout_s
@@ -368,7 +395,7 @@ class AMPR(AMPRBase):
                         if disable_status != self.NO_ERR:
                             self.logger.error(
                                 "AMPR cleanup failed to disable PSU after initialization "
-                                f"error: {disable_status}"
+                                f"error: {self.format_status(disable_status)}"
                             )
                     except Exception as cleanup_error:
                         self.logger.error(
@@ -384,16 +411,19 @@ class AMPR(AMPRBase):
         modules = self.scan_modules()
 
         for module in modules:
-            for channel in range(1, 5):
+            for channel in range(1, self.CHANNEL_NUM + 1):
                 status = self.set_module_voltage(module, channel, 0.0)
                 if status != self.NO_ERR:
                     raise RuntimeError(
-                        f"Failed to set AMPR module {module} channel {channel} to 0 V: {status}"
+                        "Failed to set AMPR module "
+                        f"{module} channel {channel} to 0 V: {self.format_status(status)}"
                     )
 
         status, _ = self.enable_psu(False)
         if status != self.NO_ERR:
-            raise RuntimeError(f"AMPR disable_psu failed: {status}")
+            raise RuntimeError(
+                f"AMPR disable_psu failed: {self.format_status(status)}"
+            )
 
         if not self.disconnect():
             raise RuntimeError("AMPR disconnect failed")
@@ -425,21 +455,21 @@ class AMPR(AMPRBase):
     
     def _hk_product_info(self):
         """Get and log product information."""
-        status, product_no = self.get_product_no()
+        status, product_no = AMPRBase.get_product_no(self)
         if status == self.NO_ERR:
             self.logger.info(f"Product number: {product_no}")
         return status == self.NO_ERR
 
     def _hk_main_state(self):
         """Get and log main device state."""
-        status, state_hex, state_name = self.get_state()
+        status, state_hex, state_name = AMPRBase.get_state(self)
         if status == self.NO_ERR:
             self.logger.info(f"Main state: {state_name} ({state_hex})")
         return status == self.NO_ERR
 
     def _hk_device_state(self):
         """Get and log device state."""
-        status, state_hex, state_names = self.get_device_state()
+        status, state_hex, state_names = AMPRBase.get_device_state(self)
         if status == self.NO_ERR:
             self.logger.info(f"Device state: {', '.join(state_names)} ({state_hex})")
         return status == self.NO_ERR
@@ -447,7 +477,7 @@ class AMPR(AMPRBase):
     def _hk_general_housekeeping(self):
         """Get and log general housekeeping data."""
         status, volt_12v, volt_5v0, volt_3v3, volt_agnd, volt_12vp, volt_12vn, \
-        volt_hvp, volt_hvn, temp_cpu, temp_adc, temp_av, temp_hvp, temp_hvn, line_freq = self.get_housekeeping()
+        volt_hvp, volt_hvn, temp_cpu, temp_adc, temp_av, temp_hvp, temp_hvn, line_freq = AMPRBase.get_housekeeping(self)
         
         if status == self.NO_ERR:
             self.logger.info("get_housekeeping() results:")
@@ -469,28 +499,28 @@ class AMPR(AMPRBase):
 
     def _hk_voltage_state(self):
         """Get and log voltage state."""
-        status, state_hex, state_names = self.get_voltage_state()
+        status, state_hex, state_names = AMPRBase.get_voltage_state(self)
         if status == self.NO_ERR:
             self.logger.info(f"Voltage state: {', '.join(state_names)} ({state_hex})")
         return status == self.NO_ERR
 
     def _hk_temperature_state(self):
         """Get and log temperature state."""
-        status, state_hex, state_names = self.get_temperature_state()
+        status, state_hex, state_names = AMPRBase.get_temperature_state(self)
         if status == self.NO_ERR:
             self.logger.info(f"Temperature state: {', '.join(state_names)} ({state_hex})")
         return status == self.NO_ERR
 
     def _hk_interlock_state(self):
         """Get and log interlock state."""
-        status, state_hex, state_names = self.get_interlock_state()
+        status, state_hex, state_names = AMPRBase.get_interlock_state(self)
         if status == self.NO_ERR:
             self.logger.info(f"Interlock state: {', '.join(state_names)} ({state_hex})")
         return status == self.NO_ERR
 
     def _hk_fan_data(self):
         """Get and log fan data."""
-        status, failed, max_rpm, set_rpm, measured_rpm, pwm = self.get_fan_data()
+        status, failed, max_rpm, set_rpm, measured_rpm, pwm = AMPRBase.get_fan_data(self)
         if status == self.NO_ERR:
             self.logger.info("get_fan_data() results:")
             self.logger.info(f"  Failed: {failed}")
@@ -502,21 +532,21 @@ class AMPR(AMPRBase):
 
     def _hk_led_data(self):
         """Get and log LED data."""
-        status, red, green, blue = self.get_led_data()
+        status, red, green, blue = AMPRBase.get_led_data(self)
         if status == self.NO_ERR:
             self.logger.info(f"LED state: R={red}, G={green}, B={blue}")
         return status == self.NO_ERR
 
     def _hk_cpu_data(self):
         """Get and log CPU data."""
-        status, load, frequency = self.get_cpu_data()
+        status, load, frequency = AMPRBase.get_cpu_data(self)
         if status == self.NO_ERR:
             self.logger.info(f"CPU: Load={load*100:.1f}%, Frequency={frequency/1e6:.1f}MHz")
         return status == self.NO_ERR
 
     def _hk_module_presence(self):
         """Get and log module presence."""
-        status, valid, max_module, presence_list = self.get_module_presence()
+        status, valid, max_module, presence_list = AMPRBase.get_module_presence(self)
         if status == self.NO_ERR:
             present_modules = [
                 i
@@ -532,7 +562,9 @@ class AMPR(AMPRBase):
         This method executes all individual housekeeping functions.
         """
         try:
-            # Execute all housekeeping functions
+            # Housekeeping holds the transport lock for the whole batch, so it must
+            # call the low-level AMPRBase methods directly and avoid the public
+            # wrappers that would try to reacquire the same lock.
             with self.thread_lock:
                 self._hk_product_info()
                 self._hk_main_state()
@@ -690,7 +722,9 @@ class AMPR(AMPRBase):
             if status == self.NO_ERR:
                 self.logger.info(f"PSU enable set to {enable_value}")
             else:
-                self.logger.error(f"Failed to set PSU enable: status {status}")
+                self.logger.error(
+                    f"Failed to set PSU enable: {self.format_status(status)}"
+                )
             return status, enable_value
         except Exception as e:
             self.logger.error(f"Error setting PSU enable: {e}")
@@ -702,7 +736,9 @@ class AMPR(AMPRBase):
         if status == self.NO_ERR:
             self.logger.info(f"Main state: {state_name} ({state_hex})")
         else:
-            self.logger.error(f"Failed to get main state: status {status}")
+            self.logger.error(
+                f"Failed to get main state: {self.format_status(status)}"
+            )
         return status, state_hex, state_name
 
     def restart(self):
@@ -713,7 +749,9 @@ class AMPR(AMPRBase):
             if status == self.NO_ERR:
                 self.logger.info("Device restart successful")
             else:
-                self.logger.error(f"Device restart failed: status {status}")
+                self.logger.error(
+                    f"Device restart failed: {self.format_status(status)}"
+                )
             return status
         except Exception as e:
             self.logger.error(f"Error restarting device: {e}")
@@ -759,7 +797,10 @@ class AMPR(AMPRBase):
             if status == self.NO_ERR:
                 self.logger.info(f"Module {address} channel {channel} voltage set successfully")
             else:
-                self.logger.error(f"Failed to set module {address} channel {channel} voltage: status {status}")
+                self.logger.error(
+                    "Failed to set module "
+                    f"{address} channel {channel} voltage: {self.format_status(status)}"
+                )
             return status
         except Exception as e:
             self.logger.error(f"Error setting module voltage: {e}")
@@ -789,7 +830,10 @@ class AMPR(AMPRBase):
             
             for channel, status in results.items():
                 if status != self.NO_ERR:
-                    self.logger.error(f"Failed to set module {address} channel {channel}: status {status}")
+                    self.logger.error(
+                        f"Failed to set module {address} channel {channel}: "
+                        f"{self.format_status(status)}"
+                    )
             
             return results
         except Exception as e:
@@ -856,7 +900,9 @@ class AMPR(AMPRBase):
             if status == self.NO_ERR:
                 self.logger.info(f"Module {address} restart successful")
             else:
-                self.logger.error(f"Module {address} restart failed: status {status}")
+                self.logger.error(
+                    f"Module {address} restart failed: {self.format_status(status)}"
+                )
             return status
         except Exception as e:
             self.logger.error(f"Error restarting module {address}: {e}")
