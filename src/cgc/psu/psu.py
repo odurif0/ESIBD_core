@@ -44,6 +44,7 @@ class PSU(PSUBase):
             PSUBase.ERR_ARGUMENT_WRONG,
         }
     )
+    _EXPECTED_PRODUCT_TOKENS = ("PSU", "PSU-CTRL")
 
     def __init__(
         self,
@@ -248,6 +249,26 @@ class PSU(PSUBase):
         if status != self.NO_ERR:
             raise RuntimeError(f"PSU {action} failed: {self.format_status(status)}")
 
+    def _warn_if_unexpected_product_id(self):
+        try:
+            status, product_id = self._call_locked(PSUBase.get_product_id, self)
+        except Exception as exc:
+            self.logger.debug(f"Skipping PSU identity probe after connect: {exc}")
+            return
+
+        if status != self.NO_ERR or not product_id:
+            return
+
+        normalized = product_id.upper()
+        if any(token in normalized for token in self._EXPECTED_PRODUCT_TOKENS):
+            return
+
+        self.logger.warning(
+            "Connected device does not look like a PSU controller. "
+            f"Reported product_id='{product_id}'. Check the COM port and use the "
+            "matching driver for that instrument."
+        )
+
     def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the PSU device."""
         try:
@@ -282,6 +303,7 @@ class PSU(PSUBase):
                 set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
             )
             if baud_status == self.NO_ERR:
+                self._warn_if_unexpected_product_id()
                 self.logger.info(
                     f"Successfully connected to PSU device {self.device_id} "
                     f"(baud rate: {actual_baud})"

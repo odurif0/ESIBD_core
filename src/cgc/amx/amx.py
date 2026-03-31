@@ -39,6 +39,7 @@ class AMX(AMXBase):
         2: "pulser_2",
         3: "pulser_3",
     }
+    _EXPECTED_PRODUCT_TOKENS = ("AMX", "AMX-CTRL")
 
     def __init__(
         self,
@@ -243,6 +244,26 @@ class AMX(AMXBase):
         if status != self.NO_ERR:
             raise RuntimeError(f"AMX {action} failed: {self.format_status(status)}")
 
+    def _warn_if_unexpected_product_id(self):
+        try:
+            status, product_id = self._call_locked(AMXBase.get_product_id, self)
+        except Exception as exc:
+            self.logger.debug(f"Skipping AMX identity probe after connect: {exc}")
+            return
+
+        if status != self.NO_ERR or not product_id:
+            return
+
+        normalized = product_id.upper()
+        if any(token in normalized for token in self._EXPECTED_PRODUCT_TOKENS):
+            return
+
+        self.logger.warning(
+            "Connected device does not look like an AMX controller. "
+            f"Reported product_id='{product_id}'. Check the COM port and use the "
+            "matching driver for that instrument."
+        )
+
     def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the AMX device."""
         try:
@@ -277,6 +298,7 @@ class AMX(AMXBase):
                 set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
             )
             if baud_status == self.NO_ERR:
+                self._warn_if_unexpected_product_id()
                 self.logger.info(
                     f"Successfully connected to AMX device {self.device_id} "
                     f"(baud rate: {actual_baud})"

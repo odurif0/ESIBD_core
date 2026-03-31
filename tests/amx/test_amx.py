@@ -124,6 +124,9 @@ def test_connect_warns_when_multiple_dll_ports_are_active(monkeypatch, caplog):
     dll_b.COM_HVAMX4ED_Open.return_value = AMXBase.NO_ERR
     dll_a.COM_HVAMX4ED_SetBaudRate.return_value = AMXBase.NO_ERR
     dll_b.COM_HVAMX4ED_SetBaudRate.return_value = AMXBase.NO_ERR
+    monkeypatch.setattr(
+        AMXBase, "get_product_id", lambda self: (self.NO_ERR, "AMX-CTRL-4ED")
+    )
 
     amx_a.connect()
     with caplog.at_level(logging.WARNING):
@@ -131,6 +134,23 @@ def test_connect_warns_when_multiple_dll_ports_are_active(monkeypatch, caplog):
 
     assert "Multiple AMX instances in this process currently claim DLL ports" in caplog.text
     assert "[0, 1]" in caplog.text
+
+
+def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch, caplog):
+    amx, dll = make_amx(monkeypatch)
+    dll.COM_HVAMX4ED_Open.return_value = AMXBase.NO_ERR
+    dll.COM_HVAMX4ED_SetBaudRate.return_value = AMXBase.NO_ERR
+    monkeypatch.setattr(
+        AMXBase,
+        "get_product_id",
+        lambda self: (self.NO_ERR, "HV-PSU-CTRL-2D, Rev.1-01"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        amx.connect()
+
+    assert "does not look like an AMX controller" in caplog.text
+    assert "HV-PSU-CTRL-2D" in caplog.text
 
 
 def test_set_frequency_hz_translates_to_oscillator_period(monkeypatch):

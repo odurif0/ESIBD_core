@@ -126,6 +126,9 @@ def test_connect_warns_when_multiple_dll_ports_are_active(monkeypatch, caplog):
     dll_b.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
     dll_a.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
     dll_b.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    monkeypatch.setattr(
+        PSUBase, "get_product_id", lambda self: (self.NO_ERR, "PSU-CTRL-2D")
+    )
 
     psu_a.connect()
     with caplog.at_level(logging.WARNING):
@@ -133,6 +136,23 @@ def test_connect_warns_when_multiple_dll_ports_are_active(monkeypatch, caplog):
 
     assert "Multiple PSU instances in this process currently claim DLL ports" in caplog.text
     assert "[0, 1]" in caplog.text
+
+
+def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch, caplog):
+    psu, dll = make_psu(monkeypatch)
+    dll.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    monkeypatch.setattr(
+        PSUBase,
+        "get_product_id",
+        lambda self: (self.NO_ERR, "HV-AMX-CTRL-4ED, Rev.2-20"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        psu.connect()
+
+    assert "does not look like a PSU controller" in caplog.text
+    assert "HV-AMX-CTRL-4ED" in caplog.text
 
 
 def test_initialize_loads_config_without_overriding_enable_flags(monkeypatch):
