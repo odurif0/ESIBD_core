@@ -10,6 +10,28 @@ This driver follows the vendor recommendation:
 2. keep that configuration as the reproducible operating mode
 3. adjust only frequency, duty cycle or delays at runtime
 
+## Recommended API
+
+For application code, use the high-level driver methods:
+
+- construct the driver with `AMX(..., com=..., port=...)`
+- call `connect()` or `initialize()`
+- use the high-level frequency, pulser and switch helpers
+- use `get_product_info()` for stable metadata
+- use `collect_housekeeping()` for a structured runtime snapshot
+- finish with `shutdown()` or `disconnect()`
+
+Do not treat `open_port()` as the normal entry point. It is a low-level DLL
+primitive exposed by `amx_base.py`, not the full driver connection workflow.
+In particular, `connect()` adds:
+
+- timeout handling around native DLL calls
+- logging
+- driver state tracking through `self.connected`
+- baud-rate setup
+- rollback on partial connection failure
+- warnings when multiple AMX instances are active in the same process
+
 ## What It Does
 
 - Connects to a CGC AMX controller over a Windows COM port
@@ -19,6 +41,8 @@ This driver follows the vendor recommendation:
 - Adjusts oscillator frequency
 - Adjusts pulser duty cycle, width and delay
 - Adjusts coarse switch trigger and enable delays
+- Exposes `get_product_info()` for product, firmware and hardware metadata
+- Exposes `collect_housekeeping()` for structured monitoring data
 
 ## Files
 
@@ -43,3 +67,66 @@ try:
 finally:
     amx.shutdown()
 ```
+
+## Low-Level Primitives
+
+Low-level communication primitives are implemented in `amx_base.py`. They are
+useful for debugging or vendor-level investigations, but they are not the
+recommended application API.
+
+Transport:
+
+- `open_port(com_number, port_number=None)`
+- `close_port()`
+- `set_baud_rate(baud_rate)`
+- `purge()`
+- `device_purge()`
+- `get_buffer_state()`
+
+Device state and housekeeping:
+
+- `get_main_state()`
+- `get_device_state()`
+- `get_housekeeping()`
+- `get_sensor_data()`
+- `get_fan_data()`
+- `get_led_data()`
+- `get_controller_state()`
+
+Enable and timing:
+
+- `get_device_enable()`
+- `set_device_enable(enable)`
+- `get_oscillator_period()`
+- `set_oscillator_period(period)`
+- `get_pulser_delay(pulser_no)`
+- `set_pulser_delay(pulser_no, delay)`
+- `get_pulser_width(pulser_no)`
+- `set_pulser_width(pulser_no, width)`
+- `get_pulser_burst(pulser_no)`
+- `get_switch_trigger_config(switch_no)`
+- `get_switch_enable_config(switch_no)`
+- `get_switch_trigger_delay(switch_no)`
+- `set_switch_trigger_delay(switch_no, rise_delay, fall_delay)`
+- `get_switch_enable_delay(switch_no)`
+- `set_switch_enable_delay(switch_no, delay)`
+
+Configurations:
+
+- `save_current_config(config_number)`
+- `load_current_config(config_number)`
+- `get_config_name(config_number)`
+- `get_config_flags(config_number)`
+- `get_config_list()`
+
+Device information:
+
+- `get_cpu_data()`
+- `get_uptime()`
+- `get_total_time()`
+- `get_hw_type()`
+- `get_hw_version()`
+- `get_fw_version()`
+- `get_fw_date()`
+- `get_product_id()`
+- `get_product_no()`

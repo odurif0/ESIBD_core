@@ -66,17 +66,37 @@ class AMXBase:
         (1 << 0x1A): "DEVST_SEN3_LOW",
     }
 
+    CONTROLLER_STATE = {
+        (1 << 0): "ENB",
+        (1 << 1): "ENB_OSC",
+        (1 << 2): "ENB_PULSER",
+        (1 << 3): "SW_TRIG",
+        (1 << 4): "SW_PULSE",
+        (1 << 5): "PREVENT_DIS",
+        (1 << 6): "DIS_DITHER",
+        (1 << 7): "NC",
+        (1 << 8): "ENABLE",
+        (1 << 9): "SW_TRIG_OUT",
+        (1 << 10): "CLRN",
+    }
+
     MAX_PORT = 16
     UINT32_MAX = (1 << 32) - 1
     CLOCK = 100e6
     OSC_OFFSET = 2
+    SENSOR_NUM = 3
+    FAN_NUM = 3
+    FAN_PWM_MAX = 1000
     PULSER_NUM = 4
     PULSER_DELAY_OFFSET = 3
     PULSER_WIDTH_OFFSET = 2
+    PULSER_BURST_NUM = 2
     SWITCH_NUM = 4
     SWITCH_DELAY_MAX = 1 << 4
     MAX_CONFIG = 126
     CONFIG_NAME_SIZE = 52
+    FW_DATE_SIZE = 16
+    PRODUCT_ID_SIZE = 60
 
     def __init__(
         self,
@@ -141,6 +161,15 @@ class AMXBase:
                 f"Expected 0 <= switch < {self.SWITCH_NUM}."
             )
         return switch_no
+
+    def _validate_burst_pulser(self, pulser_no: int) -> int:
+        pulser_no = int(pulser_no)
+        if not 0 <= pulser_no < self.PULSER_BURST_NUM:
+            raise ValueError(
+                f"Invalid burst-capable pulser number: {pulser_no}. "
+                f"Expected 0 <= pulser < {self.PULSER_BURST_NUM}."
+            )
+        return pulser_no
 
     def _validate_uint32_register(self, value: int, name: str) -> int:
         value = int(value)
@@ -236,6 +265,56 @@ class AMXBase:
                     active_states.append(name)
         return status, hex(state_value), active_states
 
+    def get_housekeeping(self):
+        """Get the AMX housekeeping values."""
+        volt_12v = ctypes.c_double()
+        volt_5v0 = ctypes.c_double()
+        volt_3v3 = ctypes.c_double()
+        temp_cpu = ctypes.c_double()
+        status = self.amx_dll.COM_HVAMX4ED_GetHousekeeping(
+            self.port,
+            ctypes.byref(volt_12v),
+            ctypes.byref(volt_5v0),
+            ctypes.byref(volt_3v3),
+            ctypes.byref(temp_cpu),
+        )
+        return status, volt_12v.value, volt_5v0.value, volt_3v3.value, temp_cpu.value
+
+    def get_sensor_data(self):
+        """Get the three AMX temperature sensor readings."""
+        temperatures = (ctypes.c_double * self.SENSOR_NUM)()
+        status = self.amx_dll.COM_HVAMX4ED_GetSensorData(self.port, temperatures)
+        return status, [temperatures[i] for i in range(self.SENSOR_NUM)]
+
+    def get_fan_data(self):
+        """Get the configured and measured fan values."""
+        enabled = (ctypes.c_bool * self.FAN_NUM)()
+        failed = (ctypes.c_bool * self.FAN_NUM)()
+        set_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
+        measured_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
+        pwm = (ctypes.c_uint16 * self.FAN_NUM)()
+        status = self.amx_dll.COM_HVAMX4ED_GetFanData(
+            self.port, enabled, failed, set_rpm, measured_rpm, pwm
+        )
+        return (
+            status,
+            [bool(enabled[i]) for i in range(self.FAN_NUM)],
+            [bool(failed[i]) for i in range(self.FAN_NUM)],
+            [int(set_rpm[i]) for i in range(self.FAN_NUM)],
+            [int(measured_rpm[i]) for i in range(self.FAN_NUM)],
+            [int(pwm[i]) for i in range(self.FAN_NUM)],
+        )
+
+    def get_led_data(self):
+        """Get the AMX controller LED state."""
+        red = ctypes.c_bool()
+        green = ctypes.c_bool()
+        blue = ctypes.c_bool()
+        status = self.amx_dll.COM_HVAMX4ED_GetLEDData(
+            self.port, ctypes.byref(red), ctypes.byref(green), ctypes.byref(blue)
+        )
+        return status, red.value, green.value, blue.value
+
     def get_device_enable(self):
         """Get the device enable state."""
         enable = ctypes.c_bool()
@@ -299,6 +378,33 @@ class AMXBase:
             self.port, pulser_no, ctypes.c_uint32(width)
         )
 
+    def get_pulser_burst(self, pulser_no: int):
+        """Get the burst size for one burst-capable pulser."""
+        pulser_no = self._validate_burst_pulser(pulser_no)
+        burst = ctypes.c_uint32()
+        status = self.amx_dll.COM_HVAMX4ED_GetPulserBurst(
+            self.port, pulser_no, ctypes.byref(burst)
+        )
+        return status, burst.value
+
+    def get_switch_trigger_config(self, switch_no: int):
+        """Get one switch trigger configuration byte."""
+        switch_no = self._validate_switch(switch_no)
+        config = ctypes.c_ubyte()
+        status = self.amx_dll.COM_HVAMX4ED_GetSwitchTriggerConfig(
+            self.port, switch_no, ctypes.byref(config)
+        )
+        return status, config.value
+
+    def get_switch_enable_config(self, switch_no: int):
+        """Get one switch enable configuration byte."""
+        switch_no = self._validate_switch(switch_no)
+        config = ctypes.c_ubyte()
+        status = self.amx_dll.COM_HVAMX4ED_GetSwitchEnableConfig(
+            self.port, switch_no, ctypes.byref(config)
+        )
+        return status, config.value
+
     def get_switch_trigger_delay(self, switch_no: int):
         """Get the coarse trigger rise/fall delays of one switch."""
         switch_no = self._validate_switch(switch_no)
@@ -340,6 +446,19 @@ class AMXBase:
             self.port, switch_no, ctypes.c_ubyte(delay)
         )
 
+    def get_controller_state(self):
+        """Get the combined AMX controller state/configuration bitfield."""
+        state = ctypes.c_uint16()
+        status = self.amx_dll.COM_HVAMX4ED_GetControllerState(
+            self.port, ctypes.byref(state)
+        )
+        state_value = state.value
+        active_states = []
+        for flag, name in self.CONTROLLER_STATE.items():
+            if state_value & flag:
+                active_states.append(name)
+        return status, hex(state_value), active_states
+
     def save_current_config(self, config_number: int) -> int:
         """Save the current configuration to NVM."""
         config_number = self._validate_config_number(config_number)
@@ -377,3 +496,74 @@ class AMXBase:
             [bool(active[i]) for i in range(self.MAX_CONFIG)],
             [bool(valid[i]) for i in range(self.MAX_CONFIG)],
         )
+
+    def get_cpu_data(self):
+        """Get the controller CPU load and frequency."""
+        load = ctypes.c_double()
+        frequency = ctypes.c_double()
+        status = self.amx_dll.COM_HVAMX4ED_GetCPUData(
+            self.port, ctypes.byref(load), ctypes.byref(frequency)
+        )
+        return status, load.value, frequency.value
+
+    def get_uptime(self):
+        """Get current uptime and operation time."""
+        seconds = ctypes.c_uint32()
+        milliseconds = ctypes.c_uint16()
+        optime = ctypes.c_uint32()
+        status = self.amx_dll.COM_HVAMX4ED_GetUptime(
+            self.port,
+            ctypes.byref(seconds),
+            ctypes.byref(milliseconds),
+            ctypes.byref(optime),
+        )
+        return status, seconds.value, milliseconds.value, optime.value
+
+    def get_total_time(self):
+        """Get total uptime and total operation time."""
+        uptime = ctypes.c_uint32()
+        optime = ctypes.c_uint32()
+        status = self.amx_dll.COM_HVAMX4ED_GetTotalTime(
+            self.port, ctypes.byref(uptime), ctypes.byref(optime)
+        )
+        return status, uptime.value, optime.value
+
+    def get_hw_type(self):
+        """Get the hardware type."""
+        hw_type = ctypes.c_uint16()
+        status = self.amx_dll.COM_HVAMX4ED_GetHWType(self.port, ctypes.byref(hw_type))
+        return status, hw_type.value
+
+    def get_hw_version(self):
+        """Get the hardware version."""
+        hw_version = ctypes.c_uint16()
+        status = self.amx_dll.COM_HVAMX4ED_GetHWVersion(
+            self.port, ctypes.byref(hw_version)
+        )
+        return status, hw_version.value
+
+    def get_fw_version(self):
+        """Get the firmware version."""
+        version = ctypes.c_uint16()
+        status = self.amx_dll.COM_HVAMX4ED_GetFWVersion(self.port, ctypes.byref(version))
+        return status, version.value
+
+    def get_fw_date(self):
+        """Get the firmware date string."""
+        date_string = ctypes.create_string_buffer(self.FW_DATE_SIZE)
+        status = self.amx_dll.COM_HVAMX4ED_GetFWDate(self.port, date_string)
+        return status, date_string.value.decode()
+
+    def get_product_id(self):
+        """Get the product identification string."""
+        identification = ctypes.create_string_buffer(self.PRODUCT_ID_SIZE)
+        status = self.amx_dll.COM_HVAMX4ED_GetProductID(self.port, identification)
+        return status, identification.value.decode()
+
+    def get_product_no(self):
+        """Get the product number."""
+        number = ctypes.c_uint32()
+        status = self.amx_dll.COM_HVAMX4ED_GetProductNo(
+            self.port, ctypes.byref(number)
+        )
+        return status, number.value

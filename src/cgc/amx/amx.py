@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -30,6 +31,15 @@ class AMX(AMXBase):
     3. adjust frequency, duty cycle or delays only
     """
 
+    _active_connections_lock = threading.Lock()
+    _active_connections: dict[int, dict[str, object]] = {}
+    PULSER_LABELS = {
+        0: "pulser_0",
+        1: "pulser_1",
+        2: "pulser_2",
+        3: "pulser_3",
+    }
+
     def __init__(
         self,
         device_id: str,
@@ -51,6 +61,7 @@ class AMX(AMXBase):
         self.port_num = int(port)
         self.baudrate = int(baudrate)
         self.connected = False
+        self._dll_port_claimed = False
         self._transport_poisoned = False
         self._transport_error = None
 
@@ -80,6 +91,76 @@ class AMX(AMXBase):
 
         super().__init__(com=com, port=port, log=None, idn=device_id, dll_path=dll_path)
 
+    @classmethod
+    def _purge_stale_connections(cls):
+        stale = []
+        for instance_id, entry in cls._active_connections.items():
+            instance = entry["ref"]()
+            if instance is None or not instance._dll_port_claimed:
+                stale.append(instance_id)
+        for instance_id in stale:
+            cls._active_connections.pop(instance_id, None)
+
+    def _register_connected_instance(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._purge_stale_connections()
+            cls._active_connections[id(self)] = {
+                "ref": weakref.ref(self),
+                "device_id": self.device_id,
+                "com": self.com,
+                "port": self.port_num,
+            }
+
+    def _unregister_connected_instance(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._active_connections.pop(id(self), None)
+            cls._purge_stale_connections()
+
+    def _set_port_claimed(self, claimed: bool):
+        self._dll_port_claimed = bool(claimed)
+        if self._dll_port_claimed:
+            self._register_connected_instance()
+        else:
+            self._unregister_connected_instance()
+
+    def _warn_on_other_process_ports(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._purge_stale_connections()
+            others = [
+                entry
+                for instance_id, entry in cls._active_connections.items()
+                if instance_id != id(self)
+            ]
+
+        if not others:
+            return
+
+        same_port = [entry for entry in others if entry["port"] == self.port_num]
+        if same_port:
+            other_devices = ", ".join(
+                f"{entry['device_id']}@COM{entry['com']}" for entry in same_port
+            )
+            self.logger.warning(
+                "Another AMX instance in this process already claims the same DLL "
+                f"port {self.port_num}: {other_devices}. Reusing the same DLL port "
+                "can reassign or close the shared vendor channel unexpectedly."
+            )
+            return
+
+        all_ports = sorted({entry["port"] for entry in others} | {self.port_num})
+        other_devices = ", ".join(
+            f"{entry['device_id']}@COM{entry['com']}/port{entry['port']}"
+            for entry in others
+        )
+        self.logger.warning(
+            "Multiple AMX instances in this process currently claim DLL ports "
+            f"{all_ports}: {other_devices}. The vendor DLL exposes independent "
+            "ports, but keep one active instance per port in each workflow."
+        )
+
     def _raise_if_transport_poisoned(self):
         if self._transport_poisoned:
             detail = self._transport_error or "unknown transport failure"
@@ -95,6 +176,7 @@ class AMX(AMXBase):
             "The device may be powered off or unresponsive."
         )
         self.connected = False
+        self._set_port_claimed(True)
 
     def _call_locked_with_timeout(self, method, timeout_s, step_name, *args, **kwargs):
         self._raise_if_transport_poisoned()
@@ -165,11 +247,13 @@ class AMX(AMXBase):
         """Connect to the AMX device."""
         try:
             if self.connected:
+                self._set_port_claimed(True)
                 self.logger.info(
                     f"AMX device {self.device_id} is already connected; skipping open_port"
                 )
                 return True
 
+            self._warn_on_other_process_ports()
             self.logger.info(
                 f"Connecting to AMX device {self.device_id} "
                 f"on COM{self.com}, port {self.port_num}"
@@ -188,6 +272,7 @@ class AMX(AMXBase):
                 )
 
             self.connected = True
+            self._set_port_claimed(True)
             baud_status, actual_baud = self._call_locked_with_timeout(
                 set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
             )
@@ -209,6 +294,8 @@ class AMX(AMXBase):
                     "AMX port rollback after baud-rate failure also failed: "
                     f"{self.format_status(close_status)}"
                 )
+            else:
+                self._set_port_claimed(False)
             self.connected = False
             raise RuntimeError(
                 f"AMX set_baud_rate failed: {self.format_status(baud_status)}"
@@ -224,6 +311,7 @@ class AMX(AMXBase):
 
         try:
             if self._transport_poisoned:
+                self._set_port_claimed(True)
                 self.logger.warning(
                     f"Skipping AMX close_port for {self.device_id} because the "
                     "transport is marked unusable."
@@ -231,22 +319,27 @@ class AMX(AMXBase):
                 return False
 
             if not was_connected:
+                if not self._dll_port_claimed:
+                    self._set_port_claimed(False)
                 return True
 
             self.logger.info(f"Disconnecting AMX device {self.device_id}")
             status = self._call_locked(super().close_port)
             if status == self.NO_ERR:
+                self._set_port_claimed(False)
                 self.logger.info(
                     f"Successfully disconnected AMX device {self.device_id}"
                 )
                 return True
 
+            self._set_port_claimed(True)
             self.logger.error(
                 f"Failed to disconnect AMX device {self.device_id}: "
                 f"{self.format_status(status)}"
             )
             return False
         except Exception as exc:
+            self._set_port_claimed(True)
             self.logger.error(f"Disconnection error: {exc}")
             return False
 
@@ -437,6 +530,168 @@ class AMX(AMXBase):
         self._raise_on_status(status, f"get_switch_enable_delay({switch_no})")
         return delay
 
+    def _get_product_info_unlocked(self) -> dict:
+        product_no_status, product_no = AMXBase.get_product_no(self)
+        self._raise_on_status(product_no_status, "get_product_no")
+        product_id_status, product_id = AMXBase.get_product_id(self)
+        self._raise_on_status(product_id_status, "get_product_id")
+        fw_version_status, fw_version = AMXBase.get_fw_version(self)
+        self._raise_on_status(fw_version_status, "get_fw_version")
+        fw_date_status, fw_date = AMXBase.get_fw_date(self)
+        self._raise_on_status(fw_date_status, "get_fw_date")
+        hw_type_status, hw_type = AMXBase.get_hw_type(self)
+        self._raise_on_status(hw_type_status, "get_hw_type")
+        hw_version_status, hw_version = AMXBase.get_hw_version(self)
+        self._raise_on_status(hw_version_status, "get_hw_version")
+        return {
+            "product_no": product_no,
+            "product_id": product_id,
+            "firmware": {
+                "version": fw_version,
+                "date": fw_date,
+            },
+            "hardware": {
+                "type": hw_type,
+                "version": hw_version,
+            },
+        }
+
+    def get_product_info(self) -> dict:
+        """Return stable product, firmware and hardware metadata."""
+        self._require_connected()
+        return self._call_locked(self._get_product_info_unlocked)
+
+    def _collect_housekeeping_unlocked(self) -> dict:
+        main_status, main_state_hex, main_state_name = AMXBase.get_main_state(self)
+        self._raise_on_status(main_status, "get_main_state")
+        device_state_status, device_state_hex, device_state_flags = AMXBase.get_device_state(self)
+        self._raise_on_status(device_state_status, "get_device_state")
+        controller_state_status, controller_state_hex, controller_state_flags = AMXBase.get_controller_state(self)
+        self._raise_on_status(controller_state_status, "get_controller_state")
+        device_enabled_status, device_enabled = AMXBase.get_device_enable(self)
+        self._raise_on_status(device_enabled_status, "get_device_enable")
+        housekeeping_status, volt_12v, volt_5v0, volt_3v3, temp_cpu = AMXBase.get_housekeeping(self)
+        self._raise_on_status(housekeeping_status, "get_housekeeping")
+        sensor_status, temperatures = AMXBase.get_sensor_data(self)
+        self._raise_on_status(sensor_status, "get_sensor_data")
+        fan_status, fan_enabled, fan_failed, fan_set_rpm, fan_measured_rpm, fan_pwm = AMXBase.get_fan_data(self)
+        self._raise_on_status(fan_status, "get_fan_data")
+        led_status, led_red, led_green, led_blue = AMXBase.get_led_data(self)
+        self._raise_on_status(led_status, "get_led_data")
+        cpu_status, cpu_load, cpu_frequency = AMXBase.get_cpu_data(self)
+        self._raise_on_status(cpu_status, "get_cpu_data")
+        uptime_status, uptime_s, uptime_ms, operation_s = AMXBase.get_uptime(self)
+        self._raise_on_status(uptime_status, "get_uptime")
+        total_time_status, total_uptime_s, total_operation_s = AMXBase.get_total_time(self)
+        self._raise_on_status(total_time_status, "get_total_time")
+        oscillator_status, oscillator_period = AMXBase.get_oscillator_period(self)
+        self._raise_on_status(oscillator_status, "get_oscillator_period")
+
+        pulsers = []
+        for pulser in range(self.PULSER_NUM):
+            delay_status, delay_ticks = AMXBase.get_pulser_delay(self, pulser)
+            self._raise_on_status(delay_status, f"get_pulser_delay({pulser})")
+            width_status, width_ticks = AMXBase.get_pulser_width(self, pulser)
+            self._raise_on_status(width_status, f"get_pulser_width({pulser})")
+            burst = None
+            if pulser < self.PULSER_BURST_NUM:
+                burst_status, burst = AMXBase.get_pulser_burst(self, pulser)
+                self._raise_on_status(burst_status, f"get_pulser_burst({pulser})")
+            pulsers.append(
+                {
+                    "pulser": pulser,
+                    "label": self.PULSER_LABELS.get(pulser, str(pulser)),
+                    "delay_ticks": delay_ticks,
+                    "width_ticks": width_ticks,
+                    "burst": burst,
+                }
+            )
+
+        switches = []
+        for switch in range(self.SWITCH_NUM):
+            trig_cfg_status, trigger_config = AMXBase.get_switch_trigger_config(self, switch)
+            self._raise_on_status(trig_cfg_status, f"get_switch_trigger_config({switch})")
+            enb_cfg_status, enable_config = AMXBase.get_switch_enable_config(self, switch)
+            self._raise_on_status(enb_cfg_status, f"get_switch_enable_config({switch})")
+            trig_delay_status, rise_delay, fall_delay = AMXBase.get_switch_trigger_delay(self, switch)
+            self._raise_on_status(trig_delay_status, f"get_switch_trigger_delay({switch})")
+            enb_delay_status, enable_delay = AMXBase.get_switch_enable_delay(self, switch)
+            self._raise_on_status(enb_delay_status, f"get_switch_enable_delay({switch})")
+            switches.append(
+                {
+                    "switch": switch,
+                    "trigger_config": trigger_config,
+                    "enable_config": enable_config,
+                    "trigger_delay": {
+                        "rise": rise_delay,
+                        "fall": fall_delay,
+                    },
+                    "enable_delay": enable_delay,
+                }
+            )
+
+        oscillator_frequency_hz = self.CLOCK / (oscillator_period + self.OSC_OFFSET)
+        return {
+            "device_enabled": device_enabled,
+            "main_state": {
+                "hex": main_state_hex,
+                "name": main_state_name,
+            },
+            "device_state": {
+                "hex": device_state_hex,
+                "flags": device_state_flags,
+            },
+            "controller_state": {
+                "hex": controller_state_hex,
+                "flags": controller_state_flags,
+            },
+            "housekeeping": {
+                "volt_12v_v": volt_12v,
+                "volt_5v0_v": volt_5v0,
+                "volt_3v3_v": volt_3v3,
+                "temp_cpu_c": temp_cpu,
+            },
+            "sensors_c": temperatures,
+            "fans": [
+                {
+                    "fan": index,
+                    "enabled": fan_enabled[index],
+                    "failed": fan_failed[index],
+                    "set_rpm": fan_set_rpm[index],
+                    "measured_rpm": fan_measured_rpm[index],
+                    "pwm": fan_pwm[index],
+                }
+                for index in range(self.FAN_NUM)
+            ],
+            "led": {
+                "red": led_red,
+                "green": led_green,
+                "blue": led_blue,
+            },
+            "cpu": {
+                "load": cpu_load,
+                "frequency_hz": cpu_frequency,
+            },
+            "uptime": {
+                "seconds": uptime_s,
+                "milliseconds": uptime_ms,
+                "operation_seconds": operation_s,
+                "total_uptime_seconds": total_uptime_s,
+                "total_operation_seconds": total_operation_s,
+            },
+            "oscillator": {
+                "period": oscillator_period,
+                "frequency_hz": oscillator_frequency_hz,
+            },
+            "pulsers": pulsers,
+            "switches": switches,
+        }
+
+    def collect_housekeeping(self) -> dict:
+        """Return a structured runtime snapshot suitable for monitoring."""
+        self._require_connected()
+        return self._call_locked(self._collect_housekeeping_unlocked)
+
     def initialize(
         self,
         config_number: int,
@@ -452,7 +707,7 @@ class AMX(AMXBase):
             if enable_device is not None:
                 self.set_device_enabled(enable_device)
         except Exception:
-            if was_connected or self.connected or self._transport_poisoned:
+            if not was_connected and (self.connected or self._transport_poisoned):
                 self.disconnect()
             raise
 

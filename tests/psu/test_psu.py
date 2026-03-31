@@ -11,12 +11,21 @@ from cgc.psu import PSU, PSUBase, PSUDllLoadError, PSUPlatformError
 ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "src" / "cgc" / "error_codes.json"
 
 
-def make_psu(monkeypatch):
+@pytest.fixture(autouse=True)
+def clear_psu_connection_registry():
+    with PSU._active_connections_lock:
+        PSU._active_connections.clear()
+    yield
+    with PSU._active_connections_lock:
+        PSU._active_connections.clear()
+
+
+def make_psu(monkeypatch, *, device_id="psu_test", com=6, port=0):
     monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
     dll = Mock()
     monkeypatch.setattr("cgc.psu.psu_base.ctypes.WinDLL", lambda _path: dll, raising=False)
     log_dir = Path(tempfile.gettempdir()) / "esibd_core_test_logs"
-    return PSU("psu_test", com=6, port=0, log_dir=log_dir), dll
+    return PSU(device_id, com=com, port=port, log_dir=log_dir), dll
 
 
 def test_psu_base_rejects_non_windows(monkeypatch):
@@ -73,6 +82,38 @@ def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     dll.COM_HVPSU2D_Close.assert_called_once()
 
 
+def test_connect_warns_when_reusing_the_same_dll_port(monkeypatch, caplog):
+    psu_a, dll_a = make_psu(monkeypatch, device_id="psu_a", com=6, port=0)
+    psu_b, dll_b = make_psu(monkeypatch, device_id="psu_b", com=7, port=0)
+    dll_a.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_a.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+
+    psu_a.connect()
+    with caplog.at_level(logging.WARNING):
+        psu_b.connect()
+
+    assert "same DLL port" in caplog.text
+    assert "port 0" in caplog.text
+
+
+def test_connect_warns_when_multiple_dll_ports_are_active(monkeypatch, caplog):
+    psu_a, dll_a = make_psu(monkeypatch, device_id="psu_a", com=6, port=0)
+    psu_b, dll_b = make_psu(monkeypatch, device_id="psu_b", com=7, port=1)
+    dll_a.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_a.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+
+    psu_a.connect()
+    with caplog.at_level(logging.WARNING):
+        psu_b.connect()
+
+    assert "Multiple PSU instances in this process currently claim DLL ports" in caplog.text
+    assert "[0, 1]" in caplog.text
+
+
 def test_initialize_loads_config_without_overriding_enable_flags(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     monkeypatch.setattr(psu, "connect", Mock(return_value=True))
@@ -107,6 +148,22 @@ def test_initialize_disconnects_on_failure(monkeypatch):
     psu.disconnect.assert_called_once()
 
 
+def test_initialize_keeps_existing_connection_on_failure(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    psu._dll_port_claimed = True
+    monkeypatch.setattr(psu, "connect", Mock(return_value=True))
+    monkeypatch.setattr(
+        psu, "load_user_config", Mock(side_effect=RuntimeError("boom"))
+    )
+    monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="boom"):
+        psu.initialize(config_number=19)
+
+    psu.disconnect.assert_not_called()
+
+
 def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     psu.connected = True
@@ -122,6 +179,27 @@ def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(m
     psu.set_output_enabled.assert_called_once_with(False, False)
     psu.set_device_enabled.assert_not_called()
     psu.disconnect.assert_called_once()
+
+
+def test_failed_disconnect_keeps_dll_port_claim_warning(monkeypatch, caplog):
+    psu_a, dll_a = make_psu(monkeypatch, device_id="psu_a", com=6, port=0)
+    psu_b, dll_b = make_psu(monkeypatch, device_id="psu_b", com=7, port=0)
+    dll_a.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR
+    dll_a.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    dll_b.COM_HVPSU2D_SetBaudRate.return_value = PSUBase.NO_ERR
+    dll_a.COM_HVPSU2D_Close.return_value = PSUBase.ERR_CLOSE
+
+    psu_a.connect()
+    assert psu_a.disconnect() is False
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING):
+        psu_b.connect()
+
+    assert psu_a.connected is False
+    assert psu_a._dll_port_claimed is True
+    assert "same DLL port" in caplog.text
 
 
 def test_list_configs_filters_empty_entries(monkeypatch):
@@ -141,3 +219,190 @@ def test_list_configs_filters_empty_entries(monkeypatch):
         {"index": 0, "name": "standby", "active": True, "valid": True},
         {"index": 2, "name": "test", "active": False, "valid": True},
     ]
+
+
+def test_get_product_info_returns_structured_metadata(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(PSUBase, "get_product_no", lambda self: (self.NO_ERR, 350))
+    monkeypatch.setattr(
+        PSUBase, "get_product_id", lambda self: (self.NO_ERR, "PSU-CTRL-2D")
+    )
+    monkeypatch.setattr(PSUBase, "get_fw_version", lambda self: (self.NO_ERR, 0x0102))
+    monkeypatch.setattr(
+        PSUBase, "get_fw_date", lambda self: (self.NO_ERR, "2026-03-31")
+    )
+    monkeypatch.setattr(PSUBase, "get_hw_type", lambda self: (self.NO_ERR, 17))
+    monkeypatch.setattr(PSUBase, "get_hw_version", lambda self: (self.NO_ERR, 3))
+
+    info = psu.get_product_info()
+
+    assert info == {
+        "product_no": 350,
+        "product_id": "PSU-CTRL-2D",
+        "firmware": {
+            "version": 0x0102,
+            "date": "2026-03-31",
+        },
+        "hardware": {
+            "type": 17,
+            "version": 3,
+        },
+    }
+
+
+def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(
+        PSUBase, "get_main_state", lambda self: (self.NO_ERR, "0x0000", "STATE_ON")
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_device_state",
+        lambda self: (self.NO_ERR, "0x0001", ["DEVST_VCPU_FAIL"]),
+    )
+    monkeypatch.setattr(PSUBase, "get_device_enable", lambda self: (self.NO_ERR, True))
+    monkeypatch.setattr(PSUBase, "get_psu_enable", lambda self: (self.NO_ERR, True, False))
+    monkeypatch.setattr(
+        PSUBase,
+        "get_housekeeping",
+        lambda self: (self.NO_ERR, 24.0, 5.0, 3.3, 41.5),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_sensor_data",
+        lambda self: (self.NO_ERR, [12.0, 13.0, 14.0]),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_fan_data",
+        lambda self: (
+            self.NO_ERR,
+            [True, True, False],
+            [False, False, True],
+            [1000, 1100, 1200],
+            [990, 1090, 1190],
+            [100, 110, 120],
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_led_data", lambda self: (self.NO_ERR, True, False, True)
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_cpu_data", lambda self: (self.NO_ERR, 0.25, 250_000_000.0)
+    )
+    monkeypatch.setattr(PSUBase, "get_uptime", lambda self: (self.NO_ERR, 12, 34, 56))
+    monkeypatch.setattr(
+        PSUBase, "get_total_time", lambda self: (self.NO_ERR, 120, 560)
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_data",
+        lambda self, channel: (
+            self.NO_ERR,
+            10.0 + channel,
+            0.1 + channel,
+            1.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_set_output_voltage",
+        lambda self, channel: (
+            self.NO_ERR,
+            20.0 + channel,
+            30.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_set_output_current",
+        lambda self, channel: (
+            self.NO_ERR,
+            0.2 + channel,
+            0.3 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_adc_housekeeping",
+        lambda self, channel: (
+            self.NO_ERR,
+            1.1 + channel,
+            1.2 + channel,
+            1.3 + channel,
+            1.4 + channel,
+            1.5 + channel,
+            40.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_housekeeping",
+        lambda self, channel: (
+            self.NO_ERR,
+            24.0 + channel,
+            12.0 + channel,
+            -12.0 - channel,
+            2.5 + channel,
+        ),
+    )
+
+    snapshot = psu.collect_housekeeping()
+
+    assert snapshot["device_enabled"] is True
+    assert snapshot["output_enabled"] == (True, False)
+    assert snapshot["main_state"] == {"hex": "0x0000", "name": "STATE_ON"}
+    assert snapshot["device_state"] == {
+        "hex": "0x0001",
+        "flags": ["DEVST_VCPU_FAIL"],
+    }
+    assert snapshot["housekeeping"] == {
+        "volt_rect_v": 24.0,
+        "volt_5v0_v": 5.0,
+        "volt_3v3_v": 3.3,
+        "temp_cpu_c": 41.5,
+    }
+    assert snapshot["sensors_c"] == [12.0, 13.0, 14.0]
+    assert snapshot["led"] == {"red": True, "green": False, "blue": True}
+    assert snapshot["cpu"] == {"load": 0.25, "frequency_hz": 250_000_000.0}
+    assert snapshot["uptime"] == {
+        "seconds": 12,
+        "milliseconds": 34,
+        "operation_seconds": 56,
+        "total_uptime_seconds": 120,
+        "total_operation_seconds": 560,
+    }
+    assert snapshot["channels"][0] == {
+        "channel": 0,
+        "label": "positive",
+        "enabled": True,
+        "voltage": {
+            "measured_v": 10.0,
+            "set_v": 20.0,
+            "limit_v": 30.0,
+        },
+        "current": {
+            "measured_a": 0.1,
+            "set_a": 0.2,
+            "limit_a": 0.3,
+        },
+        "dropout_v": 1.0,
+        "adc": {
+            "volt_avdd_v": 1.1,
+            "volt_dvdd_v": 1.2,
+            "volt_aldo_v": 1.3,
+            "volt_dldo_v": 1.4,
+            "volt_ref_v": 1.5,
+            "temp_adc_c": 40.0,
+        },
+        "rails": {
+            "volt_24vp_v": 24.0,
+            "volt_12vp_v": 12.0,
+            "volt_12vn_v": -12.0,
+            "volt_ref_v": 2.5,
+        },
+    }
+    assert snapshot["channels"][1]["label"] == "negative"
+    assert snapshot["channels"][1]["enabled"] is False

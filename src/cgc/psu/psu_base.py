@@ -72,9 +72,13 @@ class PSUBase:
     PSU_POS = 0
     PSU_NEG = 1
     PSU_NUM = 2
+    SENSOR_NUM = 3
+    FAN_NUM = 3
     MAX_PORT = 16
     MAX_CONFIG = 168
     CONFIG_NAME_SIZE = 75
+    FW_DATE_SIZE = 16
+    PRODUCT_ID_SIZE = 60
 
     def __init__(
         self,
@@ -207,6 +211,117 @@ class PSUBase:
                     active_states.append(name)
         return status, hex(state_value), active_states
 
+    def get_housekeeping(self):
+        """Get the PSU housekeeping values."""
+        volt_rect = ctypes.c_double()
+        volt_5v0 = ctypes.c_double()
+        volt_3v3 = ctypes.c_double()
+        temp_cpu = ctypes.c_double()
+        status = self.psu_dll.COM_HVPSU2D_GetHousekeeping(
+            self.port,
+            ctypes.byref(volt_rect),
+            ctypes.byref(volt_5v0),
+            ctypes.byref(volt_3v3),
+            ctypes.byref(temp_cpu),
+        )
+        return status, volt_rect.value, volt_5v0.value, volt_3v3.value, temp_cpu.value
+
+    def get_sensor_data(self):
+        """Get the three PSU temperature sensor readings."""
+        temperatures = (ctypes.c_double * self.SENSOR_NUM)()
+        status = self.psu_dll.COM_HVPSU2D_GetSensorData(self.port, temperatures)
+        return status, [temperatures[i] for i in range(self.SENSOR_NUM)]
+
+    def get_fan_data(self):
+        """Get the configured and measured fan values."""
+        enabled = (ctypes.c_bool * self.FAN_NUM)()
+        failed = (ctypes.c_bool * self.FAN_NUM)()
+        set_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
+        measured_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
+        pwm = (ctypes.c_uint16 * self.FAN_NUM)()
+        status = self.psu_dll.COM_HVPSU2D_GetFanData(
+            self.port, enabled, failed, set_rpm, measured_rpm, pwm
+        )
+        return (
+            status,
+            [bool(enabled[i]) for i in range(self.FAN_NUM)],
+            [bool(failed[i]) for i in range(self.FAN_NUM)],
+            [int(set_rpm[i]) for i in range(self.FAN_NUM)],
+            [int(measured_rpm[i]) for i in range(self.FAN_NUM)],
+            [int(pwm[i]) for i in range(self.FAN_NUM)],
+        )
+
+    def get_led_data(self):
+        """Get the PSU controller LED state."""
+        red = ctypes.c_bool()
+        green = ctypes.c_bool()
+        blue = ctypes.c_bool()
+        status = self.psu_dll.COM_HVPSU2D_GetLEDData(
+            self.port, ctypes.byref(red), ctypes.byref(green), ctypes.byref(blue)
+        )
+        return status, red.value, green.value, blue.value
+
+    def get_adc_housekeeping(self, channel: int):
+        """Get ADC housekeeping data for one PSU channel."""
+        channel = self._validate_channel(channel)
+        volt_avdd = ctypes.c_double()
+        volt_dvdd = ctypes.c_double()
+        volt_aldo = ctypes.c_double()
+        volt_dldo = ctypes.c_double()
+        volt_ref = ctypes.c_double()
+        temp_adc = ctypes.c_double()
+        status = self.psu_dll.COM_HVPSU2D_GetADCHousekeeping(
+            self.port,
+            channel,
+            ctypes.byref(volt_avdd),
+            ctypes.byref(volt_dvdd),
+            ctypes.byref(volt_aldo),
+            ctypes.byref(volt_dldo),
+            ctypes.byref(volt_ref),
+            ctypes.byref(temp_adc),
+        )
+        return (
+            status,
+            volt_avdd.value,
+            volt_dvdd.value,
+            volt_aldo.value,
+            volt_dldo.value,
+            volt_ref.value,
+            temp_adc.value,
+        )
+
+    def get_psu_housekeeping(self, channel: int):
+        """Get rail housekeeping data for one PSU channel."""
+        channel = self._validate_channel(channel)
+        volt_24vp = ctypes.c_double()
+        volt_12vp = ctypes.c_double()
+        volt_12vn = ctypes.c_double()
+        volt_ref = ctypes.c_double()
+        status = self.psu_dll.COM_HVPSU2D_GetPSUHousekeeping(
+            self.port,
+            channel,
+            ctypes.byref(volt_24vp),
+            ctypes.byref(volt_12vp),
+            ctypes.byref(volt_12vn),
+            ctypes.byref(volt_ref),
+        )
+        return status, volt_24vp.value, volt_12vp.value, volt_12vn.value, volt_ref.value
+
+    def get_psu_data(self, channel: int):
+        """Get measured output data for one PSU channel."""
+        channel = self._validate_channel(channel)
+        voltage = ctypes.c_double()
+        current = ctypes.c_double()
+        volt_dropout = ctypes.c_double()
+        status = self.psu_dll.COM_HVPSU2D_GetPSUData(
+            self.port,
+            channel,
+            ctypes.byref(voltage),
+            ctypes.byref(current),
+            ctypes.byref(volt_dropout),
+        )
+        return status, voltage.value, current.value, volt_dropout.value
+
     def get_device_enable(self):
         """Get the device enable state."""
         enable = ctypes.c_bool()
@@ -235,6 +350,36 @@ class PSUBase:
         return self.psu_dll.COM_HVPSU2D_SetPSUEnable(
             self.port, ctypes.c_bool(bool(psu0)), ctypes.c_bool(bool(psu1))
         )
+
+    def has_psu_full_range(self):
+        """Return whether range switching is implemented for each channel."""
+        psu0 = ctypes.c_bool()
+        psu1 = ctypes.c_bool()
+        status = self.psu_dll.COM_HVPSU2D_HasPSUFullRange(
+            self.port, ctypes.byref(psu0), ctypes.byref(psu1)
+        )
+        return status, psu0.value, psu1.value
+
+    def set_psu_full_range(self, psu0: bool, psu1: bool) -> int:
+        """Set the full-range state for both PSU channels."""
+        return self.psu_dll.COM_HVPSU2D_SetPSUFullRange(
+            self.port, ctypes.c_bool(bool(psu0)), ctypes.c_bool(bool(psu1))
+        )
+
+    def get_psu_full_range(self):
+        """Return the full-range state for both PSU channels."""
+        psu0 = ctypes.c_bool()
+        psu1 = ctypes.c_bool()
+        status = self.psu_dll.COM_HVPSU2D_GetPSUFullRange(
+            self.port, ctypes.byref(psu0), ctypes.byref(psu1)
+        )
+        return status, psu0.value, psu1.value
+
+    def get_psu_state(self):
+        """Get the raw PSU state bitfield."""
+        state = ctypes.c_uint32()
+        status = self.psu_dll.COM_HVPSU2D_GetPSUState(self.port, ctypes.byref(state))
+        return status, state.value
 
     def get_psu_output_voltage(self, channel: int):
         """Get the output voltage of one PSU channel in volts."""
@@ -337,3 +482,72 @@ class PSUBase:
             [bool(active[i]) for i in range(self.MAX_CONFIG)],
             [bool(valid[i]) for i in range(self.MAX_CONFIG)],
         )
+
+    def get_cpu_data(self):
+        """Get the controller CPU load and frequency."""
+        load = ctypes.c_double()
+        frequency = ctypes.c_double()
+        status = self.psu_dll.COM_HVPSU2D_GetCPUData(
+            self.port, ctypes.byref(load), ctypes.byref(frequency)
+        )
+        return status, load.value, frequency.value
+
+    def get_uptime(self):
+        """Get current uptime and operation time."""
+        seconds = ctypes.c_uint32()
+        milliseconds = ctypes.c_uint16()
+        optime = ctypes.c_uint32()
+        status = self.psu_dll.COM_HVPSU2D_GetUptime(
+            self.port,
+            ctypes.byref(seconds),
+            ctypes.byref(milliseconds),
+            ctypes.byref(optime),
+        )
+        return status, seconds.value, milliseconds.value, optime.value
+
+    def get_total_time(self):
+        """Get total uptime and total operation time."""
+        uptime = ctypes.c_uint32()
+        optime = ctypes.c_uint32()
+        status = self.psu_dll.COM_HVPSU2D_GetTotalTime(
+            self.port, ctypes.byref(uptime), ctypes.byref(optime)
+        )
+        return status, uptime.value, optime.value
+
+    def get_hw_type(self):
+        """Get the hardware type."""
+        hw_type = ctypes.c_uint32()
+        status = self.psu_dll.COM_HVPSU2D_GetHWType(self.port, ctypes.byref(hw_type))
+        return status, hw_type.value
+
+    def get_hw_version(self):
+        """Get the hardware version."""
+        hw_version = ctypes.c_uint16()
+        status = self.psu_dll.COM_HVPSU2D_GetHWVersion(
+            self.port, ctypes.byref(hw_version)
+        )
+        return status, hw_version.value
+
+    def get_fw_version(self):
+        """Get the firmware version."""
+        version = ctypes.c_uint16()
+        status = self.psu_dll.COM_HVPSU2D_GetFWVersion(self.port, ctypes.byref(version))
+        return status, version.value
+
+    def get_fw_date(self):
+        """Get the firmware date string."""
+        date_string = ctypes.create_string_buffer(self.FW_DATE_SIZE)
+        status = self.psu_dll.COM_HVPSU2D_GetFWDate(self.port, date_string)
+        return status, date_string.value.decode()
+
+    def get_product_id(self):
+        """Get the product identification string."""
+        identification = ctypes.create_string_buffer(self.PRODUCT_ID_SIZE)
+        status = self.psu_dll.COM_HVPSU2D_GetProductID(self.port, identification)
+        return status, identification.value.decode()
+
+    def get_product_no(self):
+        """Get the product number."""
+        number = ctypes.c_uint32()
+        status = self.psu_dll.COM_HVPSU2D_GetProductNo(self.port, ctypes.byref(number))
+        return status, number.value

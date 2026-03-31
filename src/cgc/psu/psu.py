@@ -6,6 +6,7 @@ import logging
 import queue
 import threading
 import time
+import weakref
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,13 @@ class PSU(PSUBase):
     current limits at runtime.
     """
 
+    _active_connections_lock = threading.Lock()
+    _active_connections: dict[int, dict[str, object]] = {}
+    CHANNEL_LABELS = {
+        PSUBase.PSU_POS: "positive",
+        PSUBase.PSU_NEG: "negative",
+    }
+
     def __init__(
         self,
         device_id: str,
@@ -50,6 +58,7 @@ class PSU(PSUBase):
         self.port_num = int(port)
         self.baudrate = int(baudrate)
         self.connected = False
+        self._dll_port_claimed = False
         self._transport_poisoned = False
         self._transport_error = None
 
@@ -79,6 +88,76 @@ class PSU(PSUBase):
 
         super().__init__(com=com, port=port, log=None, idn=device_id, dll_path=dll_path)
 
+    @classmethod
+    def _purge_stale_connections(cls):
+        stale = []
+        for instance_id, entry in cls._active_connections.items():
+            instance = entry["ref"]()
+            if instance is None or not instance._dll_port_claimed:
+                stale.append(instance_id)
+        for instance_id in stale:
+            cls._active_connections.pop(instance_id, None)
+
+    def _register_connected_instance(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._purge_stale_connections()
+            cls._active_connections[id(self)] = {
+                "ref": weakref.ref(self),
+                "device_id": self.device_id,
+                "com": self.com,
+                "port": self.port_num,
+            }
+
+    def _unregister_connected_instance(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._active_connections.pop(id(self), None)
+            cls._purge_stale_connections()
+
+    def _set_port_claimed(self, claimed: bool):
+        self._dll_port_claimed = bool(claimed)
+        if self._dll_port_claimed:
+            self._register_connected_instance()
+        else:
+            self._unregister_connected_instance()
+
+    def _warn_on_other_process_ports(self):
+        cls = type(self)
+        with cls._active_connections_lock:
+            cls._purge_stale_connections()
+            others = [
+                entry
+                for instance_id, entry in cls._active_connections.items()
+                if instance_id != id(self)
+            ]
+
+        if not others:
+            return
+
+        same_port = [entry for entry in others if entry["port"] == self.port_num]
+        if same_port:
+            other_devices = ", ".join(
+                f"{entry['device_id']}@COM{entry['com']}" for entry in same_port
+            )
+            self.logger.warning(
+                "Another PSU instance in this process already claims the same DLL "
+                f"port {self.port_num}: {other_devices}. Reusing the same DLL port "
+                "can reassign or close the shared vendor channel unexpectedly."
+            )
+            return
+
+        all_ports = sorted({entry["port"] for entry in others} | {self.port_num})
+        other_devices = ", ".join(
+            f"{entry['device_id']}@COM{entry['com']}/port{entry['port']}"
+            for entry in others
+        )
+        self.logger.warning(
+            "Multiple PSU instances in this process currently claim DLL ports "
+            f"{all_ports}: {other_devices}. The vendor DLL exposes independent "
+            "ports, but keep one active instance per port in each workflow."
+        )
+
     def _raise_if_transport_poisoned(self):
         if self._transport_poisoned:
             detail = self._transport_error or "unknown transport failure"
@@ -94,6 +173,7 @@ class PSU(PSUBase):
             "The device may be powered off or unresponsive."
         )
         self.connected = False
+        self._set_port_claimed(True)
 
     def _call_locked_with_timeout(self, method, timeout_s, step_name, *args, **kwargs):
         self._raise_if_transport_poisoned()
@@ -164,11 +244,13 @@ class PSU(PSUBase):
         """Connect to the PSU device."""
         try:
             if self.connected:
+                self._set_port_claimed(True)
                 self.logger.info(
                     f"PSU device {self.device_id} is already connected; skipping open_port"
                 )
                 return True
 
+            self._warn_on_other_process_ports()
             self.logger.info(
                 f"Connecting to PSU device {self.device_id} "
                 f"on COM{self.com}, port {self.port_num}"
@@ -187,6 +269,7 @@ class PSU(PSUBase):
                 )
 
             self.connected = True
+            self._set_port_claimed(True)
             baud_status, actual_baud = self._call_locked_with_timeout(
                 set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
             )
@@ -208,6 +291,8 @@ class PSU(PSUBase):
                     "PSU port rollback after baud-rate failure also failed: "
                     f"{self.format_status(close_status)}"
                 )
+            else:
+                self._set_port_claimed(False)
             self.connected = False
             raise RuntimeError(
                 f"PSU set_baud_rate failed: {self.format_status(baud_status)}"
@@ -223,6 +308,7 @@ class PSU(PSUBase):
 
         try:
             if self._transport_poisoned:
+                self._set_port_claimed(True)
                 self.logger.warning(
                     f"Skipping PSU close_port for {self.device_id} because the "
                     "transport is marked unusable."
@@ -230,22 +316,27 @@ class PSU(PSUBase):
                 return False
 
             if not was_connected:
+                if not self._dll_port_claimed:
+                    self._set_port_claimed(False)
                 return True
 
             self.logger.info(f"Disconnecting PSU device {self.device_id}")
             status = self._call_locked(super().close_port)
             if status == self.NO_ERR:
+                self._set_port_claimed(False)
                 self.logger.info(
                     f"Successfully disconnected PSU device {self.device_id}"
                 )
                 return True
 
+            self._set_port_claimed(True)
             self.logger.error(
                 f"Failed to disconnect PSU device {self.device_id}: "
                 f"{self.format_status(status)}"
             )
             return False
         except Exception as exc:
+            self._set_port_claimed(True)
             self.logger.error(f"Disconnection error: {exc}")
             return False
 
@@ -363,6 +454,160 @@ class PSU(PSUBase):
         self._raise_on_status(status, f"get_psu_set_output_current({channel})")
         return setpoint, limit
 
+    def _get_product_info_unlocked(self) -> dict:
+        product_no_status, product_no = PSUBase.get_product_no(self)
+        self._raise_on_status(product_no_status, "get_product_no")
+        product_id_status, product_id = PSUBase.get_product_id(self)
+        self._raise_on_status(product_id_status, "get_product_id")
+        fw_version_status, fw_version = PSUBase.get_fw_version(self)
+        self._raise_on_status(fw_version_status, "get_fw_version")
+        fw_date_status, fw_date = PSUBase.get_fw_date(self)
+        self._raise_on_status(fw_date_status, "get_fw_date")
+        hw_type_status, hw_type = PSUBase.get_hw_type(self)
+        self._raise_on_status(hw_type_status, "get_hw_type")
+        hw_version_status, hw_version = PSUBase.get_hw_version(self)
+        self._raise_on_status(hw_version_status, "get_hw_version")
+        return {
+            "product_no": product_no,
+            "product_id": product_id,
+            "firmware": {
+                "version": fw_version,
+                "date": fw_date,
+            },
+            "hardware": {
+                "type": hw_type,
+                "version": hw_version,
+            },
+        }
+
+    def get_product_info(self) -> dict:
+        """Return stable product, firmware and hardware metadata."""
+        self._require_connected()
+        return self._call_locked(self._get_product_info_unlocked)
+
+    def _collect_housekeeping_unlocked(self) -> dict:
+        main_status, main_state_hex, main_state_name = PSUBase.get_main_state(self)
+        self._raise_on_status(main_status, "get_main_state")
+        device_state_status, device_state_hex, device_state_flags = PSUBase.get_device_state(self)
+        self._raise_on_status(device_state_status, "get_device_state")
+        device_enabled_status, device_enabled = PSUBase.get_device_enable(self)
+        self._raise_on_status(device_enabled_status, "get_device_enable")
+        outputs_enabled_status, psu0_enabled, psu1_enabled = PSUBase.get_psu_enable(self)
+        self._raise_on_status(outputs_enabled_status, "get_psu_enable")
+        housekeeping_status, volt_rect, volt_5v0, volt_3v3, temp_cpu = PSUBase.get_housekeeping(self)
+        self._raise_on_status(housekeeping_status, "get_housekeeping")
+        sensor_status, temperatures = PSUBase.get_sensor_data(self)
+        self._raise_on_status(sensor_status, "get_sensor_data")
+        fan_status, fan_enabled, fan_failed, fan_set_rpm, fan_measured_rpm, fan_pwm = PSUBase.get_fan_data(self)
+        self._raise_on_status(fan_status, "get_fan_data")
+        led_status, led_red, led_green, led_blue = PSUBase.get_led_data(self)
+        self._raise_on_status(led_status, "get_led_data")
+        cpu_status, cpu_load, cpu_frequency = PSUBase.get_cpu_data(self)
+        self._raise_on_status(cpu_status, "get_cpu_data")
+        uptime_status, uptime_s, uptime_ms, operation_s = PSUBase.get_uptime(self)
+        self._raise_on_status(uptime_status, "get_uptime")
+        total_time_status, total_uptime_s, total_operation_s = PSUBase.get_total_time(self)
+        self._raise_on_status(total_time_status, "get_total_time")
+
+        output_enabled = (psu0_enabled, psu1_enabled)
+        channels = []
+        for channel in range(self.PSU_NUM):
+            measured_status, measured_voltage, measured_current, dropout_voltage = PSUBase.get_psu_data(self, channel)
+            self._raise_on_status(measured_status, f"get_psu_data({channel})")
+            voltage_status, set_voltage, limit_voltage = PSUBase.get_psu_set_output_voltage(self, channel)
+            self._raise_on_status(voltage_status, f"get_psu_set_output_voltage({channel})")
+            current_status, set_current, limit_current = PSUBase.get_psu_set_output_current(self, channel)
+            self._raise_on_status(current_status, f"get_psu_set_output_current({channel})")
+            adc_status, volt_avdd, volt_dvdd, volt_aldo, volt_dldo, volt_ref, temp_adc = PSUBase.get_adc_housekeeping(self, channel)
+            self._raise_on_status(adc_status, f"get_adc_housekeeping({channel})")
+            rail_status, volt_24vp, volt_12vp, volt_12vn, rail_ref = PSUBase.get_psu_housekeeping(self, channel)
+            self._raise_on_status(rail_status, f"get_psu_housekeeping({channel})")
+            channels.append(
+                {
+                    "channel": channel,
+                    "label": self.CHANNEL_LABELS.get(channel, str(channel)),
+                    "enabled": output_enabled[channel],
+                    "voltage": {
+                        "measured_v": measured_voltage,
+                        "set_v": set_voltage,
+                        "limit_v": limit_voltage,
+                    },
+                    "current": {
+                        "measured_a": measured_current,
+                        "set_a": set_current,
+                        "limit_a": limit_current,
+                    },
+                    "dropout_v": dropout_voltage,
+                    "adc": {
+                        "volt_avdd_v": volt_avdd,
+                        "volt_dvdd_v": volt_dvdd,
+                        "volt_aldo_v": volt_aldo,
+                        "volt_dldo_v": volt_dldo,
+                        "volt_ref_v": volt_ref,
+                        "temp_adc_c": temp_adc,
+                    },
+                    "rails": {
+                        "volt_24vp_v": volt_24vp,
+                        "volt_12vp_v": volt_12vp,
+                        "volt_12vn_v": volt_12vn,
+                        "volt_ref_v": rail_ref,
+                    },
+                }
+            )
+
+        return {
+            "device_enabled": device_enabled,
+            "output_enabled": output_enabled,
+            "main_state": {
+                "hex": main_state_hex,
+                "name": main_state_name,
+            },
+            "device_state": {
+                "hex": device_state_hex,
+                "flags": device_state_flags,
+            },
+            "housekeeping": {
+                "volt_rect_v": volt_rect,
+                "volt_5v0_v": volt_5v0,
+                "volt_3v3_v": volt_3v3,
+                "temp_cpu_c": temp_cpu,
+            },
+            "sensors_c": temperatures,
+            "fans": [
+                {
+                    "fan": index,
+                    "enabled": fan_enabled[index],
+                    "failed": fan_failed[index],
+                    "set_rpm": fan_set_rpm[index],
+                    "measured_rpm": fan_measured_rpm[index],
+                    "pwm": fan_pwm[index],
+                }
+                for index in range(self.FAN_NUM)
+            ],
+            "led": {
+                "red": led_red,
+                "green": led_green,
+                "blue": led_blue,
+            },
+            "cpu": {
+                "load": cpu_load,
+                "frequency_hz": cpu_frequency,
+            },
+            "uptime": {
+                "seconds": uptime_s,
+                "milliseconds": uptime_ms,
+                "operation_seconds": operation_s,
+                "total_uptime_seconds": total_uptime_s,
+                "total_operation_seconds": total_operation_s,
+            },
+            "channels": channels,
+        }
+
+    def collect_housekeeping(self) -> dict:
+        """Return a structured runtime snapshot suitable for monitoring."""
+        self._require_connected()
+        return self._call_locked(self._collect_housekeeping_unlocked)
+
     def initialize(
         self,
         config_number: int,
@@ -386,7 +631,7 @@ class PSU(PSUBase):
             if enable_outputs is not None:
                 self.set_output_enabled(*enable_outputs)
         except Exception:
-            if was_connected or self.connected or self._transport_poisoned:
+            if not was_connected and (self.connected or self._transport_poisoned):
                 self.disconnect()
             raise
 

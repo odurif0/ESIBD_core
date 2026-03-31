@@ -12,6 +12,28 @@ This driver follows a configuration-first workflow:
 
 This matches the vendor recommendation for reproducible operation.
 
+## Recommended API
+
+For application code, use the high-level driver methods:
+
+- construct the driver with `PSU(..., com=..., port=...)`
+- call `connect()` or `initialize()`
+- use the high-level getters and setters
+- use `get_product_info()` for stable metadata
+- use `collect_housekeeping()` for a structured runtime snapshot
+- finish with `shutdown()` or `disconnect()`
+
+Do not treat `open_port()` as the normal entry point. It is a low-level DLL
+primitive exposed by `psu_base.py`, not the full driver connection workflow.
+In particular, `connect()` adds:
+
+- timeout handling around native DLL calls
+- logging
+- driver state tracking through `self.connected`
+- baud-rate setup
+- rollback on partial connection failure
+- warnings when multiple PSU instances are active in the same process
+
 ## What It Does
 
 - Connects to a CGC PSU controller over a Windows COM port
@@ -19,6 +41,8 @@ This matches the vendor recommendation for reproducible operation.
 - Lists and loads stored user configurations
 - Enables or disables the device and both PSU outputs
 - Sets and reads output voltages and currents
+- Exposes `get_product_info()` for product, firmware and hardware metadata
+- Exposes `collect_housekeeping()` for structured monitoring data
 
 ## Files
 
@@ -43,3 +67,71 @@ try:
 finally:
     psu.shutdown()
 ```
+
+## Low-Level Primitives
+
+Low-level communication primitives are implemented in `psu_base.py`. They are
+useful for debugging or vendor-level investigations, but they are not the
+recommended application API.
+
+Transport:
+
+- `open_port(com_number, port_number=None)`
+- `close_port()`
+- `set_baud_rate(baud_rate)`
+- `purge()`
+- `device_purge()`
+- `get_buffer_state()`
+
+Device state and housekeeping:
+
+- `get_main_state()`
+- `get_device_state()`
+- `get_housekeeping()`
+- `get_sensor_data()`
+- `get_fan_data()`
+- `get_led_data()`
+- `get_adc_housekeeping(psu_no)`
+- `get_psu_housekeeping(psu_no)`
+- `get_psu_data(psu_no)`
+- `get_psu_state()`
+
+Enable and outputs:
+
+- `get_device_enable()`
+- `set_device_enable(enable)`
+- `get_psu_enable()`
+- `set_psu_enable(psu0, psu1)`
+- `has_psu_full_range()`
+- `get_psu_full_range()`
+- `set_psu_full_range(psu0, psu1)`
+
+Voltage and current:
+
+- `set_psu_output_voltage(psu_no, voltage)`
+- `get_psu_output_voltage(psu_no)`
+- `get_psu_set_output_voltage(psu_no)`
+- `set_psu_output_current(psu_no, current)`
+- `get_psu_output_current(psu_no)`
+- `get_psu_set_output_current(psu_no)`
+
+Configurations:
+
+- `reset_current_config()`
+- `save_current_config(config_number)`
+- `load_current_config(config_number)`
+- `get_config_name(config_number)`
+- `get_config_flags(config_number)`
+- `get_config_list()`
+
+Device information:
+
+- `get_cpu_data()`
+- `get_uptime()`
+- `get_total_time()`
+- `get_hw_type()`
+- `get_hw_version()`
+- `get_fw_version()`
+- `get_fw_date()`
+- `get_product_id()`
+- `get_product_no()`
