@@ -72,6 +72,11 @@ class PSUBase:
         (1 << 0x1A): "DEVST_SEN3_LOW",
     }
 
+    PSU_STATE_PSU0_ENB_CTRL = 1 << 4
+    PSU_STATE_PSU1_ENB_CTRL = 1 << 5
+    PSU_STATE_PSU0_ENB_ACT = 1 << 20
+    PSU_STATE_PSU1_ENB_ACT = 1 << 21
+
     PSU_POS = 0
     PSU_NEG = 1
     PSU_NUM = 2

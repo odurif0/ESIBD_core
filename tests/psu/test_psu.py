@@ -242,6 +242,35 @@ def test_list_configs_filters_empty_entries(monkeypatch):
     ]
 
 
+def test_list_configs_falls_back_to_per_config_flags(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(
+        PSUBase,
+        "get_config_list",
+        lambda self: (self.ERR_DATA_RECEIVE, [], []),
+    )
+    flags = {
+        0: (PSUBase.NO_ERR, True, True),
+        1: (PSUBase.NO_ERR, False, False),
+        2: (PSUBase.NO_ERR, False, True),
+    }
+    monkeypatch.setattr(
+        PSUBase,
+        "get_config_flags",
+        lambda self, index: flags.get(index, (self.NO_ERR, False, False)),
+    )
+    names = {0: (PSUBase.NO_ERR, "standby"), 2: (PSUBase.NO_ERR, "test")}
+    monkeypatch.setattr(PSUBase, "get_config_name", lambda self, index: names[index])
+
+    configs = psu.list_configs()
+
+    assert configs == [
+        {"index": 0, "name": "standby", "active": True, "valid": True},
+        {"index": 2, "name": "test", "active": False, "valid": True},
+    ]
+
+
 def test_get_product_info_returns_structured_metadata(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     psu.connected = True
@@ -270,6 +299,60 @@ def test_get_product_info_returns_structured_metadata(monkeypatch):
             "version": 3,
         },
     }
+
+
+def test_get_product_info_tolerates_optional_metadata_failures(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(PSUBase, "get_product_no", lambda self: (self.NO_ERR, 350))
+    monkeypatch.setattr(
+        PSUBase, "get_product_id", lambda self: (self.NO_ERR, "PSU-CTRL-2D")
+    )
+    monkeypatch.setattr(PSUBase, "get_fw_version", lambda self: (self.NO_ERR, 0x0102))
+    monkeypatch.setattr(
+        PSUBase, "get_fw_date", lambda self: (self.NO_ERR, "2026-03-31")
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_hw_type", lambda self: (self.ERR_DATA_RECEIVE, 0)
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_hw_version", lambda self: (self.ERR_COMMAND_RECEIVE, 0)
+    )
+
+    info = psu.get_product_info()
+
+    assert info == {
+        "product_no": 350,
+        "product_id": "PSU-CTRL-2D",
+        "firmware": {
+            "version": 0x0102,
+            "date": "2026-03-31",
+        },
+        "hardware": {
+            "type": None,
+            "version": None,
+        },
+    }
+
+
+def test_get_output_enabled_falls_back_to_psu_state(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_enable",
+        lambda self: (self.ERR_COMMAND_RECEIVE, False, False),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_state",
+        lambda self: (
+            self.NO_ERR,
+            self.PSU_STATE_PSU0_ENB_CTRL | self.PSU_STATE_PSU1_ENB_CTRL,
+        ),
+    )
+
+    assert psu.get_output_enabled() == (True, True)
 
 
 def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):

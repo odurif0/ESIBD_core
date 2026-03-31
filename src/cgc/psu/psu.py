@@ -36,6 +36,14 @@ class PSU(PSUBase):
         PSUBase.PSU_POS: "positive",
         PSUBase.PSU_NEG: "negative",
     }
+    _COMPAT_OPTIONAL_STATUSES = frozenset(
+        {
+            PSUBase.ERR_COMMAND_RECEIVE,
+            PSUBase.ERR_DATA_RECEIVE,
+            PSUBase.ERR_COMMAND_WRONG,
+            PSUBase.ERR_ARGUMENT_WRONG,
+        }
+    )
 
     def __init__(
         self,
@@ -351,11 +359,64 @@ class PSU(PSUBase):
             "transport_poisoned": self._transport_poisoned,
         }
 
+    def _is_optional_command_failure(self, status: int) -> bool:
+        return status in self._COMPAT_OPTIONAL_STATUSES
+
+    def _read_optional_metadata(self, method, action: str):
+        status, value = method(self)
+        if status == self.NO_ERR:
+            return value
+        if self._is_optional_command_failure(status):
+            self.logger.warning(
+                f"PSU {action} is unavailable on this controller: "
+                f"{self.format_status(status)}"
+            )
+            return None
+        self._raise_on_status(status, action)
+        return None
+
+    def _get_output_enabled_unlocked(self) -> tuple[bool, bool]:
+        status, psu0, psu1 = PSUBase.get_psu_enable(self)
+        if status == self.NO_ERR:
+            return psu0, psu1
+        if self._is_optional_command_failure(status):
+            state_status, state = PSUBase.get_psu_state(self)
+            self._raise_on_status(state_status, "get_psu_state")
+            self.logger.warning(
+                "PSU get_psu_enable is unavailable on this controller; "
+                "falling back to get_psu_state control bits."
+            )
+            return (
+                bool(state & self.PSU_STATE_PSU0_ENB_CTRL),
+                bool(state & self.PSU_STATE_PSU1_ENB_CTRL),
+            )
+        self._raise_on_status(status, "get_psu_enable")
+        return False, False
+
+    def _get_config_flags_list_unlocked(self) -> tuple[list[bool], list[bool]]:
+        status, active_list, valid_list = PSUBase.get_config_list(self)
+        if status == self.NO_ERR:
+            return active_list, valid_list
+        if self._is_optional_command_failure(status):
+            self.logger.warning(
+                "PSU get_config_list is unavailable on this controller; "
+                "falling back to per-config get_config_flags."
+            )
+            active_list = []
+            valid_list = []
+            for index in range(self.MAX_CONFIG):
+                flag_status, active, valid = PSUBase.get_config_flags(self, index)
+                self._raise_on_status(flag_status, f"get_config_flags({index})")
+                active_list.append(active)
+                valid_list.append(valid)
+            return active_list, valid_list
+        self._raise_on_status(status, "get_config_list")
+        return [], []
+
     def list_configs(self, include_empty: bool = False) -> list[dict]:
         """Return PSU configurations with flags and names."""
         self._require_connected()
-        status, active_list, valid_list = self._call_locked(PSUBase.get_config_list, self)
-        self._raise_on_status(status, "get_config_list")
+        active_list, valid_list = self._call_locked(self._get_config_flags_list_unlocked)
 
         configs = []
         for index, (active, valid) in enumerate(zip(active_list, valid_list)):
@@ -402,9 +463,7 @@ class PSU(PSUBase):
     def get_output_enabled(self) -> tuple[bool, bool]:
         """Return the two PSU channel enable flags."""
         self._require_connected()
-        status, psu0, psu1 = self._call_locked(PSUBase.get_psu_enable, self)
-        self._raise_on_status(status, "get_psu_enable")
-        return psu0, psu1
+        return self._call_locked(self._get_output_enabled_unlocked)
 
     def set_channel_voltage(self, channel: int, voltage_v: float) -> None:
         """Set one PSU channel output voltage in volts."""
@@ -457,16 +516,11 @@ class PSU(PSUBase):
     def _get_product_info_unlocked(self) -> dict:
         product_no_status, product_no = PSUBase.get_product_no(self)
         self._raise_on_status(product_no_status, "get_product_no")
-        product_id_status, product_id = PSUBase.get_product_id(self)
-        self._raise_on_status(product_id_status, "get_product_id")
-        fw_version_status, fw_version = PSUBase.get_fw_version(self)
-        self._raise_on_status(fw_version_status, "get_fw_version")
-        fw_date_status, fw_date = PSUBase.get_fw_date(self)
-        self._raise_on_status(fw_date_status, "get_fw_date")
-        hw_type_status, hw_type = PSUBase.get_hw_type(self)
-        self._raise_on_status(hw_type_status, "get_hw_type")
-        hw_version_status, hw_version = PSUBase.get_hw_version(self)
-        self._raise_on_status(hw_version_status, "get_hw_version")
+        product_id = self._read_optional_metadata(PSUBase.get_product_id, "get_product_id")
+        fw_version = self._read_optional_metadata(PSUBase.get_fw_version, "get_fw_version")
+        fw_date = self._read_optional_metadata(PSUBase.get_fw_date, "get_fw_date")
+        hw_type = self._read_optional_metadata(PSUBase.get_hw_type, "get_hw_type")
+        hw_version = self._read_optional_metadata(PSUBase.get_hw_version, "get_hw_version")
         return {
             "product_no": product_no,
             "product_id": product_id,
@@ -492,8 +546,7 @@ class PSU(PSUBase):
         self._raise_on_status(device_state_status, "get_device_state")
         device_enabled_status, device_enabled = PSUBase.get_device_enable(self)
         self._raise_on_status(device_enabled_status, "get_device_enable")
-        outputs_enabled_status, psu0_enabled, psu1_enabled = PSUBase.get_psu_enable(self)
-        self._raise_on_status(outputs_enabled_status, "get_psu_enable")
+        psu0_enabled, psu1_enabled = self._get_output_enabled_unlocked()
         housekeeping_status, volt_rect, volt_5v0, volt_3v3, temp_cpu = PSUBase.get_housekeeping(self)
         self._raise_on_status(housekeeping_status, "get_housekeeping")
         sensor_status, temperatures = PSUBase.get_sensor_data(self)
