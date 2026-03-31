@@ -12,25 +12,21 @@ This driver follows the vendor recommendation:
 
 ## Recommended API
 
-For application code, use the high-level driver methods:
+For normal application code:
 
 - construct the driver with `AMX(..., com=..., port=...)`
-- call `connect()` or `initialize()`
+- prefer `initialize(config_number=...)`
 - use the high-level frequency, pulser and switch helpers
 - use `get_product_info()` for stable metadata
 - use `collect_housekeeping()` for a structured runtime snapshot
-- finish with `shutdown()` or `disconnect()`
+- finish with `shutdown()`
+
+Use `connect()` only if you explicitly want to inspect or control the current
+device state without loading a known configuration first.
 
 Do not treat `open_port()` as the normal entry point. It is a low-level DLL
-primitive exposed by `amx_base.py`, not the full driver connection workflow.
-In particular, `connect()` adds:
-
-- timeout handling around native DLL calls
-- logging
-- driver state tracking through `self.connected`
-- baud-rate setup
-- rollback on partial connection failure
-- warnings when multiple AMX instances are active in the same process
+primitive exposed by `amx_base.py`. `connect()` remains the safe transport
+entry point when you need a manual workflow.
 
 ## What It Does
 

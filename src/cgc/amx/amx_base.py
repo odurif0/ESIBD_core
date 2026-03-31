@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import json
 import sys
+from ctypes import wintypes
 from pathlib import Path
 
 
@@ -18,6 +19,8 @@ class AMXDllLoadError(RuntimeError):
 
 class AMXBase:
     """Low-level CGC AMX driver backed by the vendor DLL."""
+
+    WIN_BOOL = wintypes.BOOL
 
     NO_ERR = 0
     ERR_PORT_RANGE = -1
@@ -222,19 +225,19 @@ class AMXBase:
 
     def device_purge(self):
         """Clear the device output data buffer."""
-        empty = ctypes.c_bool()
+        empty = self.WIN_BOOL()
         status = self.amx_dll.COM_HVAMX4ED_DevicePurge(
             self.port, ctypes.byref(empty)
         )
-        return status, empty.value
+        return status, bool(empty.value)
 
     def get_buffer_state(self):
         """Return whether the device input buffer is empty."""
-        empty = ctypes.c_bool()
+        empty = self.WIN_BOOL()
         status = self.amx_dll.COM_HVAMX4ED_GetBufferState(
             self.port, ctypes.byref(empty)
         )
-        return status, empty.value
+        return status, bool(empty.value)
 
     def get_main_state(self):
         """Get the main AMX state."""
@@ -288,8 +291,8 @@ class AMXBase:
 
     def get_fan_data(self):
         """Get the configured and measured fan values."""
-        enabled = (ctypes.c_bool * self.FAN_NUM)()
-        failed = (ctypes.c_bool * self.FAN_NUM)()
+        enabled = (self.WIN_BOOL * self.FAN_NUM)()
+        failed = (self.WIN_BOOL * self.FAN_NUM)()
         set_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
         measured_rpm = (ctypes.c_uint16 * self.FAN_NUM)()
         pwm = (ctypes.c_uint16 * self.FAN_NUM)()
@@ -307,26 +310,26 @@ class AMXBase:
 
     def get_led_data(self):
         """Get the AMX controller LED state."""
-        red = ctypes.c_bool()
-        green = ctypes.c_bool()
-        blue = ctypes.c_bool()
+        red = self.WIN_BOOL()
+        green = self.WIN_BOOL()
+        blue = self.WIN_BOOL()
         status = self.amx_dll.COM_HVAMX4ED_GetLEDData(
             self.port, ctypes.byref(red), ctypes.byref(green), ctypes.byref(blue)
         )
-        return status, red.value, green.value, blue.value
+        return status, bool(red.value), bool(green.value), bool(blue.value)
 
     def get_device_enable(self):
         """Get the device enable state."""
-        enable = ctypes.c_bool()
+        enable = self.WIN_BOOL()
         status = self.amx_dll.COM_HVAMX4ED_GetDeviceEnable(
             self.port, ctypes.byref(enable)
         )
-        return status, enable.value
+        return status, bool(enable.value)
 
     def set_device_enable(self, enable: bool) -> int:
         """Set the device enable state."""
         return self.amx_dll.COM_HVAMX4ED_SetDeviceEnable(
-            self.port, ctypes.c_bool(bool(enable))
+            self.port, self.WIN_BOOL(int(bool(enable)))
         )
 
     def get_oscillator_period(self):

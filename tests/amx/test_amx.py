@@ -1,3 +1,4 @@
+import ctypes
 from pathlib import Path
 import logging
 import tempfile
@@ -45,6 +46,24 @@ def test_amx_base_raises_clear_error_when_dll_fails(monkeypatch):
 
     with pytest.raises(AMXDllLoadError):
         AMXBase(com=8, error_codes_path=ERROR_CODES_PATH)
+
+
+def test_amx_base_get_device_enable_uses_windows_bool(monkeypatch):
+    monkeypatch.setattr("cgc.amx.amx_base.sys.platform", "win32")
+    dll = Mock()
+
+    def fake_get_device_enable(port, enable_ptr):
+        assert port == 0
+        assert ctypes.sizeof(enable_ptr._obj) == ctypes.sizeof(AMXBase.WIN_BOOL)
+        enable_ptr._obj.value = 1
+        return AMXBase.NO_ERR
+
+    dll.COM_HVAMX4ED_GetDeviceEnable.side_effect = fake_get_device_enable
+    monkeypatch.setattr("cgc.amx.amx_base.ctypes.WinDLL", lambda _path: dll, raising=False)
+
+    base = AMXBase(com=8, error_codes_path=ERROR_CODES_PATH)
+
+    assert base.get_device_enable() == (AMXBase.NO_ERR, True)
 
 
 def test_amx_rejects_unknown_init_kwargs():

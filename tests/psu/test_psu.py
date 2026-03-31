@@ -1,3 +1,4 @@
+import ctypes
 from pathlib import Path
 import logging
 import tempfile
@@ -45,6 +46,26 @@ def test_psu_base_raises_clear_error_when_dll_fails(monkeypatch):
 
     with pytest.raises(PSUDllLoadError):
         PSUBase(com=6, error_codes_path=ERROR_CODES_PATH)
+
+
+def test_psu_base_get_psu_enable_uses_windows_bool(monkeypatch):
+    monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
+    dll = Mock()
+
+    def fake_get_psu_enable(port, psu0_ptr, psu1_ptr):
+        assert port == 0
+        assert ctypes.sizeof(psu0_ptr._obj) == ctypes.sizeof(PSUBase.WIN_BOOL)
+        assert ctypes.sizeof(psu1_ptr._obj) == ctypes.sizeof(PSUBase.WIN_BOOL)
+        psu0_ptr._obj.value = 1
+        psu1_ptr._obj.value = 0
+        return PSUBase.NO_ERR
+
+    dll.COM_HVPSU2D_GetPSUEnable.side_effect = fake_get_psu_enable
+    monkeypatch.setattr("cgc.psu.psu_base.ctypes.WinDLL", lambda _path: dll, raising=False)
+
+    base = PSUBase(com=6, error_codes_path=ERROR_CODES_PATH)
+
+    assert base.get_psu_enable() == (PSUBase.NO_ERR, True, False)
 
 
 def test_psu_rejects_unknown_init_kwargs():
