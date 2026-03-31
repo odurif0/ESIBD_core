@@ -11,6 +11,8 @@ Current package families:
 
 Current implemented instrument:
 - `cgc.ampr`
+- `cgc.amx`
+- `cgc.psu`
 
 ## Repository Layout
 
@@ -21,6 +23,8 @@ Current implemented instrument:
 ## Instrument-Specific Documentation
 
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
+- AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
+- PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
 
 ## Installation
 

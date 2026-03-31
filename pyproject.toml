@@ -22,6 +22,8 @@ package-dir = {"" = "src"}
 [tool.setuptools.package-data]
 cgc = ["error_codes.json"]
 "cgc.ampr" = ["vendor/COM-AMPR-12.h", "vendor/x64/COM-AMPR-12.dll", "README.md"]
+"cgc.amx" = ["vendor/COM-HVAMX4ED.h", "vendor/x64/COM-HVAMX4ED.dll", "README.md"]
+"cgc.psu" = ["vendor/COM-HVPSU2D.h", "vendor/x64/COM-HVPSU2D.dll", "README.md"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
