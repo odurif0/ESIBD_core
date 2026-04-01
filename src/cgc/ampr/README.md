@@ -23,6 +23,19 @@ Python driver for the CGC AMPR unit.
 
 The driver depends on `COM-AMPR-12.dll`.
 
+## Process Isolation
+
+On Windows, the high-level `AMPR` client runs the DLL-backed controller in a
+dedicated worker process when possible. This keeps a blocked vendor DLL call
+from poisoning the main Python process, which is especially important in
+notebooks. Advanced injected objects such as an external `logger`, `hk_thread`,
+or `thread_lock` fall back to inline mode because they cannot be shared across
+process boundaries.
+
+## Notebook
+
+- Manual notebook: [`notebooks/cgc/ampr_wrapper.ipynb`](../../../notebooks/cgc/ampr_wrapper.ipynb)
+
 ## Minimal Example
 
 ```python

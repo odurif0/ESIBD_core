@@ -3,25 +3,19 @@
 from __future__ import annotations
 
 import logging
-import queue
 import threading
-import time
-import weakref
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from .._driver_common import (
+    DllPortClaimRegistryMixin,
+    ProcessIsolatedClientMixin,
+    TimeoutSafeDllMixin,
+    build_device_logger,
+)
 from .amx_base import AMXBase
 
-
-class _DeviceLoggerAdapter(logging.LoggerAdapter):
-    """Prefix log messages with the device identifier."""
-
-    def process(self, msg, kwargs):
-        return f"{self.extra['device_id']} - {msg}", kwargs
-
-
-class AMX(AMXBase):
+class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
     """
     High-level CGC AMX driver.
 
@@ -31,6 +25,7 @@ class AMX(AMXBase):
     3. adjust frequency, duty cycle or delays only
     """
 
+    _INSTRUMENT_NAME = "AMX"
     _active_connections_lock = threading.Lock()
     _active_connections: dict[int, dict[str, object]] = {}
     PULSER_LABELS = {
@@ -68,173 +63,18 @@ class AMX(AMXBase):
 
         self.thread_lock = thread_lock or threading.Lock()
 
-        if logger is not None:
-            self.logger = _DeviceLoggerAdapter(logger, {"device_id": device_id})
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            logger_name = f"AMX_{device_id}_{timestamp}"
-            self.logger = logging.getLogger(logger_name)
-            if not self.logger.handlers:
-                root_log_dir = (
-                    Path(log_dir)
-                    if log_dir is not None
-                    else Path(__file__).resolve().parents[3] / "logs"
-                )
-                root_log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = root_log_dir / f"amx_{device_id}_{timestamp}.log"
-                handler = logging.FileHandler(log_file)
-                formatter = logging.Formatter(
-                    f"%(asctime)s - {device_id} - %(levelname)s - %(message)s"
-                )
-                handler.setFormatter(formatter)
-                self.logger.addHandler(handler)
-                self.logger.setLevel(logging.INFO)
+        self.logger = build_device_logger(
+            instrument_name=self._INSTRUMENT_NAME,
+            device_id=device_id,
+            logger=logger,
+            log_dir=log_dir,
+            source_file=__file__,
+        )
 
         super().__init__(com=com, port=port, log=None, idn=device_id, dll_path=dll_path)
 
-    @classmethod
-    def _purge_stale_connections(cls):
-        stale = []
-        for instance_id, entry in cls._active_connections.items():
-            instance = entry["ref"]()
-            if instance is None or not instance._dll_port_claimed:
-                stale.append(instance_id)
-        for instance_id in stale:
-            cls._active_connections.pop(instance_id, None)
-
-    def _register_connected_instance(self):
-        cls = type(self)
-        with cls._active_connections_lock:
-            cls._purge_stale_connections()
-            cls._active_connections[id(self)] = {
-                "ref": weakref.ref(self),
-                "device_id": self.device_id,
-                "com": self.com,
-                "port": self.port_num,
-            }
-
-    def _unregister_connected_instance(self):
-        cls = type(self)
-        with cls._active_connections_lock:
-            cls._active_connections.pop(id(self), None)
-            cls._purge_stale_connections()
-
-    def _set_port_claimed(self, claimed: bool):
-        self._dll_port_claimed = bool(claimed)
-        if self._dll_port_claimed:
-            self._register_connected_instance()
-        else:
-            self._unregister_connected_instance()
-
-    def _warn_on_other_process_ports(self):
-        cls = type(self)
-        with cls._active_connections_lock:
-            cls._purge_stale_connections()
-            others = [
-                entry
-                for instance_id, entry in cls._active_connections.items()
-                if instance_id != id(self)
-            ]
-
-        if not others:
-            return
-
-        same_port = [entry for entry in others if entry["port"] == self.port_num]
-        if same_port:
-            other_devices = ", ".join(
-                f"{entry['device_id']}@COM{entry['com']}" for entry in same_port
-            )
-            self.logger.warning(
-                "Another AMX instance in this process already claims the same DLL "
-                f"port {self.port_num}: {other_devices}. Reusing the same DLL port "
-                "can reassign or close the shared vendor channel unexpectedly."
-            )
-            return
-
-        all_ports = sorted({entry["port"] for entry in others} | {self.port_num})
-        other_devices = ", ".join(
-            f"{entry['device_id']}@COM{entry['com']}/port{entry['port']}"
-            for entry in others
-        )
-        self.logger.warning(
-            "Multiple AMX instances in this process currently claim DLL ports "
-            f"{all_ports}: {other_devices}. The vendor DLL exposes independent "
-            "ports, but keep one active instance per port in each workflow."
-        )
-
-    def _raise_if_transport_poisoned(self):
-        if self._transport_poisoned:
-            detail = self._transport_error or "unknown transport failure"
-            raise RuntimeError(
-                "AMX transport is unusable after a timed-out DLL call. "
-                f"{detail} Recreate the AMX instance before retrying."
-            )
-
-    def _poison_transport(self, step_name: str):
-        self._transport_poisoned = True
-        self._transport_error = (
-            f"Timed out during '{step_name}'. "
-            "The device may be powered off or unresponsive."
-        )
-        self.connected = False
+    def _on_transport_poisoned(self) -> None:
         self._set_port_claimed(True)
-
-    def _call_locked_with_timeout(self, method, timeout_s, step_name, *args, **kwargs):
-        self._raise_if_transport_poisoned()
-        lock_deadline = time.monotonic() + timeout_s
-        while True:
-            remaining = lock_deadline - time.monotonic()
-            if remaining <= 0:
-                self._raise_if_transport_poisoned()
-                raise RuntimeError(
-                    f"AMX transport lock timed out during '{step_name}'. "
-                    "A previous DLL call may still be blocked."
-                )
-            if self.thread_lock.acquire(timeout=min(0.1, remaining)):
-                break
-            self._raise_if_transport_poisoned()
-
-        result_queue = queue.Queue(maxsize=1)
-        release_lock = True
-
-        def runner():
-            try:
-                result_queue.put(("result", method(*args, **kwargs)))
-            except Exception as exc:  # pragma: no cover - forwarded to caller
-                result_queue.put(("error", exc))
-
-        thread = threading.Thread(target=runner, daemon=True)
-        thread.start()
-        thread.join(timeout_s)
-
-        try:
-            if thread.is_alive():
-                self._poison_transport(step_name)
-                release_lock = False
-                raise RuntimeError(
-                    f"AMX DLL call timed out during '{step_name}'. "
-                    "The device may be powered off or unresponsive. "
-                    "The AMX instance is now marked unusable."
-                )
-
-            kind, payload = result_queue.get()
-            if kind == "error":
-                raise payload
-            return payload
-        finally:
-            if release_lock:
-                self.thread_lock.release()
-
-    def _call_locked(self, method, *args, **kwargs):
-        self._raise_if_transport_poisoned()
-        while True:
-            if self.thread_lock.acquire(timeout=0.1):
-                try:
-                    self._raise_if_transport_poisoned()
-                    return method(*args, **kwargs)
-                finally:
-                    self.thread_lock.release()
-            self._raise_if_transport_poisoned()
 
     def _require_connected(self):
         if not self.connected:
@@ -733,3 +573,44 @@ class AMX(AMXBase):
         if self.connected and disable_device:
             self.set_device_enabled(False)
         return self.disconnect()
+
+
+class AMX(ProcessIsolatedClientMixin):
+    """Public AMX client with process isolation on Windows."""
+
+    _INSTRUMENT_NAME = "AMX"
+    _PROCESS_CONTROLLER_CLASS = _AMXController
+    _PROCESS_CONTROLLER_PATH = "cgc.amx.amx:_AMXController"
+    _active_connections_lock = _AMXController._active_connections_lock
+    _active_connections = _AMXController._active_connections
+
+    def __init__(
+        self,
+        device_id: str,
+        com: int,
+        port: int = 0,
+        baudrate: int = 230400,
+        logger: Optional[logging.Logger] = None,
+        thread_lock: Optional[threading.Lock] = None,
+        dll_path: Optional[str] = None,
+        log_dir: Optional[Path] = None,
+        **kwargs,
+    ):
+        backend_kwargs = {
+            "device_id": device_id,
+            "com": com,
+            "port": port,
+            "baudrate": baudrate,
+            "logger": logger,
+            "thread_lock": thread_lock,
+            "dll_path": dll_path,
+            "log_dir": log_dir,
+            **kwargs,
+        }
+        self._initialize_process_backend(
+            backend_kwargs=backend_kwargs,
+            incompatible_objects={
+                "logger": logger,
+                "thread_lock": thread_lock,
+            },
+        )

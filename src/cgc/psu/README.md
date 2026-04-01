@@ -55,6 +55,19 @@ entry point when you need a manual workflow.
 
 - Windows only
 
+## Process Isolation
+
+On Windows, the high-level `PSU` client runs the DLL-backed controller in a
+dedicated worker process when possible. This keeps a blocked vendor DLL call
+from poisoning the main Python process, which is especially important in
+notebooks. Advanced injected objects such as an external `logger` or
+`thread_lock` fall back to inline mode because they cannot be shared across
+process boundaries.
+
+## Notebook
+
+- Manual notebook: [`notebooks/cgc/psu_wrapper.ipynb`](../../../notebooks/cgc/psu_wrapper.ipynb)
+
 ## Minimal Example
 
 ```python

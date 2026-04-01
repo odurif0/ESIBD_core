@@ -4,25 +4,22 @@ AMPR (Amplifier) device controller.
 This module provides the AMPR class for communicating with CGC AMPR-12 amplifier
 devices via the AMPR base hardware interface with added logging functionality.
 """
-from typing import Optional
+from __future__ import annotations
+
 import logging
-import queue
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
+from .._driver_common import (
+    ProcessIsolatedClientMixin,
+    TimeoutSafeDllMixin,
+    build_device_logger,
+)
 from .ampr_base import AMPRBase
 
-
-class _DeviceLoggerAdapter(logging.LoggerAdapter):
-    """Prefix log messages with the device identifier."""
-
-    def process(self, msg, kwargs):
-        return f"{self.extra['device_id']} - {msg}", kwargs
-
-
-class AMPR(AMPRBase):
+class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
     """
     AMPR device communication class with logging functionality.
 
@@ -46,6 +43,8 @@ class AMPR(AMPRBase):
         ampr.set_module_voltage(0, 1, 50.0)
         ampr.shutdown()
     """
+
+    _INSTRUMENT_NAME = "AMPR"
 
     def __init__(
         self,
@@ -111,31 +110,16 @@ class AMPR(AMPRBase):
                 target=self._hk_worker, name=f"HK_{device_id}", daemon=True
             )
 
-        # Setup logger
-        if logger is not None:
-            self.logger = _DeviceLoggerAdapter(logger, {"device_id": device_id})
-        else:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            logger_name = f"AMPR_{device_id}_{timestamp}"
-            self.logger = logging.getLogger(logger_name)
-
-            if not self.logger.handlers:
-                root_log_dir = (
-                    Path(log_dir)
-                    if log_dir is not None
-                    else Path(__file__).resolve().parents[3] / "logs"
-                )
-                root_log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = root_log_dir / f"ampr_{device_id}_{timestamp}.log"
-                handler = logging.FileHandler(log_file)
-                formatter = logging.Formatter(
-                    f"%(asctime)s - {device_id} - %(levelname)s - %(message)s"
-                )
-                handler.setFormatter(formatter)
-                self.logger.addHandler(handler)
-                self.logger.setLevel(logging.INFO)
+        self.logger = build_device_logger(
+            instrument_name=self._INSTRUMENT_NAME,
+            device_id=device_id,
+            logger=logger,
+            log_dir=log_dir,
+            source_file=__file__,
+        )
 
         super().__init__(com=com, log=None, idn=device_id, dll_path=dll_path)
+
     @staticmethod
     def _validate_init_args(device_id, com, baudrate, hk_interval_s):
         """Validate public constructor arguments before touching the DLL."""
@@ -158,88 +142,6 @@ class AMPR(AMPRBase):
             raise TypeError("AMPR hk_interval_s must be a positive number.")
         if hk_interval_s <= 0:
             raise ValueError("AMPR hk_interval_s must be greater than 0.")
-
-    def _raise_if_transport_poisoned(self):
-        """Refuse further DLL access after a timed-out native call."""
-        if self._transport_poisoned:
-            detail = self._transport_error or "unknown transport failure"
-            raise RuntimeError(
-                "AMPR transport is unusable after a timed-out DLL call. "
-                f"{detail} Recreate the AMPR instance before retrying."
-            )
-
-    def _poison_transport(self, step_name):
-        """Mark the DLL transport unusable after a timed-out native call."""
-        self._transport_poisoned = True
-        self._transport_error = (
-            f"Timed out during '{step_name}'. "
-            "The device may be powered off or unresponsive."
-        )
-        self.connected = False
-
-    def _call_locked_with_timeout(self, method, timeout_s, step_name, *args, **kwargs):
-        """
-        Serialize a DLL call and fail fast if it blocks too long.
-
-        If the native call times out, the transport is marked unusable and the
-        AMPR instance must be recreated before any further hardware access.
-        """
-        self._raise_if_transport_poisoned()
-        lock_deadline = time.monotonic() + timeout_s
-        while True:
-            remaining = lock_deadline - time.monotonic()
-            if remaining <= 0:
-                self._raise_if_transport_poisoned()
-                raise RuntimeError(
-                    f"AMPR transport lock timed out during '{step_name}'. "
-                    "A previous DLL call may still be blocked."
-                )
-            if self.thread_lock.acquire(timeout=min(0.1, remaining)):
-                break
-            self._raise_if_transport_poisoned()
-
-        result_queue = queue.Queue(maxsize=1)
-        release_lock = True
-
-        def runner():
-            try:
-                result_queue.put(("result", method(*args, **kwargs)))
-            except Exception as exc:  # pragma: no cover - forwarded to caller
-                result_queue.put(("error", exc))
-
-        thread = threading.Thread(target=runner, daemon=True)
-        thread.start()
-        thread.join(timeout_s)
-
-        try:
-            if thread.is_alive():
-                self._poison_transport(step_name)
-                release_lock = False
-                raise RuntimeError(
-                    f"AMPR DLL call timed out during '{step_name}'. "
-                    "The device may be powered off or unresponsive. "
-                    "The AMPR instance is now marked unusable."
-                )
-
-            kind, payload = result_queue.get()
-            if kind == "error":
-                raise payload
-            return payload
-        finally:
-            if release_lock:
-                self.thread_lock.release()
-
-    def _call_locked(self, method, *args, **kwargs):
-        """Serialize DLL access through the shared communication lock."""
-        self._raise_if_transport_poisoned()
-        while True:
-            if self.thread_lock.acquire(timeout=0.1):
-                try:
-                    self._raise_if_transport_poisoned()
-                    return method(*args, **kwargs)
-                finally:
-                    self.thread_lock.release()
-            self._raise_if_transport_poisoned()
 
     def _rollback_connect_failure(self, close_port, timeout_s, reason):
         """Close the vendor channel after a failed connect sequence."""
@@ -982,3 +884,49 @@ class AMPR(AMPRBase):
         except Exception as e:
             self.logger.error(f"Error restarting module {address}: {e}")
             raise
+
+
+class AMPR(ProcessIsolatedClientMixin):
+    """Public AMPR client with process isolation on Windows."""
+
+    _INSTRUMENT_NAME = "AMPR"
+    _PROCESS_CONTROLLER_CLASS = _AMPRController
+    _PROCESS_CONTROLLER_PATH = "cgc.ampr.ampr:_AMPRController"
+    _PROCESS_TIMEOUT_RULES = {
+        "connect": (4.0, 5.0, 15.0),
+        "initialize": (8.0, 5.0, 30.0),
+    }
+
+    def __init__(
+        self,
+        device_id: str,
+        com: int,
+        baudrate: int = 230400,
+        logger: Optional[logging.Logger] = None,
+        hk_thread: Optional[threading.Thread] = None,
+        thread_lock: Optional[threading.Lock] = None,
+        hk_interval_s: float = 5.0,
+        dll_path: Optional[str] = None,
+        log_dir: Optional[Path] = None,
+        **kwargs,
+    ):
+        backend_kwargs = {
+            "device_id": device_id,
+            "com": com,
+            "baudrate": baudrate,
+            "logger": logger,
+            "hk_thread": hk_thread,
+            "thread_lock": thread_lock,
+            "hk_interval_s": hk_interval_s,
+            "dll_path": dll_path,
+            "log_dir": log_dir,
+            **kwargs,
+        }
+        self._initialize_process_backend(
+            backend_kwargs=backend_kwargs,
+            incompatible_objects={
+                "logger": logger,
+                "hk_thread": hk_thread,
+                "thread_lock": thread_lock,
+            },
+        )

@@ -20,6 +20,7 @@ Current implemented CGC instruments:
 - `src/cgc/`: CGC instrument family
 - `tests/<manufacturer>/`: regression tests grouped by manufacturer
 - `examples/<manufacturer>/`: small usage examples grouped by manufacturer
+- `notebooks/<manufacturer>/`: manual documentation and hardware-test notebooks
 
 ## Instrument-Specific Documentation
 
@@ -27,6 +28,7 @@ Current implemented CGC instruments:
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
 - AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
 - PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
+- CGC notebooks: [`notebooks/cgc/README.md`](notebooks/cgc/README.md)
 
 ## Tree
 
@@ -46,6 +48,11 @@ examples/
     ampr_basic.py
     amx_basic.py
     psu_basic.py
+notebooks/
+  cgc/
+    ampr_wrapper.ipynb
+    amx_wrapper.ipynb
+    psu_wrapper.ipynb
 ```
 
 ## Installation

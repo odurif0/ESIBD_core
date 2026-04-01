@@ -17,7 +17,18 @@ This package contains the instrument drivers for CGC hardware supported by
 - `src/cgc/amx/`: AMX driver, vendor DLL, and AMX-specific documentation
 - `src/cgc/psu/`: PSU driver, vendor DLL, and PSU-specific documentation
 
+## Process Isolation
+
+On Windows, the high-level CGC clients (`AMPR`, `AMX`, and `PSU`) run their
+DLL-backed controllers inside dedicated worker processes when possible. This
+contains blocked vendor DLL calls to the worker process instead of poisoning
+the main Python process, which is especially useful in notebooks. Advanced
+injected objects such as external loggers or shared thread primitives fall back
+to inline mode because they cannot be shared cleanly across process
+boundaries.
+
 ## Examples And Tests
 
 - `examples/cgc/`: usage examples for CGC instruments
 - `tests/cgc/`: regression tests for CGC instruments
+- `notebooks/cgc/`: manual documentation and hardware-test notebooks

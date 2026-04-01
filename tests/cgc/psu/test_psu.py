@@ -90,6 +90,38 @@ def test_psu_external_logger_prefixes_device_id(monkeypatch, caplog):
     assert "psu_test - hello" in caplog.messages
 
 
+def test_psu_uses_process_backend_when_supported(monkeypatch):
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, controller_path, controller_kwargs, *, label, startup_timeout_s):
+            created["controller_path"] = controller_path
+            created["controller_kwargs"] = controller_kwargs
+            created["label"] = label
+            created["startup_timeout_s"] = startup_timeout_s
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+
+    psu = PSU("psu_process", com=6, port=1)
+
+    assert psu._backend_mode == "process"
+    assert created["controller_path"] == "cgc.psu.psu:_PSUController"
+    assert created["label"] == "PSU psu_process"
+    assert created["controller_kwargs"]["device_id"] == "psu_process"
+    assert created["controller_kwargs"]["com"] == 6
+    assert created["controller_kwargs"]["port"] == 1
+    assert created["controller_kwargs"]["logger"] is None
+
+    psu.close()
+
+    assert psu._backend.closed is True
+
+
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     psu, dll = make_psu(monkeypatch)
     dll.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR

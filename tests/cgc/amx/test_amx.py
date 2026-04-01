@@ -88,6 +88,38 @@ def test_amx_external_logger_prefixes_device_id(monkeypatch, caplog):
     assert "amx_test - hello" in caplog.messages
 
 
+def test_amx_uses_process_backend_when_supported(monkeypatch):
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, controller_path, controller_kwargs, *, label, startup_timeout_s):
+            created["controller_path"] = controller_path
+            created["controller_kwargs"] = controller_kwargs
+            created["label"] = label
+            created["startup_timeout_s"] = startup_timeout_s
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+
+    amx = AMX("amx_process", com=8, port=1)
+
+    assert amx._backend_mode == "process"
+    assert created["controller_path"] == "cgc.amx.amx:_AMXController"
+    assert created["label"] == "AMX amx_process"
+    assert created["controller_kwargs"]["device_id"] == "amx_process"
+    assert created["controller_kwargs"]["com"] == 8
+    assert created["controller_kwargs"]["port"] == 1
+    assert created["controller_kwargs"]["logger"] is None
+
+    amx.close()
+
+    assert amx._backend.closed is True
+
+
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     amx, dll = make_amx(monkeypatch)
     dll.COM_HVAMX4ED_Open.return_value = AMXBase.NO_ERR
@@ -161,7 +193,10 @@ def test_set_frequency_hz_translates_to_oscillator_period(monkeypatch):
     amx.set_frequency_hz(2_000.0)
 
     expected_period = round((AMXBase.CLOCK / 2_000.0) - AMXBase.OSC_OFFSET)
-    AMXBase.set_oscillator_period.assert_called_once_with(amx, expected_period)
+    called_self, called_period = AMXBase.set_oscillator_period.call_args.args
+    assert called_period == expected_period
+    assert called_self.device_id == amx.device_id
+    assert called_self.com == amx.com
 
 
 def test_set_pulser_duty_cycle_uses_current_oscillator_period(monkeypatch):
@@ -174,7 +209,10 @@ def test_set_pulser_duty_cycle_uses_current_oscillator_period(monkeypatch):
 
     amx.set_pulser_duty_cycle(0, 0.5)
 
-    AMXBase.set_pulser_width.assert_called_once_with(amx, 0, 49998)
+    called_self, called_pulser, called_width = AMXBase.set_pulser_width.call_args.args
+    assert (called_pulser, called_width) == (0, 49998)
+    assert called_self.device_id == amx.device_id
+    assert called_self.com == amx.com
 
 
 def test_load_config_calls_vendor_wrapper(monkeypatch):
