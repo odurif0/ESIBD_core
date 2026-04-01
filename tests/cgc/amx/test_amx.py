@@ -9,7 +9,7 @@ import pytest
 from cgc.amx import AMX, AMXBase, AMXDllLoadError, AMXPlatformError
 
 
-ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "src" / "cgc" / "error_codes.json"
+ERROR_CODES_PATH = Path(__file__).resolve().parents[3] / "src" / "cgc" / "error_codes.json"
 
 
 @pytest.fixture(autouse=True)

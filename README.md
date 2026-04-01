@@ -9,7 +9,7 @@ This repository is intended to host multiple instrument drivers over time.
 Current package families:
 - `cgc`
 
-Current implemented instrument:
+Current implemented CGC instruments:
 - `cgc.ampr`
 - `cgc.amx`
 - `cgc.psu`
@@ -17,14 +17,36 @@ Current implemented instrument:
 ## Repository Layout
 
 - `src/<manufacturer>/`: driver packages for each manufacturer
-- `tests/`: regression tests
-- `examples/`: small usage examples
+- `src/cgc/`: CGC instrument family
+- `tests/<manufacturer>/`: regression tests grouped by manufacturer
+- `examples/<manufacturer>/`: small usage examples grouped by manufacturer
 
 ## Instrument-Specific Documentation
 
+- CGC family: [`src/cgc/README.md`](src/cgc/README.md)
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
 - AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
 - PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
+
+## Tree
+
+```text
+src/
+  cgc/
+    ampr/
+    amx/
+    psu/
+tests/
+  cgc/
+    ampr/
+    amx/
+    psu/
+examples/
+  cgc/
+    ampr_basic.py
+    amx_basic.py
+    psu_basic.py
+```
 
 ## Installation
 

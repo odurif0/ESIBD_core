@@ -9,7 +9,7 @@ import pytest
 from cgc.psu import PSU, PSUBase, PSUDllLoadError, PSUPlatformError
 
 
-ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "src" / "cgc" / "error_codes.json"
+ERROR_CODES_PATH = Path(__file__).resolve().parents[3] / "src" / "cgc" / "error_codes.json"
 
 
 @pytest.fixture(autouse=True)

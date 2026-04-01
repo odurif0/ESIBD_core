@@ -9,13 +9,18 @@ import pytest
 from cgc.ampr import AMPR, AMPRBase, AMPRDllLoadError, AMPRPlatformError
 
 
-ERROR_CODES_PATH = Path(__file__).resolve().parents[2] / "src" / "cgc" / "error_codes.json"
+ERROR_CODES_PATH = Path(__file__).resolve().parents[3] / "src" / "cgc" / "error_codes.json"
 
 
 def make_ampr(monkeypatch):
     monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
     dll = Mock()
     monkeypatch.setattr("cgc.ampr.ampr_base.ctypes.WinDLL", lambda _path: dll, raising=False)
+    monkeypatch.setattr(
+        AMPRBase,
+        "get_device_type",
+        lambda self: (self.NO_ERR, self.DEVICE_TYPE),
+    )
     log_dir = Path(tempfile.gettempdir()) / "esibd_core_test_logs"
     return AMPR("ampr_test", com=5, log_dir=log_dir), dll
 
@@ -51,6 +56,24 @@ def test_ampr_rejects_unknown_init_kwargs():
         AMPR("ampr_test", com=5, unexpected=True)
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "exc_type", "match"),
+    [
+        ({"device_id": ""}, ValueError, "device_id"),
+        ({"com": 0}, ValueError, "com"),
+        ({"baudrate": 0}, ValueError, "baudrate"),
+        ({"hk_interval_s": 0}, ValueError, "hk_interval_s"),
+        ({"hk_interval": 2.5}, TypeError, "Unexpected AMPR init kwargs: hk_interval"),
+    ],
+)
+def test_ampr_rejects_invalid_init_args(kwargs, exc_type, match):
+    params = {"device_id": "ampr_test", "com": 5}
+    params.update(kwargs)
+
+    with pytest.raises(exc_type, match=match):
+        AMPR(**params)
+
+
 def test_ampr_external_logger_prefixes_device_id(monkeypatch, caplog):
     monkeypatch.setattr("cgc.ampr.ampr_base.sys.platform", "win32")
     monkeypatch.setattr(
@@ -75,6 +98,30 @@ def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     dll.COM_AMPR_12_Close.return_value = AMPRBase.NO_ERR
 
     with pytest.raises(RuntimeError, match="set_baud_rate failed"):
+        ampr.connect()
+
+    assert ampr.connected is False
+    dll.COM_AMPR_12_Close.assert_called_once()
+
+
+def test_connect_succeeds_when_device_type_matches(monkeypatch):
+    ampr, dll = make_ampr(monkeypatch)
+    dll.COM_AMPR_12_Open.return_value = AMPRBase.NO_ERR
+    dll.COM_AMPR_12_SetBaudRate.return_value = AMPRBase.NO_ERR
+
+    assert ampr.connect() is True
+    assert ampr.connected is True
+    dll.COM_AMPR_12_Close.assert_not_called()
+
+
+def test_connect_rolls_back_when_device_type_mismatches(monkeypatch):
+    ampr, dll = make_ampr(monkeypatch)
+    dll.COM_AMPR_12_Open.return_value = AMPRBase.NO_ERR
+    dll.COM_AMPR_12_SetBaudRate.return_value = AMPRBase.NO_ERR
+    dll.COM_AMPR_12_Close.return_value = AMPRBase.NO_ERR
+    monkeypatch.setattr(AMPRBase, "get_device_type", lambda self: (self.NO_ERR, 0x1234))
+
+    with pytest.raises(RuntimeError, match="device type mismatch"):
         ampr.connect()
 
     assert ampr.connected is False
@@ -301,6 +348,34 @@ def test_housekeeping_monitor_does_not_deadlock_on_wrapped_methods(monkeypatch):
     assert worker.is_alive() is False
     assert ampr.thread_lock.acquire(blocking=False) is True
     ampr.thread_lock.release()
+
+
+def test_start_housekeeping_updates_interval_s(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    ampr.connected = True
+    ampr.external_thread = True
+
+    assert ampr.start_housekeeping(interval_s=1.5) is True
+
+    assert ampr.hk_interval_s == 1.5
+    assert ampr.get_status()["hk_interval_s"] == 1.5
+    assert ampr.stop_housekeeping() is True
+
+
+@pytest.mark.parametrize(
+    ("interval_s", "exc_type", "match"),
+    [
+        (0, ValueError, "interval_s"),
+        (-1, ValueError, "interval_s"),
+        (True, TypeError, "interval_s"),
+    ],
+)
+def test_start_housekeeping_rejects_invalid_interval_s(monkeypatch, interval_s, exc_type, match):
+    ampr, _dll = make_ampr(monkeypatch)
+    ampr.connected = True
+
+    with pytest.raises(exc_type, match=match):
+        ampr.start_housekeeping(interval_s=interval_s)
 
 
 def test_get_all_module_voltages_reads_measured_values_once(monkeypatch):

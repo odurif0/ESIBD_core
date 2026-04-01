@@ -55,7 +55,7 @@ class AMPR(AMPRBase):
         logger: Optional[logging.Logger] = None,
         hk_thread: Optional[threading.Thread] = None,
         thread_lock: Optional[threading.Lock] = None,
-        hk_interval: float = 5.0,
+        hk_interval_s: float = 5.0,
         dll_path: Optional[str] = None,
         log_dir: Optional[Path] = None,
         **kwargs,
@@ -67,11 +67,18 @@ class AMPR(AMPRBase):
             unexpected = ", ".join(sorted(kwargs))
             raise TypeError(f"Unexpected AMPR init kwargs: {unexpected}")
 
+        self._validate_init_args(
+            device_id=device_id,
+            com=com,
+            baudrate=baudrate,
+            hk_interval_s=hk_interval_s,
+        )
+
         # Store parameters for AMPR functionality
         self.device_id = device_id
         self.com = com
         self.baudrate = baudrate
-        self.hk_interval = hk_interval
+        self.hk_interval_s = hk_interval_s
         
         # Connection status
         self.connected = False
@@ -129,6 +136,28 @@ class AMPR(AMPRBase):
                 self.logger.setLevel(logging.INFO)
 
         super().__init__(com=com, log=None, idn=device_id, dll_path=dll_path)
+    @staticmethod
+    def _validate_init_args(device_id, com, baudrate, hk_interval_s):
+        """Validate public constructor arguments before touching the DLL."""
+        if not isinstance(device_id, str):
+            raise TypeError("AMPR device_id must be a string.")
+        if not device_id.strip():
+            raise ValueError("AMPR device_id must be a non-empty string.")
+
+        if isinstance(com, bool) or not isinstance(com, int):
+            raise TypeError("AMPR com must be an integer between 1 and 255.")
+        if not 1 <= com <= 255:
+            raise ValueError("AMPR com must be between 1 and 255.")
+
+        if isinstance(baudrate, bool) or not isinstance(baudrate, int):
+            raise TypeError("AMPR baudrate must be a positive integer.")
+        if baudrate <= 0:
+            raise ValueError("AMPR baudrate must be a positive integer.")
+
+        if isinstance(hk_interval_s, bool) or not isinstance(hk_interval_s, (int, float)):
+            raise TypeError("AMPR hk_interval_s must be a positive number.")
+        if hk_interval_s <= 0:
+            raise ValueError("AMPR hk_interval_s must be greater than 0.")
 
     def _raise_if_transport_poisoned(self):
         """Refuse further DLL access after a timed-out native call."""
@@ -212,8 +241,43 @@ class AMPR(AMPRBase):
                     self.thread_lock.release()
             self._raise_if_transport_poisoned()
 
+    def _rollback_connect_failure(self, close_port, timeout_s, reason):
+        """Close the vendor channel after a failed connect sequence."""
+        try:
+            close_status = self._call_locked_with_timeout(
+                close_port, timeout_s, "close_port"
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"AMPR port rollback after {reason} also failed: {exc}"
+            )
+            return
+
+        if close_status != self.NO_ERR:
+            self.logger.warning(
+                f"AMPR port rollback after {reason} also failed: "
+                f"{self.format_status(close_status)}"
+            )
+
+    def _verify_device_type(self, timeout_s: float) -> int:
+        """Confirm that the connected controller reports the AMPR device type."""
+        status, device_type = self._call_locked_with_timeout(
+            super().get_device_type, timeout_s, "get_device_type"
+        )
+        if status != self.NO_ERR:
+            raise RuntimeError(
+                f"AMPR get_device_type failed: {self.format_status(status)}"
+            )
+        if device_type != self.DEVICE_TYPE:
+            raise RuntimeError(
+                "AMPR device type mismatch: "
+                f"expected 0x{self.DEVICE_TYPE:04X}, got 0x{device_type:04X}."
+            )
+        return device_type
+
     def connect(self, timeout_s: float = 5.0) -> bool:
         """Connect to the AMPR device."""
+        close_port = None
         try:
             if self.connected:
                 self.logger.info(
@@ -233,26 +297,24 @@ class AMPR(AMPRBase):
 
             if status == self.NO_ERR:
                 self.connected = True
-                self.logger.info(f"Successfully connected to AMPR device {self.device_id}")
 
                 baud_status, actual_baud = self._call_locked_with_timeout(
                     set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
                 )
                 if baud_status == self.NO_ERR:
-                    self.logger.info(f"Baud rate set to {actual_baud}")
+                    device_type = self._verify_device_type(timeout_s)
+                    self.logger.info(
+                        f"Successfully connected to AMPR device {self.device_id} "
+                        f"(baud rate: {actual_baud}, device_type: 0x{device_type:04X})"
+                    )
                     return True
 
                 self.logger.error(
                     f"Failed to set baud rate: {self.format_status(baud_status)}"
                 )
-                close_status = self._call_locked_with_timeout(
-                    close_port, timeout_s, "close_port"
+                self._rollback_connect_failure(
+                    close_port, timeout_s, "baud-rate failure"
                 )
-                if close_status != self.NO_ERR:
-                    self.logger.warning(
-                        "AMPR port rollback after baud-rate failure also failed: "
-                        f"{self.format_status(close_status)}"
-                    )
                 self.connected = False
                 raise RuntimeError(
                     f"AMPR set_baud_rate failed: {self.format_status(baud_status)}"
@@ -268,6 +330,10 @@ class AMPR(AMPRBase):
             )
                 
         except Exception as e:
+            if close_port is not None and self.connected and not self._transport_poisoned:
+                self._rollback_connect_failure(
+                    close_port, timeout_s, "connect verification failure"
+                )
             self.logger.error(f"Connection error: {e}")
             self.connected = False
             raise
@@ -440,7 +506,7 @@ class AMPR(AMPRBase):
                 if self.connected:
                     self.hk_monitor()
                     # Wait for interval or stop event
-                    self.hk_stop_event.wait(timeout=self.hk_interval)
+                    self.hk_stop_event.wait(timeout=self.hk_interval_s)
                 else:
                     # If not connected, wait a short time before checking again
                     self.hk_stop_event.wait(timeout=1.0)
@@ -585,7 +651,7 @@ class AMPR(AMPRBase):
     #     Housekeeping and Threading Methods
     # =============================================================================
 
-    def start_housekeeping(self, interval=-1) -> bool:
+    def start_housekeeping(self, interval_s: Optional[float] = None) -> bool:
         """
         Start housekeeping monitoring. Works automatically in both internal and external thread modes.
 
@@ -593,7 +659,8 @@ class AMPR(AMPRBase):
         - External mode (thread passed to __init__): Enables monitoring for external thread control
 
         Args:
-            interval (int): Monitoring interval in seconds (default: uses hk_interval from __init__)
+            interval_s (float | None): Monitoring interval in seconds
+                (default: uses hk_interval_s from __init__)
 
         Returns:
             bool: True if started successfully, False otherwise
@@ -602,6 +669,12 @@ class AMPR(AMPRBase):
             self.logger.warning("Cannot start housekeeping: device not connected")
             return False
 
+        if interval_s is not None:
+            if isinstance(interval_s, bool) or not isinstance(interval_s, (int, float)):
+                raise TypeError("AMPR interval_s must be a positive number.")
+            if interval_s <= 0:
+                raise ValueError("AMPR interval_s must be greater than 0.")
+
         with self.hk_lock:
             if self.hk_running:
                 self.logger.warning("Housekeeping already running")
@@ -609,8 +682,8 @@ class AMPR(AMPRBase):
 
             try:
                 # Set the monitoring interval
-                if interval > 0:
-                    self.hk_interval = interval
+                if interval_s is not None:
+                    self.hk_interval_s = interval_s
 
                 # Clear stop event
                 self.hk_stop_event.clear()
@@ -627,7 +700,9 @@ class AMPR(AMPRBase):
                             target=self._hk_worker, name=f"HK_{self.device_id}", daemon=True
                         )
                     self.hk_thread.start()
-                    self.logger.info(f"Housekeeping thread started with {self.hk_interval}s interval")
+                    self.logger.info(
+                        f"Housekeeping thread started with {self.hk_interval_s}s interval"
+                    )
 
                 return True
 
@@ -707,7 +782,7 @@ class AMPR(AMPRBase):
             "connected": self.connected,
             "transport_poisoned": self._transport_poisoned,
             "hk_running": self.hk_running,
-            "hk_interval": self.hk_interval,
+            "hk_interval_s": self.hk_interval_s,
             "external_thread": self.external_thread,
             "external_lock": self.external_lock,
         }
