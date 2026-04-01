@@ -398,8 +398,8 @@ class AMX(AMXBase):
             )
         return configs
 
-    def load_user_config(self, config_number: int) -> None:
-        """Load one AMX configuration from NVM."""
+    def load_config(self, config_number: int) -> None:
+        """Load and apply one AMX configuration stored in controller NVM."""
         self._require_connected()
         self.logger.info(f"Loading AMX config {config_number}")
         status = self._call_locked(AMXBase.load_current_config, self, config_number)
@@ -714,38 +714,22 @@ class AMX(AMXBase):
         self._require_connected()
         return self._call_locked(self._collect_housekeeping_unlocked)
 
-    def initialize(
-        self,
-        config_number: int,
-        *,
-        timeout_s: float = 5.0,
-        enable_device: bool | None = None,
-    ) -> None:
-        """Connect and load a known AMX configuration."""
-        was_connected = self.connected
-        try:
-            self.connect(timeout_s=timeout_s)
-            self.load_user_config(config_number)
-            if enable_device is not None:
-                self.set_device_enabled(enable_device)
-        except Exception:
-            if not was_connected and (self.connected or self._transport_poisoned):
-                self.disconnect()
-            raise
-
     def shutdown(
         self,
         *,
         standby_config: int | None = None,
         disable_device: bool = True,
     ) -> bool:
-        """Safely disable the device, optionally load a standby config, then disconnect."""
-        disconnect_result = True
-        try:
-            if self.connected and standby_config is not None:
-                self.load_user_config(standby_config)
-            if self.connected and disable_device:
-                self.set_device_enabled(False)
-        finally:
-            disconnect_result = self.disconnect()
-        return disconnect_result
+        """Disable the AMX or load an explicit standby config, then disconnect."""
+        if standby_config is not None and disable_device:
+            raise ValueError(
+                "standby_config cannot be combined with disable_device. Either "
+                "load an explicit standby config or request an explicit shutdown "
+                "sequence."
+            )
+
+        if self.connected and standby_config is not None:
+            self.load_config(standby_config)
+        if self.connected and disable_device:
+            self.set_device_enabled(False)
+        return self.disconnect()

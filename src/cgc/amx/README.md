@@ -6,23 +6,26 @@ Python driver for the CGC `AMX-CTRL-4ED` power switch unit.
 
 This driver follows the vendor recommendation:
 
-1. load a known user configuration first
-2. keep that configuration as the reproducible operating mode
-3. adjust only frequency, duty cycle or delays at runtime
+1. connect to the device
+2. load a known user configuration first
+3. keep that configuration as the reproducible operating mode
+4. adjust only frequency, duty cycle or delays at runtime
 
 ## Recommended API
 
 For normal application code:
 
 - construct the driver with `AMX(..., com=..., port=...)`
-- prefer `initialize(config_number=...)`
+- call `connect()`
+- then call `load_config(config_number)`
 - use the high-level frequency, pulser and switch helpers
 - use `get_product_info()` for stable metadata
 - use `collect_housekeeping()` for a structured runtime snapshot
 - finish with `shutdown()`
 
-Use `connect()` only if you explicitly want to inspect or control the current
-device state without loading a known configuration first.
+`load_config(config_number)` applies the configuration stored in the controller
+NVM. Depending on how that CGC configuration was saved, it may also apply
+device enable and active timing or switching settings.
 
 Do not treat `open_port()` as the normal entry point. It is a low-level DLL
 primitive exposed by `amx_base.py`. `connect()` remains the safe transport
@@ -56,7 +59,8 @@ entry point when you need a manual workflow.
 from cgc.amx import AMX
 
 amx = AMX("amx_main", com=8, port=0)
-amx.initialize(config_number=40)
+amx.connect()
+amx.load_config(40)
 try:
     amx.set_frequency_hz(2_000.0)
     amx.set_pulser_duty_cycle(0, 0.5)

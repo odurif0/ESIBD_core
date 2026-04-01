@@ -155,59 +155,19 @@ def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch
     assert "HV-AMX-CTRL-4ED" in caplog.text
 
 
-def test_initialize_loads_config_without_overriding_enable_flags(monkeypatch):
-    psu, _dll = make_psu(monkeypatch)
-    monkeypatch.setattr(psu, "connect", Mock(return_value=True))
-    monkeypatch.setattr(psu, "load_user_config", Mock())
-    monkeypatch.setattr(psu, "set_device_enabled", Mock())
-    monkeypatch.setattr(psu, "set_output_enabled", Mock())
-
-    psu.initialize(config_number=19)
-
-    psu.connect.assert_called_once()
-    psu.load_user_config.assert_called_once_with(19)
-    psu.set_device_enabled.assert_not_called()
-    psu.set_output_enabled.assert_not_called()
-
-
-def test_initialize_disconnects_on_failure(monkeypatch):
-    psu, _dll = make_psu(monkeypatch)
-
-    def fake_connect(*, timeout_s):
-        psu.connected = True
-        return True
-
-    monkeypatch.setattr(psu, "connect", Mock(side_effect=fake_connect))
-    monkeypatch.setattr(
-        psu, "load_user_config", Mock(side_effect=RuntimeError("boom"))
-    )
-    monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
-
-    with pytest.raises(RuntimeError, match="boom"):
-        psu.initialize(config_number=19)
-
-    psu.disconnect.assert_called_once()
-
-
-def test_initialize_keeps_existing_connection_on_failure(monkeypatch):
+def test_load_config_calls_vendor_wrapper(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     psu.connected = True
-    psu._dll_port_claimed = True
-    monkeypatch.setattr(psu, "connect", Mock(return_value=True))
-    monkeypatch.setattr(
-        psu, "load_user_config", Mock(side_effect=RuntimeError("boom"))
-    )
-    monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
+    monkeypatch.setattr(PSUBase, "load_current_config", lambda self, index: self.NO_ERR)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        psu.initialize(config_number=19)
-
-    psu.disconnect.assert_not_called()
+    psu.load_config(19)
 
 
 def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     psu.connected = True
+    monkeypatch.setattr(psu, "set_channel_current", Mock())
+    monkeypatch.setattr(psu, "set_channel_voltage", Mock())
     monkeypatch.setattr(
         psu, "set_output_enabled", Mock(side_effect=RuntimeError("boom"))
     )
@@ -217,7 +177,91 @@ def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(m
     with pytest.raises(RuntimeError, match="boom"):
         psu.shutdown()
 
+    psu.set_channel_current.assert_any_call(0, 0.0)
+    psu.set_channel_current.assert_any_call(1, 0.0)
+    psu.set_channel_voltage.assert_any_call(0, 0.0)
+    psu.set_channel_voltage.assert_any_call(1, 0.0)
     psu.set_output_enabled.assert_called_once_with(False, False)
+    psu.set_device_enabled.assert_not_called()
+    psu.disconnect.assert_not_called()
+
+
+def test_shutdown_zeros_setpoints_before_disabling_outputs_and_device(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    calls = []
+
+    monkeypatch.setattr(
+        psu,
+        "set_channel_current",
+        lambda channel, current: calls.append(("current", channel, current)),
+    )
+    monkeypatch.setattr(
+        psu,
+        "set_channel_voltage",
+        lambda channel, voltage: calls.append(("voltage", channel, voltage)),
+    )
+    monkeypatch.setattr(
+        psu,
+        "set_output_enabled",
+        lambda psu0, psu1: calls.append(("outputs", psu0, psu1)),
+    )
+    monkeypatch.setattr(
+        psu,
+        "set_device_enabled",
+        lambda enabled: calls.append(("device", enabled)),
+    )
+    monkeypatch.setattr(
+        psu,
+        "disconnect",
+        lambda: calls.append(("disconnect",)) or True,
+    )
+
+    assert psu.shutdown() is True
+
+    assert calls == [
+        ("current", 0, 0.0),
+        ("current", 1, 0.0),
+        ("voltage", 0, 0.0),
+        ("voltage", 1, 0.0),
+        ("outputs", False, False),
+        ("device", False),
+        ("disconnect",),
+    ]
+
+
+def test_shutdown_rejects_standby_config_when_disable_flags_are_enabled(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(psu, "load_config", Mock())
+    monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
+
+    with pytest.raises(ValueError, match="standby_config"):
+        psu.shutdown(standby_config=3)
+
+    psu.load_config.assert_not_called()
+    psu.disconnect.assert_not_called()
+
+
+def test_shutdown_can_load_explicit_standby_config_without_disable_steps(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    monkeypatch.setattr(psu, "load_config", Mock())
+    monkeypatch.setattr(psu, "set_output_enabled", Mock())
+    monkeypatch.setattr(psu, "set_device_enabled", Mock())
+    monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
+
+    assert (
+        psu.shutdown(
+            standby_config=3,
+            disable_outputs=False,
+            disable_device=False,
+        )
+        is True
+    )
+
+    psu.load_config.assert_called_once_with(3)
+    psu.set_output_enabled.assert_not_called()
     psu.set_device_enabled.assert_not_called()
     psu.disconnect.assert_called_once()
 

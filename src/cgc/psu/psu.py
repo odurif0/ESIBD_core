@@ -456,8 +456,8 @@ class PSU(PSUBase):
             )
         return configs
 
-    def load_user_config(self, config_number: int) -> None:
-        """Load one PSU configuration from NVM."""
+    def load_config(self, config_number: int) -> None:
+        """Load and apply one PSU configuration stored in controller NVM."""
         self._require_connected()
         self.logger.info(f"Loading PSU config {config_number}")
         status = self._call_locked(PSUBase.load_current_config, self, config_number)
@@ -683,32 +683,12 @@ class PSU(PSUBase):
         self._require_connected()
         return self._call_locked(self._collect_housekeeping_unlocked)
 
-    def initialize(
-        self,
-        config_number: int,
-        *,
-        timeout_s: float = 5.0,
-        enable_device: bool | None = None,
-        enable_outputs: tuple[bool, bool] | None = None,
-    ) -> None:
-        """
-        Connect and load a known configuration.
-
-        The configuration is the reproducible starting point. Optional enable
-        changes are applied only if explicitly requested.
-        """
-        was_connected = self.connected
-        try:
-            self.connect(timeout_s=timeout_s)
-            self.load_user_config(config_number)
-            if enable_device is not None:
-                self.set_device_enabled(enable_device)
-            if enable_outputs is not None:
-                self.set_output_enabled(*enable_outputs)
-        except Exception:
-            if not was_connected and (self.connected or self._transport_poisoned):
-                self.disconnect()
-            raise
+    def _zero_output_setpoints(self) -> None:
+        """Drive both channel current and voltage setpoints to zero."""
+        for channel in range(self.PSU_NUM):
+            self.set_channel_current(channel, 0.0)
+        for channel in range(self.PSU_NUM):
+            self.set_channel_voltage(channel, 0.0)
 
     def shutdown(
         self,
@@ -717,15 +697,20 @@ class PSU(PSUBase):
         disable_outputs: bool = True,
         disable_device: bool = True,
     ) -> bool:
-        """Safely disable outputs/device, optionally load a standby config, then disconnect."""
-        disconnect_result = True
-        try:
-            if self.connected and standby_config is not None:
-                self.load_user_config(standby_config)
-            if self.connected and disable_outputs:
-                self.set_output_enabled(False, False)
-            if self.connected and disable_device:
-                self.set_device_enabled(False)
-        finally:
-            disconnect_result = self.disconnect()
-        return disconnect_result
+        """Disable the PSU or load an explicit standby config, then disconnect."""
+        if standby_config is not None and (disable_outputs or disable_device):
+            raise ValueError(
+                "standby_config cannot be combined with disable_outputs or "
+                "disable_device. Either load an explicit standby config or "
+                "request an explicit shutdown sequence."
+            )
+
+        if self.connected and standby_config is not None:
+            self.load_config(standby_config)
+        if self.connected and (disable_outputs or disable_device):
+            self._zero_output_setpoints()
+        if self.connected and disable_outputs:
+            self.set_output_enabled(False, False)
+        if self.connected and disable_device:
+            self.set_device_enabled(False)
+        return self.disconnect()

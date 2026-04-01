@@ -177,52 +177,12 @@ def test_set_pulser_duty_cycle_uses_current_oscillator_period(monkeypatch):
     AMXBase.set_pulser_width.assert_called_once_with(amx, 0, 49998)
 
 
-def test_initialize_loads_config_without_forcing_enable(monkeypatch):
-    amx, _dll = make_amx(monkeypatch)
-    monkeypatch.setattr(amx, "connect", Mock(return_value=True))
-    monkeypatch.setattr(amx, "load_user_config", Mock())
-    monkeypatch.setattr(amx, "set_device_enabled", Mock())
-
-    amx.initialize(config_number=40)
-
-    amx.connect.assert_called_once()
-    amx.load_user_config.assert_called_once_with(40)
-    amx.set_device_enabled.assert_not_called()
-
-
-def test_initialize_disconnects_on_failure(monkeypatch):
-    amx, _dll = make_amx(monkeypatch)
-
-    def fake_connect(*, timeout_s):
-        amx.connected = True
-        return True
-
-    monkeypatch.setattr(amx, "connect", Mock(side_effect=fake_connect))
-    monkeypatch.setattr(
-        amx, "load_user_config", Mock(side_effect=RuntimeError("boom"))
-    )
-    monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
-
-    with pytest.raises(RuntimeError, match="boom"):
-        amx.initialize(config_number=40)
-
-    amx.disconnect.assert_called_once()
-
-
-def test_initialize_keeps_existing_connection_on_failure(monkeypatch):
+def test_load_config_calls_vendor_wrapper(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     amx.connected = True
-    amx._dll_port_claimed = True
-    monkeypatch.setattr(amx, "connect", Mock(return_value=True))
-    monkeypatch.setattr(
-        amx, "load_user_config", Mock(side_effect=RuntimeError("boom"))
-    )
-    monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
+    monkeypatch.setattr(AMXBase, "load_current_config", lambda self, index: self.NO_ERR)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        amx.initialize(config_number=40)
-
-    amx.disconnect.assert_not_called()
+    amx.load_config(40)
 
 
 def test_shutdown_disables_device_by_default_and_propagates_errors(monkeypatch):
@@ -237,6 +197,33 @@ def test_shutdown_disables_device_by_default_and_propagates_errors(monkeypatch):
         amx.shutdown()
 
     amx.set_device_enabled.assert_called_once_with(False)
+    amx.disconnect.assert_not_called()
+
+
+def test_shutdown_rejects_standby_config_when_disable_device_is_enabled(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    amx.connected = True
+    monkeypatch.setattr(amx, "load_config", Mock())
+    monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
+
+    with pytest.raises(ValueError, match="standby_config"):
+        amx.shutdown(standby_config=5)
+
+    amx.load_config.assert_not_called()
+    amx.disconnect.assert_not_called()
+
+
+def test_shutdown_can_load_explicit_standby_config_without_disable_step(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    amx.connected = True
+    monkeypatch.setattr(amx, "load_config", Mock())
+    monkeypatch.setattr(amx, "set_device_enabled", Mock())
+    monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
+
+    assert amx.shutdown(standby_config=5, disable_device=False) is True
+
+    amx.load_config.assert_called_once_with(5)
+    amx.set_device_enabled.assert_not_called()
     amx.disconnect.assert_called_once()
 
 

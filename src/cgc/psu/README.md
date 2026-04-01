@@ -17,14 +17,19 @@ This matches the vendor recommendation for reproducible operation.
 For normal application code:
 
 - construct the driver with `PSU(..., com=..., port=...)`
-- prefer `initialize(config_number=...)`
+- call `connect()`
+- then call `load_config(config_number)`
 - use the high-level getters and setters
 - use `get_product_info()` for stable metadata
 - use `collect_housekeeping()` for a structured runtime snapshot
 - finish with `shutdown()`
 
-Use `connect()` only if you explicitly want to inspect or control the current
-device state without loading a known configuration first.
+`load_config(config_number)` applies the configuration stored in the
+controller NVM. Depending on how that CGC configuration was saved, it may also
+apply device enable, PSU enable, range and output setpoints.
+
+`shutdown()` drives both channel current and voltage setpoints to `0` before
+disabling the outputs and the device.
 
 Do not treat `open_port()` as the normal entry point. It is a low-level DLL
 primitive exposed by `psu_base.py`. `connect()` remains the safe transport
@@ -56,7 +61,8 @@ entry point when you need a manual workflow.
 from cgc.psu import PSU
 
 psu = PSU("psu_main", com=6, port=0)
-psu.initialize(config_number=19)
+psu.connect()
+psu.load_config(19)
 try:
     psu.set_channel_voltage(0, 25.0)
     psu.set_channel_current(0, 0.5)
