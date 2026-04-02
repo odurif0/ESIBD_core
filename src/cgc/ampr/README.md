@@ -34,7 +34,7 @@ process boundaries.
 
 ## Notebook
 
-- Manual notebook: [`notebooks/cgc/ampr_wrapper.ipynb`](../../../notebooks/cgc/ampr_wrapper.ipynb)
+- Manual notebook: [`docs/notebooks/cgc/ampr_wrapper.ipynb`](../../../docs/notebooks/cgc/ampr_wrapper.ipynb)
 
 ## Minimal Example
 

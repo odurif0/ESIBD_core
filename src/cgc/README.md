@@ -29,6 +29,6 @@ boundaries.
 
 ## Examples And Tests
 
-- `examples/cgc/`: usage examples for CGC instruments
+- `docs/examples/cgc/`: usage examples for CGC instruments
 - `tests/cgc/`: regression tests for CGC instruments
-- `notebooks/cgc/`: manual documentation and hardware-test notebooks
+- `docs/notebooks/cgc/`: manual documentation and hardware-test notebooks

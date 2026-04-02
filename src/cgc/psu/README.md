@@ -66,7 +66,7 @@ process boundaries.
 
 ## Notebook
 
-- Manual notebook: [`notebooks/cgc/psu_wrapper.ipynb`](../../../notebooks/cgc/psu_wrapper.ipynb)
+- Manual notebook: [`docs/notebooks/cgc/psu_wrapper.ipynb`](../../../docs/notebooks/cgc/psu_wrapper.ipynb)
 
 ## Minimal Example
 

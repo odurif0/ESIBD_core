@@ -64,7 +64,7 @@ process boundaries.
 
 ## Notebook
 
-- Manual notebook: [`notebooks/cgc/amx_wrapper.ipynb`](../../../notebooks/cgc/amx_wrapper.ipynb)
+- Manual notebook: [`docs/notebooks/cgc/amx_wrapper.ipynb`](../../../docs/notebooks/cgc/amx_wrapper.ipynb)
 
 ## Minimal Example
 
