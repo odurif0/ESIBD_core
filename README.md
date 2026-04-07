@@ -18,6 +18,7 @@ Current implemented CGC instruments:
 
 - `src/<manufacturer>/`: driver packages for each manufacturer
 - `src/cgc/`: CGC instrument family
+- `plugins/esibd_explorer/`: external ESIBD Explorer plugins backed by this repository
 - `tests/<manufacturer>/`: regression tests grouped by manufacturer
 - `docs/examples/<manufacturer>/`: small usage examples grouped by manufacturer
 - `docs/notebooks/<manufacturer>/`: manual documentation and hardware-test notebooks
@@ -28,6 +29,7 @@ Current implemented CGC instruments:
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
 - AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
 - PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
+- ESIBD Explorer AMPR plugin (self-contained): [`plugins/esibd_explorer/ampr/README.md`](plugins/esibd_explorer/ampr/README.md)
 - CGC notebooks: [`docs/notebooks/cgc/README.md`](docs/notebooks/cgc/README.md)
 
 ## Installation
