@@ -26,9 +26,8 @@ including the AMPR driver files and vendor DLL.
 
 The plugin lazily loads its bundled local `vendor/runtime` package under a
 private Python module namespace when communication is initialized. If that
-bundled copy is unavailable, it can still fall back to an installed `cgc.ampr`
-package or to the checked-out repository source tree when used from this
-repository.
+bundled copy is missing, the plugin fails explicitly because the installation
+is incomplete.
 
 ## Device Configuration
 

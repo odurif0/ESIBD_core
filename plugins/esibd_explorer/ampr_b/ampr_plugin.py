@@ -42,6 +42,8 @@ _CHANNELS_PER_MODULE_OPTIONS = {2, 4}
 _AMPR_ABS_VOLTAGE_LIMIT = 1000.0
 _AMPR_MIN_ROW_HEIGHT = 28
 _AMPR_RAMP_STEP_S = 0.1
+_AMPR_POWER_ON_ICON = "switch-medium_on.png"
+_AMPR_POWER_OFF_ICON = "switch-medium_off.png"
 
 
 def _is_nan(value: Any) -> bool:
@@ -372,22 +374,6 @@ def _plan_channel_sync(
     return synced_items, log_entries
 
 
-def _prepend_sys_path(path: Path) -> None:
-    """Prepend a path to ``sys.path`` once."""
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
-
-
-def _find_repo_src_path(start: Path) -> Path | None:
-    """Locate the repository ``src`` directory containing ``cgc``."""
-    for parent in (start, *start.parents):
-        src_path = parent / "src"
-        if (src_path / "cgc" / "__init__.py").exists():
-            return src_path
-    return None
-
-
 def _bundled_runtime_module_name(plugin_dir: Path | None = None) -> str:
     """Return the private Python module namespace used for the bundled runtime."""
     resolved_plugin_dir = Path(__file__).resolve().parent if plugin_dir is None else plugin_dir
@@ -420,36 +406,24 @@ def _load_private_runtime_package(module_name: str, package_dir: Path) -> None:
 
 
 def _get_ampr_driver_class() -> type[Any]:
-    """Load the AMPR driver lazily from the bundled runtime or a fallback."""
+    """Load the AMPR driver lazily from the bundled runtime only."""
     global _AMPR_DRIVER_CLASS
 
     if _AMPR_DRIVER_CLASS is not None:
         return _AMPR_DRIVER_CLASS
 
     plugin_dir = Path(__file__).resolve().parent
-    bundled_runtime_root = plugin_dir / "vendor"
-    bundled_runtime_dir = bundled_runtime_root / _BUNDLED_RUNTIME_DIRNAME
+    bundled_runtime_dir = plugin_dir / "vendor" / _BUNDLED_RUNTIME_DIRNAME
     bundled_runtime_init = bundled_runtime_dir / "__init__.py"
-    if bundled_runtime_init.exists():
-        runtime_module_name = _bundled_runtime_module_name(plugin_dir)
-        _load_private_runtime_package(runtime_module_name, bundled_runtime_dir)
-        module = importlib.import_module(f"{runtime_module_name}.ampr")
-        _AMPR_DRIVER_CLASS = cast(type[Any], module.AMPR)
-        return _AMPR_DRIVER_CLASS
+    if not bundled_runtime_init.exists():
+        raise ModuleNotFoundError(
+            "Bundled AMPR runtime not found in vendor/runtime; "
+            "plugin installation is incomplete."
+        )
 
-    try:
-        module = importlib.import_module("cgc.ampr")
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"cgc", "cgc.ampr"}:
-            raise
-
-        src_path = _find_repo_src_path(plugin_dir)
-        if src_path is None:
-            raise
-
-        _prepend_sys_path(src_path)
-        module = importlib.import_module("cgc.ampr")
-
+    runtime_module_name = _bundled_runtime_module_name(plugin_dir)
+    _load_private_runtime_package(runtime_module_name, bundled_runtime_dir)
+    module = importlib.import_module(f"{runtime_module_name}.ampr")
     _AMPR_DRIVER_CLASS = cast(type[Any], module.AMPR)
     return _AMPR_DRIVER_CLASS
 
@@ -597,9 +571,9 @@ class AMPRDevice(Device):
         self.deviceOnAction = self.addStateAction(
             event=lambda checked=False: self.setOn(on=checked),
             toolTipFalse=f"Turn {self.name} ON.",
-            iconFalse=self.makeCoreIcon("rocket-fly.png"),
+            iconFalse=self.makeIcon(_AMPR_POWER_ON_ICON),
             toolTipTrue=f"Turn {self.name} OFF and disconnect.",
-            iconTrue=self.getIcon(),
+            iconTrue=self.makeIcon(_AMPR_POWER_OFF_ICON),
             before=self.closeCommunicationAction,
             restore=False,
             defaultState=False,

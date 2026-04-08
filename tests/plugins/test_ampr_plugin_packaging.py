@@ -9,6 +9,7 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 PLUGIN_PATH = (
@@ -297,6 +298,18 @@ def test_plugin_prefers_private_bundled_runtime(monkeypatch):
         sys.modules[runtime_module_name].__file__
         == str(VENDOR_ROOT / "__init__.py")
     )
+
+
+def test_plugin_fails_explicitly_when_bundled_runtime_is_missing(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+    monkeypatch.setattr(module, "_BUNDLED_RUNTIME_DIRNAME", "missing_runtime")
+    module._AMPR_DRIVER_CLASS = None
+
+    with pytest.raises(ModuleNotFoundError, match="vendor/runtime; plugin installation is incomplete"):
+        module._get_ampr_driver_class()
 
 
 def test_plugin_runtime_forces_inline_backend():
@@ -862,6 +875,7 @@ def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
     device._update_channel_column_visibility = lambda: None
     device.getIcon = lambda desaturate=False: f"icon-{desaturate}"
     device.makeCoreIcon = lambda name: f"core:{name}"
+    device.makeIcon = lambda name, path=None, desaturate=False: f"local:{name}"
     device.onAction = types.SimpleNamespace(state=True)
     device.isOn = lambda: device.onAction.state
     device.addStateAction = lambda **kwargs: added.append(kwargs) or FakeStateAction()
@@ -887,7 +901,8 @@ def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
     assert len(added) == 1
     assert added[0]["toolTipFalse"] == "Turn AMPR_A ON."
     assert added[0]["toolTipTrue"] == "Turn AMPR_A OFF and disconnect."
-    assert added[0]["iconFalse"] == "core:rocket-fly.png"
+    assert added[0]["iconFalse"] == "local:switch-medium_on.png"
+    assert added[0]["iconTrue"] == "local:switch-medium_off.png"
     assert added[0]["before"] is device.closeCommunicationAction
     assert added[0]["restore"] is False
     assert added[0]["defaultState"] is False
