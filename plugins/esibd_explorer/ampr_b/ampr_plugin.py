@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.util
 import sys
 import time
 from pathlib import Path
@@ -23,7 +24,8 @@ from esibd.core import (
 )
 from esibd.plugins import Device, Plugin
 
-_BUNDLED_RUNTIME_PACKAGE = "esibd_ampr_b_plugin_runtime"
+_BUNDLED_RUNTIME_DIRNAME = "runtime"
+_BUNDLED_RUNTIME_NAMESPACE_PREFIX = "_esibd_bundled_ampr_runtime"
 _AMPR_DRIVER_CLASS: type[Any] | None = None
 _CHANNEL_NAME_KEY = getattr(Parameter, "NAME", getattr(Channel, "NAME", "Name"))
 _CHANNEL_ENABLED_KEY = getattr(Channel, "ENABLED", "Enabled")
@@ -36,6 +38,7 @@ _PARAMETER_EVENT_KEY = getattr(Parameter, "EVENT", "Event")
 _AMPR_MODULE_KEY = "Module"
 _AMPR_CHANNEL_ID_KEY = "CH"
 _CHANNELS_PER_MODULE = 4
+_CHANNELS_PER_MODULE_OPTIONS = {2, 4}
 _AMPR_ABS_VOLTAGE_LIMIT = 1000.0
 _AMPR_MIN_ROW_HEIGHT = 28
 _AMPR_RAMP_STEP_S = 0.1
@@ -123,13 +126,34 @@ def _build_generic_channel_item(
     return item
 
 
-def _detected_output_keys(detected_modules: list[int]) -> list[tuple[int, int]]:
+def _module_channel_count(
+    module: int,
+    module_channel_counts: dict[int, int] | None = None,
+) -> int:
+    """Return the expected channel count for one module."""
+    if not module_channel_counts:
+        return _CHANNELS_PER_MODULE
+    channel_count = _coerce_int(
+        module_channel_counts.get(_coerce_int(module, -1), _CHANNELS_PER_MODULE),
+        _CHANNELS_PER_MODULE,
+    )
+    if channel_count not in _CHANNELS_PER_MODULE_OPTIONS:
+        return _CHANNELS_PER_MODULE
+    return channel_count
+
+
+def _detected_output_keys(
+    detected_modules: list[int],
+    module_channel_counts: dict[int, int] | None = None,
+) -> list[tuple[int, int]]:
     """Expand detected modules into the full ordered list of physical outputs."""
     return [
         (module, channel_id)
         for module in sorted({_coerce_int(module, -1) for module in detected_modules})
         if module >= 0
-        for channel_id in range(1, _CHANNELS_PER_MODULE + 1)
+        for channel_id in range(
+            1, _module_channel_count(module, module_channel_counts) + 1
+        )
     ]
 
 
@@ -235,9 +259,13 @@ def _plan_channel_sync(
     detected_modules: list[int],
     device_name: str,
     default_item: dict[str, Any] | None = None,
+    module_channel_counts: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, PRINT | None]]]:
     """Return the target channel config and corresponding sync log entries."""
-    detected_keys = _detected_output_keys(detected_modules)
+    detected_keys = _detected_output_keys(
+        detected_modules,
+        module_channel_counts=module_channel_counts,
+    )
     if not detected_keys:
         return current_items, []
 
@@ -360,6 +388,37 @@ def _find_repo_src_path(start: Path) -> Path | None:
     return None
 
 
+def _bundled_runtime_module_name(plugin_dir: Path | None = None) -> str:
+    """Return the private Python module namespace used for the bundled runtime."""
+    resolved_plugin_dir = Path(__file__).resolve().parent if plugin_dir is None else plugin_dir
+    plugin_key = resolved_plugin_dir.name.replace("-", "_")
+    return f"{_BUNDLED_RUNTIME_NAMESPACE_PREFIX}_{plugin_key}"
+
+
+def _load_private_runtime_package(module_name: str, package_dir: Path) -> None:
+    """Load a bundled runtime package from disk under a private module name."""
+    if module_name in sys.modules:
+        return
+
+    init_file = package_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_file,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(
+            f"Could not create an import spec for bundled AMPR runtime at {package_dir}."
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+
+
 def _get_ampr_driver_class() -> type[Any]:
     """Load the AMPR driver lazily from the bundled runtime or a fallback."""
     global _AMPR_DRIVER_CLASS
@@ -369,12 +428,12 @@ def _get_ampr_driver_class() -> type[Any]:
 
     plugin_dir = Path(__file__).resolve().parent
     bundled_runtime_root = plugin_dir / "vendor"
-    bundled_runtime_package = (
-        bundled_runtime_root / _BUNDLED_RUNTIME_PACKAGE / "__init__.py"
-    )
-    if bundled_runtime_package.exists():
-        _prepend_sys_path(bundled_runtime_root)
-        module = importlib.import_module(f"{_BUNDLED_RUNTIME_PACKAGE}.ampr")
+    bundled_runtime_dir = bundled_runtime_root / _BUNDLED_RUNTIME_DIRNAME
+    bundled_runtime_init = bundled_runtime_dir / "__init__.py"
+    if bundled_runtime_init.exists():
+        runtime_module_name = _bundled_runtime_module_name(plugin_dir)
+        _load_private_runtime_package(runtime_module_name, bundled_runtime_dir)
+        module = importlib.import_module(f"{runtime_module_name}.ampr")
         _AMPR_DRIVER_CLASS = cast(type[Any], module.AMPR)
         return _AMPR_DRIVER_CLASS
 
@@ -435,18 +494,21 @@ class AMPRDevice(Device):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.channelType = AMPRChannel
+        self.module_channel_counts: dict[int, int] = {}
+        self.module_voltage_limits: dict[int, float] = {}
 
     def initGUI(self) -> None:
         super().initGUI()
         if hasattr(self, "initAction"):
             self.initAction.setVisible(False)
         if hasattr(self, "closeCommunicationAction"):
-            shutdown_tooltip = f"Shutdown {self.name} and close communication."
+            shutdown_tooltip = f"Shutdown {self.name} and disconnect."
             with contextlib.suppress(TypeError):
                 self.closeCommunicationAction.triggered.disconnect()
             self.closeCommunicationAction.triggered.connect(self.shutdownCommunication)
             self.closeCommunicationAction.setToolTip(shutdown_tooltip)
             self.closeCommunicationAction.setText(shutdown_tooltip)
+            self.closeCommunicationAction.setVisible(False)
         self.controller = AMPRController(controllerParent=self)
 
     def finalizeInit(self) -> None:
@@ -471,6 +533,8 @@ class AMPRDevice(Device):
     connect_timeout_s: float
     startup_timeout_s: float
     ramp_rate_v_s: float
+    module_channel_counts: dict[int, int]
+    module_voltage_limits: dict[int, float]
     main_state: str
     detected_modules: str
     device_state_summary: str
@@ -482,6 +546,29 @@ class AMPRDevice(Device):
         return sorted(
             {channel.module_address() for channel in self.getChannels() if channel.real}
         )
+
+    def module_voltage_limit(self, module: int) -> float:
+        """Return the detected voltage limit for one module, defaulting to ±1000 V."""
+        limit = _coerce_float(
+            self.module_voltage_limits.get(_coerce_int(module, 0)),
+            _AMPR_ABS_VOLTAGE_LIMIT,
+        )
+        if not np.isfinite(limit) or limit <= 0:
+            return _AMPR_ABS_VOLTAGE_LIMIT
+        return min(abs(limit), _AMPR_ABS_VOLTAGE_LIMIT)
+
+    def module_channel_count(self, module: int) -> int:
+        """Return the detected channel count for one module, defaulting to 4."""
+        return _module_channel_count(module, self.module_channel_counts)
+
+    def _apply_module_voltage_limits(self) -> bool:
+        """Apply per-module voltage ratings to current channels."""
+        changed = False
+        for channel in self.getChannels():
+            changed = channel.applyModuleVoltageLimit(
+                self.module_voltage_limit(channel.module_address())
+            ) or changed
+        return changed
 
     def _current_channel_items(self) -> list[dict[str, Any]]:
         """Snapshot current channels into config dictionaries."""
@@ -509,9 +596,9 @@ class AMPRDevice(Device):
 
         self.deviceOnAction = self.addStateAction(
             event=lambda checked=False: self.setOn(on=checked),
-            toolTipFalse=f"Initialize communication if needed and turn {self.name} ON.",
+            toolTipFalse=f"Turn {self.name} ON.",
             iconFalse=self.makeCoreIcon("rocket-fly.png"),
-            toolTipTrue=f"Turn {self.name} OFF.",
+            toolTipTrue=f"Turn {self.name} OFF and disconnect.",
             iconTrue=self.getIcon(),
             before=self.closeCommunicationAction,
             restore=False,
@@ -660,6 +747,7 @@ class AMPRDevice(Device):
             detected_modules=detected_modules,
             device_name=self.name,
             default_item=self._default_channel_item(),
+            module_channel_counts=self.module_channel_counts,
         )
         if target_items == current_items:
             return False
@@ -894,6 +982,21 @@ class AMPRDevice(Device):
             self.controller.shutdownCommunication()
         self.recording = False
 
+    def _set_on_ui_state(self, on: bool) -> None:
+        """Synchronize the ESIBD and local AMPR ON/OFF actions."""
+        state = bool(on)
+        for action_name in ("onAction", "deviceOnAction"):
+            action = getattr(self, action_name, None)
+            if action is None:
+                continue
+            signal_comm = getattr(action, "signalComm", None)
+            thread_signal = getattr(signal_comm, "setValueFromThreadSignal", None)
+            if thread_signal is not None:
+                thread_signal.emit(state)
+            else:
+                action.state = state
+        self._sync_local_on_action()
+
     def setOn(self, on: "bool | None" = None) -> None:
         """Toggle the AMPR without the generic immediate apply=True jump."""
         controller = self.controller if hasattr(self, "controller") else None
@@ -1094,6 +1197,10 @@ class AMPRChannel(Channel):
             self.monitor = np.nan
         state = "ON" if self.enabled else "OFF"
         self._log_channel_event(f"Output switched {state}.")
+        if not getattr(self.channelParent, "loading", False):
+            apply_value = getattr(self, "applyValue", None)
+            if callable(apply_value):
+                apply_value(apply=True)
 
     def displayChanged(self) -> None:
         super().updateDisplay()
@@ -1115,6 +1222,69 @@ class AMPRChannel(Channel):
     def channel_number(self) -> int:
         """Return the configured AMPR channel number as an integer."""
         return _coerce_int(self.id, 1)
+
+    def _set_parameter_value_without_events(self, parameter_name: str, value: Any) -> bool:
+        """Set one parameter value silently and report whether it changed."""
+        parameter = self.getParameterByName(parameter_name)
+        if parameter is None:
+            return False
+        equals = getattr(parameter, "equals", None)
+        if callable(equals):
+            try:
+                if equals(value):
+                    return False
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            current_value = getattr(parameter, "value", None)
+            if current_value == value:
+                return False
+        setter = getattr(parameter, "setValueWithoutEvents", None)
+        if callable(setter):
+            setter(value)
+        else:
+            parameter.value = value
+        return True
+
+    def applyModuleVoltageLimit(self, limit: float) -> bool:
+        """Apply one detected per-module voltage limit to the channel UI/state."""
+        limit = max(0.0, min(float(limit), _AMPR_ABS_VOLTAGE_LIMIT))
+        lower = -limit
+        upper = limit
+        changed = False
+
+        for parameter_name in (self.VALUE, self.MIN, self.MAX):
+            parameter = self.getParameterByName(parameter_name)
+            if parameter is None:
+                continue
+            if getattr(parameter, "min", None) != lower:
+                parameter.min = lower
+                changed = True
+            if getattr(parameter, "max", None) != upper:
+                parameter.max = upper
+                changed = True
+
+        clamped_min = min(max(_coerce_float(getattr(self, "min", lower), lower), lower), upper)
+        clamped_max = min(max(_coerce_float(getattr(self, "max", upper), upper), lower), upper)
+        if clamped_min > clamped_max:
+            clamped_min, clamped_max = lower, upper
+
+        changed = self._set_parameter_value_without_events(self.MIN, clamped_min) or changed
+        changed = self._set_parameter_value_without_events(self.MAX, clamped_max) or changed
+
+        current_value = getattr(self, "value", 0.0)
+        if _is_nan(current_value):
+            clamped_value = current_value
+        else:
+            clamped_value = min(
+                max(_coerce_float(current_value, 0.0), clamped_min),
+                clamped_max,
+            )
+        changed = self._set_parameter_value_without_events(self.VALUE, clamped_value) or changed
+
+        self.updateMin()
+        self.updateMax()
+        return changed
 
 
 class AMPRController(DeviceController):
@@ -1148,6 +1318,13 @@ class AMPRController(DeviceController):
                 if channel.real
             }
 
+    def _module_voltage_limit(self, module: int) -> float:
+        """Return one module voltage limit with a safe ±1000 V fallback."""
+        limit_getter = getattr(self.controllerParent, "module_voltage_limit", None)
+        if callable(limit_getter):
+            return float(limit_getter(module))
+        return _AMPR_ABS_VOLTAGE_LIMIT
+
     def runInitialization(self) -> None:
         self.initialized = False
         self._dispose_device()
@@ -1168,6 +1345,7 @@ class AMPRController(DeviceController):
             self._update_state()
             self.signalComm.initCompleteSignal.emit()
         except Exception as exc:  # noqa: BLE001
+            self._restore_off_ui_state()
             self.print(
                 f"AMPR initialization failed on COM{int(self.controllerParent.com)}: "
                 f"{self._format_exception(exc)}",
@@ -1182,6 +1360,10 @@ class AMPRController(DeviceController):
             self.controllerParent._sync_channels_from_detected_modules(
                 self.detected_module_ids
             )
+            apply_limits = getattr(self.controllerParent, "_apply_module_voltage_limits", None)
+            export_config = getattr(self.controllerParent, "exportConfiguration", None)
+            if callable(apply_limits) and apply_limits() and callable(export_config):
+                self.controllerParent.exportConfiguration(useDefaultFile=True)
         self.initializeValues()
         self.initialized = True
         self.super_init_complete_called = True
@@ -1216,7 +1398,6 @@ class AMPRController(DeviceController):
 
         self._update_state()
         if self.main_state != "ST_ON":
-            self.initializeValues(reset=True)
             return
 
         new_values = {
@@ -1269,27 +1450,33 @@ class AMPRController(DeviceController):
         target_voltage = float(channel.value if channel.enabled else 0.0)
         module = channel.module_address()
         channel_id = channel.channel_number()
-        with self.lock.acquire_timeout(
-            1,
-            timeoutMessage=(
+        voltage_limit = self._module_voltage_limit(module)
+        if abs(target_voltage) > voltage_limit:
+            self.errorCount += 1
+            self.print(
+                f"Refusing {target_voltage:.3f} V for module {module} CH{channel_id}: "
+                f"detected module rating is ±{voltage_limit:.0f} V.",
+                flag=PRINT.ERROR,
+            )
+            return
+        try:
+            with self._controller_lock_section(
                 f"Could not acquire lock to apply module {module} CH{channel_id}."
-            ),
-        ) as lock_acquired:
-            if not lock_acquired:
-                return
-            device = self.device
-            if device is None:
-                return
-            try:
+            ):
+                device = self.device
+                if device is None:
+                    return
                 status = device.set_module_voltage(module, channel_id, target_voltage)
-            except Exception as exc:  # noqa: BLE001
-                self.errorCount += 1
-                self.print(
-                    f"Failed to apply {target_voltage:.3f} V to module "
-                    f"{module} CH{channel_id}: {exc}",
-                    flag=PRINT.ERROR,
-                )
-                return
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to apply {target_voltage:.3f} V to module "
+                f"{module} CH{channel_id}: {exc}",
+                flag=PRINT.ERROR,
+            )
+            return
 
         if status != device.NO_ERR:
             self.errorCount += 1
@@ -1321,6 +1508,7 @@ class AMPRController(DeviceController):
             return
         if getattr(self, "acquiring", False):
             self.stopAcquisition()
+            self.acquiring = False
 
         startup_timeout_s = float(
             getattr(
@@ -1341,59 +1529,74 @@ class AMPRController(DeviceController):
             if self.controllerParent.isOn():
                 with contextlib.suppress(Exception):
                     self.controllerParent.updateValues(apply=False)
-                startup_targets = self._channel_target_voltages(respect_device_state=True)
-                if startup_targets:
-                    self._apply_target_voltages(
-                        {key: 0.0 for key in startup_targets},
-                        timeout_message="Could not acquire lock to prime AMPR outputs.",
-                    )
-                with self.lock.acquire_timeout(
-                    1,
-                    timeoutMessage="Could not acquire lock to toggle the AMPR PSU.",
-                ) as lock_acquired:
-                    if not lock_acquired:
-                        return
-                    device = self.device
-                    if device is None:
-                        return
-                    self.print(
-                        f"Starting AMPR PSU. Waiting up to {startup_timeout_s:.1f} s for ST_ON."
-                    )
-                    device.initialize(timeout_s=startup_timeout_s)
-                    status = device.NO_ERR
-                    startup_completed = True
+                try:
+                    with self._controller_lock_section(
+                        "Could not acquire lock to toggle the AMPR PSU."
+                    ):
+                        device = self.device
+                        if device is None:
+                            self._restore_off_ui_state()
+                            return
+                        self.print(
+                            f"Starting AMPR PSU. Waiting up to {startup_timeout_s:.1f} s for ST_ON."
+                        )
+                        device.initialize(timeout_s=startup_timeout_s)
+                        status = device.NO_ERR
+                        startup_completed = True
+                except TimeoutError:
+                    self._restore_off_ui_state()
+                    return
                 if status == device.NO_ERR:
                     self._refresh_module_scan()
                     self._update_state()
                     state_updated = True
-                    self._ramp_target_voltages(
-                        start_targets={key: 0.0 for key in startup_targets},
-                        end_targets=startup_targets,
-                        rate_v_s=ramp_rate_v_s,
-                        label="up",
+                    apply_limits = getattr(self.controllerParent, "_apply_module_voltage_limits", None)
+                    export_config = getattr(self.controllerParent, "exportConfiguration", None)
+                    if callable(apply_limits) and apply_limits() and callable(export_config):
+                        self.controllerParent.exportConfiguration(useDefaultFile=True)
+                    startup_targets = self._channel_target_voltages(
+                        respect_device_state=True
                     )
+                    if startup_targets:
+                        zero_targets = {key: 0.0 for key in startup_targets}
+                        self._apply_target_voltages(
+                            zero_targets,
+                            timeout_message=(
+                                "Could not acquire lock to zero AMPR outputs after startup."
+                            ),
+                        )
+                        self._ramp_target_voltages(
+                            start_targets=zero_targets,
+                            end_targets=startup_targets,
+                            rate_v_s=ramp_rate_v_s,
+                            label="up",
+                        )
             else:
+                shutdown_after_ramp_error = False
                 start_targets = self._channel_target_voltages(respect_device_state=False)
-                self._ramp_target_voltages(
-                    start_targets=start_targets,
-                    end_targets={key: 0.0 for key in start_targets},
-                    rate_v_s=ramp_rate_v_s,
-                    label="down",
-                )
-                with self.lock.acquire_timeout(
-                    1,
-                    timeoutMessage="Could not acquire lock to toggle the AMPR PSU.",
-                ) as lock_acquired:
-                    if not lock_acquired:
-                        return
-                    device = self.device
-                    if device is None:
-                        return
-                    status, _enabled = device.enable_psu(False)
+                try:
+                    self._ramp_target_voltages(
+                        start_targets=start_targets,
+                        end_targets={key: 0.0 for key in start_targets},
+                        rate_v_s=ramp_rate_v_s,
+                        label="down",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    shutdown_after_ramp_error = True
+                    self.errorCount += 1
+                    self.print(
+                        f"AMPR ramp-down before shutdown failed: {self._format_exception(exc)}",
+                        flag=PRINT.ERROR,
+                    )
+                self.shutdownCommunication()
+                if shutdown_after_ramp_error:
+                    return
+                return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
             if startup_completed:
                 self._safe_disable_after_toggle_failure(startup_targets)
+            self._restore_off_ui_state()
             self._update_state()
             self.print(
                 f"Failed to toggle AMPR PSU: {self._format_exception(exc)}"
@@ -1413,20 +1616,29 @@ class AMPRController(DeviceController):
 
         if not state_updated:
             self._update_state()
-        if self.controllerParent.isOn() and self.main_state == "ST_ON":
+        if self.controllerParent.isOn():
+            if self.main_state != "ST_ON":
+                self.errorCount += 1
+                self._restore_off_ui_state()
+                self.print(
+                    "AMPR PSU ON sequence ended in an unexpected state: "
+                    f"{self.main_state}.{self._runtime_diagnostics(device=device)}",
+                    flag=PRINT.ERROR,
+                )
+                return
             start_acquisition = getattr(self, "startAcquisition", None)
             if callable(start_acquisition):
                 start_acquisition()
-        self.print(
-            f"AMPR PSU turned {'ON' if self.controllerParent.isOn() else 'OFF'}. "
-            f"State: {self.main_state}."
-        )
+            self.print("AMPR PSU turned ON. State: ST_ON.")
 
     def closeCommunication(self) -> None:
         super().closeCommunication()
         self.main_state = "Disconnected"
         self.detected_module_ids = []
         self.detected_modules_text = ""
+        if hasattr(self, "controllerParent"):
+            self.controllerParent.module_channel_counts = {}
+            self.controllerParent.module_voltage_limits = {}
         self.device_state_summary = "n/a"
         self.interlock_state_summary = "n/a"
         self.voltage_state_summary = "n/a"
@@ -1441,7 +1653,9 @@ class AMPRController(DeviceController):
             self.closeCommunication()
             return
 
-        super().closeCommunication()
+        if getattr(self, "acquiring", False):
+            self.stopAcquisition()
+            self.acquiring = False
         self.print("Starting AMPR shutdown sequence.")
         try:
             device.shutdown()
@@ -1456,9 +1670,15 @@ class AMPRController(DeviceController):
         else:
             self.print("AMPR shutdown sequence completed.")
         finally:
+            base_close = getattr(super(), "closeCommunication", None)
+            if callable(base_close):
+                base_close()
             self.main_state = "Disconnected"
             self.detected_module_ids = []
             self.detected_modules_text = ""
+            if hasattr(self, "controllerParent"):
+                self.controllerParent.module_channel_counts = {}
+                self.controllerParent.module_voltage_limits = {}
             self.device_state_summary = "n/a"
             self.interlock_state_summary = "n/a"
             self.voltage_state_summary = "n/a"
@@ -1502,6 +1722,7 @@ class AMPRController(DeviceController):
             if self.detected_module_ids
             else "None"
         )
+        self._refresh_module_capabilities()
 
         configured_modules = set(self.controllerParent.getConfiguredModules())
         current_items = self.controllerParent._current_channel_items()
@@ -1517,6 +1738,69 @@ class AMPRController(DeviceController):
             self.print(
                 "Configured modules not detected during AMPR scan: "
                 + ", ".join(str(module) for module in missing_modules),
+                flag=PRINT.WARNING,
+            )
+
+    def _refresh_module_capabilities(self) -> None:
+        """Update per-module voltage limits and channel counts from AMPR metadata."""
+        if self.device is None:
+            self.controllerParent.module_channel_counts = {}
+            self.controllerParent.module_voltage_limits = {}
+            return
+        if not hasattr(self.device, "get_module_capabilities"):
+            return
+
+        try:
+            module_capabilities = self.device.get_module_capabilities()
+        except Exception as exc:  # noqa: BLE001
+            self.print(
+                f"Could not query AMPR module capabilities: {exc}",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        channel_counts: dict[int, int] = {}
+        limits: dict[int, float] = {}
+        unresolved_limits: list[str] = []
+        unresolved_channel_counts: list[str] = []
+        for module, payload in cast("dict[Any, dict[str, Any]]", module_capabilities).items():
+            module_id = _coerce_int(module, -1)
+            if module_id < 0:
+                continue
+            status = payload.get("status")
+            if status != getattr(self.device, "NO_ERR", status):
+                continue
+            channel_count = _coerce_int(payload.get("channel_count"), 0)
+            if channel_count in _CHANNELS_PER_MODULE_OPTIONS:
+                channel_counts[module_id] = channel_count
+            else:
+                unresolved_channel_counts.append(
+                    f"{module_id} ({payload.get('product_id', 'unknown product')})"
+                )
+            rating = payload.get("voltage_rating")
+            if rating is None:
+                unresolved_limits.append(
+                    f"{module_id} ({payload.get('product_id', 'unknown product')})"
+                )
+            else:
+                limits[module_id] = min(
+                    abs(_coerce_float(rating, _AMPR_ABS_VOLTAGE_LIMIT)),
+                    _AMPR_ABS_VOLTAGE_LIMIT,
+                )
+        self.controllerParent.module_channel_counts = channel_counts
+        self.controllerParent.module_voltage_limits = limits
+        if unresolved_channel_counts:
+            self.print(
+                "Could not determine AMPR module channel counts for: "
+                + ", ".join(unresolved_channel_counts)
+                + ". Falling back to 4 channels.",
+                flag=PRINT.WARNING,
+            )
+        if unresolved_limits:
+            self.print(
+                "Could not determine AMPR module voltage ratings for: "
+                + ", ".join(unresolved_limits)
+                + ". Falling back to ±1000 V.",
                 flag=PRINT.WARNING,
             )
 
@@ -1627,6 +1911,38 @@ class AMPRController(DeviceController):
             return ""
         return " (" + "; ".join(diagnostics) + ")"
 
+    def _restore_off_ui_state(self) -> None:
+        """Reset toolbar ON/OFF widgets back to OFF after a failed startup."""
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(False)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = False
+        sync_local = getattr(self.controllerParent, "_sync_local_on_action", None)
+        if callable(sync_local):
+            sync_local()
+
+    @contextlib.contextmanager
+    def _controller_lock_section(self, timeout_message: str):
+        """Acquire the controller lock without swallowing hardware exceptions."""
+        acquire = getattr(self.lock, "acquire", None)
+        release = getattr(self.lock, "release", None)
+        if callable(acquire) and callable(release):
+            if not acquire(timeout=1):
+                self.print(timeout_message, flag=PRINT.ERROR)
+                raise TimeoutError(timeout_message)
+            try:
+                yield
+            finally:
+                release()
+            return
+
+        with self.lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
+            if not lock_acquired:
+                raise TimeoutError(timeout_message)
+            yield
+
     def _begin_transition(self, target_on: bool) -> bool:
         """Mark a global AMPR ON/OFF transition as active."""
         if self.transitioning:
@@ -1678,6 +1994,13 @@ class AMPRController(DeviceController):
     ) -> None:
         """Apply a full AMPR target map while the controller lock is held."""
         for module, module_targets in sorted(self._group_target_voltages(targets).items()):
+            voltage_limit = self._module_voltage_limit(module)
+            for channel_id, voltage in sorted(module_targets.items()):
+                if abs(float(voltage)) > voltage_limit:
+                    raise RuntimeError(
+                        f"Refusing {float(voltage):.3f} V for module {module} CH{channel_id}: "
+                        f"detected module rating is ±{voltage_limit:.0f} V."
+                    )
             if hasattr(device, "set_module_voltages"):
                 statuses = device.set_module_voltages(module, module_targets)
                 for channel_id, status in statuses.items():
@@ -1708,9 +2031,7 @@ class AMPRController(DeviceController):
         if not targets:
             return
 
-        with self.lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
-            if not lock_acquired:
-                raise TimeoutError(timeout_message)
+        with self._controller_lock_section(timeout_message):
             device = self.device
             if device is None:
                 raise RuntimeError("AMPR device is not available.")
@@ -1794,13 +2115,10 @@ class AMPRController(DeviceController):
 
         cleanup_errors: list[str] = []
         zero_targets = {key: 0.0 for key in targets}
-        with self.lock.acquire_timeout(
-            1,
-            timeoutMessage="Could not acquire lock for AMPR failure cleanup.",
-        ) as lock_acquired:
-            if not lock_acquired:
-                cleanup_errors.append("lock timeout")
-            else:
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock for AMPR failure cleanup."
+            ):
                 device = self.device
                 if device is None:
                     cleanup_errors.append("device disappeared")
@@ -1819,6 +2137,8 @@ class AMPRController(DeviceController):
                             cleanup_errors.append(
                                 f"disable_psu failed: {self._format_status(status, device=device)}"
                             )
+        except TimeoutError:
+            cleanup_errors.append("lock timeout")
 
         if cleanup_errors:
             self.print(

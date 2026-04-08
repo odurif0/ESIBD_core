@@ -24,11 +24,11 @@ including the AMPR driver files and vendor DLL.
 3. Restart ESIBD Explorer.
 4. Enable the `AMPR_A` plugin in the Plugin Manager.
 
-The plugin lazily loads its bundled local
-`vendor/esibd_ampr_a_plugin_runtime` runtime when communication is initialized.
-If that bundled copy is unavailable, it can still fall back to an installed
-`cgc.ampr` package or to the checked-out repository source tree when used from
-this repository.
+The plugin lazily loads its bundled local `vendor/runtime` package under a
+private Python module namespace when communication is initialized. If that
+bundled copy is unavailable, it can still fall back to an installed `cgc.ampr`
+package or to the checked-out repository source tree when used from this
+repository.
 
 ## Device Configuration
 

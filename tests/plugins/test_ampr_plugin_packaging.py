@@ -16,21 +16,21 @@ PLUGIN_PATH = (
     / "plugins"
     / "esibd_explorer"
     / "ampr_a"
-    / "ampr_a_plugin.py"
+    / "ampr_plugin.py"
 )
 PLUGIN_A_PATH = (
     Path(__file__).resolve().parents[2]
     / "plugins"
     / "esibd_explorer"
     / "ampr_a"
-    / "ampr_a_plugin.py"
+    / "ampr_plugin.py"
 )
 PLUGIN_B_PATH = (
     Path(__file__).resolve().parents[2]
     / "plugins"
     / "esibd_explorer"
     / "ampr_b"
-    / "ampr_b_plugin.py"
+    / "ampr_plugin.py"
 )
 VENDOR_ROOT = (
     Path(__file__).resolve().parents[2]
@@ -38,6 +38,7 @@ VENDOR_ROOT = (
     / "esibd_explorer"
     / "ampr_a"
     / "vendor"
+    / "runtime"
 )
 VENDOR_A_ROOT = (
     Path(__file__).resolve().parents[2]
@@ -45,6 +46,7 @@ VENDOR_A_ROOT = (
     / "esibd_explorer"
     / "ampr_a"
     / "vendor"
+    / "runtime"
 )
 VENDOR_B_ROOT = (
     Path(__file__).resolve().parents[2]
@@ -52,6 +54,7 @@ VENDOR_B_ROOT = (
     / "esibd_explorer"
     / "ampr_b"
     / "vendor"
+    / "runtime"
 )
 ICON_PATH = (
     Path(__file__).resolve().parents[2]
@@ -244,6 +247,7 @@ def _clear_test_modules() -> None:
         or name == "cgc"
         or name.startswith("cgc.")
         or name.startswith("esibd_ampr")
+        or name.startswith("_esibd_bundled_ampr_runtime")
         or name in {"ampr_plugin_test", "ampr_a_plugin_test", "ampr_b_plugin_test"}
     ]:
         sys.modules.pop(name, None)
@@ -267,15 +271,16 @@ def test_plugin_import_is_lazy_and_does_not_load_runtime(monkeypatch):
     _install_esibd_stubs()
     monkeypatch.syspath_prepend("/tmp/nonexistent-sentinel")
 
-    vendor_root_str = str(VENDOR_ROOT)
-    assert vendor_root_str not in sys.path
+    runtime_dir_str = str(VENDOR_ROOT)
+    assert runtime_dir_str not in sys.path
 
     module = _import_plugin_module()
+    runtime_module_name = module._bundled_runtime_module_name()
 
     assert callable(module._get_ampr_driver_class)
-    assert vendor_root_str not in sys.path
+    assert runtime_dir_str not in sys.path
     assert "cgc" not in sys.modules
-    assert "esibd_ampr_a_plugin_runtime" not in sys.modules
+    assert runtime_module_name not in sys.modules
 
 
 def test_plugin_prefers_private_bundled_runtime(monkeypatch):
@@ -284,12 +289,13 @@ def test_plugin_prefers_private_bundled_runtime(monkeypatch):
 
     module = _import_plugin_module()
     driver_class = module._get_ampr_driver_class()
+    runtime_module_name = module._bundled_runtime_module_name()
 
-    assert driver_class.__module__.startswith("esibd_ampr_a_plugin_runtime.ampr")
-    assert str(VENDOR_ROOT) in sys.path
+    assert driver_class.__module__.startswith(f"{runtime_module_name}.ampr")
+    assert str(VENDOR_ROOT) not in sys.path
     assert (
-        sys.modules["esibd_ampr_a_plugin_runtime"].__file__
-        == str(VENDOR_ROOT / "esibd_ampr_a_plugin_runtime" / "__init__.py")
+        sys.modules[runtime_module_name].__file__
+        == str(VENDOR_ROOT / "__init__.py")
     )
 
 
@@ -299,8 +305,9 @@ def test_plugin_runtime_forces_inline_backend():
 
     module = _import_plugin_module()
     module._get_ampr_driver_class()
+    runtime_module_name = module._bundled_runtime_module_name()
 
-    runtime_driver_common = sys.modules["esibd_ampr_a_plugin_runtime._driver_common"]
+    runtime_driver_common = sys.modules[f"{runtime_module_name}._driver_common"]
 
     assert runtime_driver_common.supports_process_backend() is False
 
@@ -569,6 +576,40 @@ def test_toggle_advanced_keeps_ampr_channels_visible():
     assert device.channels[1].hidden == [False]
 
 
+def test_set_on_ui_state_uses_thread_safe_action_signals():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    class FakeSignal:
+        def __init__(self):
+            self.values = []
+
+        def emit(self, value):
+            self.values.append(value)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = None
+            self.signalComm = types.SimpleNamespace(
+                setValueFromThreadSignal=FakeSignal()
+            )
+
+    sync_calls = []
+    device = object.__new__(module.AMPRDevice)
+    device.useOnOffLogic = True
+    device.onAction = FakeAction()
+    device.deviceOnAction = FakeAction()
+    device._sync_local_on_action = lambda: sync_calls.append(True)
+
+    module.AMPRDevice._set_on_ui_state(device, False)
+
+    assert device.onAction.signalComm.setValueFromThreadSignal.values == [False]
+    assert device.deviceOnAction.signalComm.setValueFromThreadSignal.values == [False]
+    assert sync_calls == [True]
+
+
 def test_channel_events_are_logged_for_user_changes():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -652,6 +693,30 @@ def test_channel_off_immediately_clears_monitor():
     module.AMPRChannel.enabledChanged(channel)
 
     assert np.isnan(channel.monitor)
+
+
+def test_channel_enabled_change_forces_apply_even_without_setpoint_change():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    applies = []
+    channel = object.__new__(module.AMPRChannel)
+    channel.channelParent = types.SimpleNamespace(
+        loading=False,
+        print=lambda message, flag=None: None,
+    )
+    channel.name = "AMPR_M02_CH3"
+    channel.module = "2"
+    channel.id = "3"
+    channel.enabled = True
+    channel.monitor = 0.0
+    channel.applyValue = lambda apply=False: applies.append(apply)
+
+    module.AMPRChannel.enabledChanged(channel)
+
+    assert applies == [True]
 
 
 def test_channel_uses_readable_toolbuttons_and_minimum_row_height():
@@ -761,8 +826,9 @@ def test_init_gui_rewires_close_action_to_shutdown():
     assert device.initAction.visible is False
     assert device.closeCommunicationAction.triggered.disconnected is True
     assert device.closeCommunicationAction.triggered.connected == [device.shutdownCommunication]
-    assert device.closeCommunicationAction.tooltips == ["Shutdown AMPR_A and close communication."]
-    assert device.closeCommunicationAction.texts == ["Shutdown AMPR_A and close communication."]
+    assert device.closeCommunicationAction.tooltips == ["Shutdown AMPR_A and disconnect."]
+    assert device.closeCommunicationAction.texts == ["Shutdown AMPR_A and disconnect."]
+    assert device.closeCommunicationAction.visible is False
     assert controller_args == [device]
     assert device.controller == "controller"
 
@@ -819,8 +885,8 @@ def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
             module.Device.finalizeInit = original_finalize_init
 
     assert len(added) == 1
-    assert added[0]["toolTipFalse"] == "Initialize communication if needed and turn AMPR_A ON."
-    assert added[0]["toolTipTrue"] == "Turn AMPR_A OFF."
+    assert added[0]["toolTipFalse"] == "Turn AMPR_A ON."
+    assert added[0]["toolTipTrue"] == "Turn AMPR_A OFF and disconnect."
     assert added[0]["iconFalse"] == "core:rocket-fly.png"
     assert added[0]["before"] is device.closeCommunicationAction
     assert added[0]["restore"] is False
@@ -971,24 +1037,29 @@ def test_ampr_a_and_ampr_b_load_as_distinct_autonomous_plugins(monkeypatch):
 
     module_a = _import_plugin_module_from_path("ampr_a_plugin_test", PLUGIN_A_PATH)
     module_b = _import_plugin_module_from_path("ampr_b_plugin_test", PLUGIN_B_PATH)
+    runtime_module_name_a = module_a._bundled_runtime_module_name()
+    runtime_module_name_b = module_b._bundled_runtime_module_name()
 
     assert module_a.AMPRDevice.name == "AMPR_A"
     assert module_b.AMPRDevice.name == "AMPR_B"
-    assert module_a._BUNDLED_RUNTIME_PACKAGE == "esibd_ampr_a_plugin_runtime"
-    assert module_b._BUNDLED_RUNTIME_PACKAGE == "esibd_ampr_b_plugin_runtime"
+    assert module_a._BUNDLED_RUNTIME_DIRNAME == "runtime"
+    assert module_b._BUNDLED_RUNTIME_DIRNAME == "runtime"
+    assert VENDOR_A_ROOT.name == "runtime"
+    assert VENDOR_B_ROOT.name == "runtime"
+    assert runtime_module_name_a != runtime_module_name_b
 
     driver_class_a = module_a._get_ampr_driver_class()
     driver_class_b = module_b._get_ampr_driver_class()
 
-    assert driver_class_a.__module__.startswith("esibd_ampr_a_plugin_runtime.ampr")
-    assert driver_class_b.__module__.startswith("esibd_ampr_b_plugin_runtime.ampr")
-    assert str(VENDOR_A_ROOT) in sys.path
-    assert str(VENDOR_B_ROOT) in sys.path
+    assert driver_class_a.__module__.startswith(f"{runtime_module_name_a}.ampr")
+    assert driver_class_b.__module__.startswith(f"{runtime_module_name_b}.ampr")
+    assert str(VENDOR_A_ROOT) not in sys.path
+    assert str(VENDOR_B_ROOT) not in sys.path
     assert (
-        sys.modules["esibd_ampr_a_plugin_runtime"].__file__
-        == str(VENDOR_A_ROOT / "esibd_ampr_a_plugin_runtime" / "__init__.py")
+        sys.modules[runtime_module_name_a].__file__
+        == str(VENDOR_A_ROOT / "__init__.py")
     )
     assert (
-        sys.modules["esibd_ampr_b_plugin_runtime"].__file__
-        == str(VENDOR_B_ROOT / "esibd_ampr_b_plugin_runtime" / "__init__.py")
+        sys.modules[runtime_module_name_b].__file__
+        == str(VENDOR_B_ROOT / "__init__.py")
     )

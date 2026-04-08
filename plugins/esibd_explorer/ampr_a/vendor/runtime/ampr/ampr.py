@@ -7,6 +7,7 @@ devices via the AMPR base hardware interface with added logging functionality.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -18,6 +19,68 @@ from .._driver_common import (
     build_device_logger,
 )
 from .ampr_base import AMPRBase
+
+_MODULE_VOLTAGE_RATING_RE = re.compile(r"\b(500|1000)\s*V\b", re.IGNORECASE)
+_MODULE_CHANNEL_COUNT_RE = re.compile(
+    r"\b(2|4)\s*(?:channel|channels|ch)\b",
+    re.IGNORECASE,
+)
+_KNOWN_MODULE_CAPABILITIES: dict[tuple[int | None, int | None], dict[str, int]] = {
+    (132401, 222308): {"voltage_rating": 1000, "channel_count": 4},
+}
+
+
+def _parse_module_voltage_rating(product_id: object) -> int | None:
+    """Extract a nominal module voltage rating from a human-readable product ID."""
+    match = _MODULE_VOLTAGE_RATING_RE.search(str(product_id))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _parse_module_channel_count(product_id: object) -> int | None:
+    """Extract the nominal channel count from a human-readable product ID."""
+    product_id_text = str(product_id)
+    lowered = product_id_text.lower()
+    if "quadruple" in lowered or "quad" in lowered:
+        return 4
+    if "dual" in lowered or "double" in lowered:
+        return 2
+    match = _MODULE_CHANNEL_COUNT_RE.search(product_id_text)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _resolve_module_capabilities(
+    *,
+    product_id: object | None,
+    product_no: object | None,
+    hw_type: object | None,
+) -> dict[str, int | None]:
+    """Resolve stable AMPR module capabilities from IDs, then fallback strings."""
+    normalized_product_no = None if product_no is None else int(product_no)
+    normalized_hw_type = None if hw_type is None else int(hw_type)
+
+    capabilities: dict[str, int | None] = {
+        "voltage_rating": None,
+        "channel_count": None,
+    }
+    for key in (
+        (normalized_product_no, normalized_hw_type),
+        (normalized_product_no, None),
+        (None, normalized_hw_type),
+    ):
+        known = _KNOWN_MODULE_CAPABILITIES.get(key)
+        if known is not None:
+            capabilities.update(known)
+            break
+
+    if capabilities["voltage_rating"] is None:
+        capabilities["voltage_rating"] = _parse_module_voltage_rating(product_id)
+    if capabilities["channel_count"] is None:
+        capabilities["channel_count"] = _parse_module_channel_count(product_id)
+    return capabilities
 
 class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
     """
@@ -45,6 +108,7 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
     """
 
     _INSTRUMENT_NAME = "AMPR"
+    _DEFAULT_IO_TIMEOUT_S = 5.0
 
     def __init__(
         self,
@@ -142,6 +206,15 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             raise TypeError("AMPR hk_interval_s must be a positive number.")
         if hk_interval_s <= 0:
             raise ValueError("AMPR hk_interval_s must be greater than 0.")
+
+    def _resolve_io_timeout(self, timeout_s: Optional[float] = None) -> float:
+        """Return a positive timeout for DLL-backed I/O calls."""
+        if timeout_s is None:
+            return self._DEFAULT_IO_TIMEOUT_S
+        timeout_s = float(timeout_s)
+        if timeout_s <= 0:
+            raise ValueError("AMPR timeout_s must be greater than 0.")
+        return timeout_s
 
     def _rollback_connect_failure(self, close_port, timeout_s, reason):
         """Close the vendor channel after a failed connect sequence."""
@@ -374,20 +447,37 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
                 self.disconnect()
             raise
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_s: Optional[float] = None) -> None:
         """Run the recommended AMPR shutdown sequence."""
-        modules = self.scan_modules()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        modules = self.scan_modules(timeout_s=timeout_s)
 
-        for module in modules:
-            for channel in range(1, self.CHANNEL_NUM + 1):
-                status = self.set_module_voltage(module, channel, 0.0)
+        module_items = (
+            modules.items()
+            if isinstance(modules, dict)
+            else ((module, {}) for module in modules)
+        )
+        for module, module_info in module_items:
+            capabilities = _resolve_module_capabilities(
+                product_id=module_info.get("product_id"),
+                product_no=module_info.get("product_no"),
+                hw_type=module_info.get("hw_type"),
+            )
+            channel_count = int(capabilities.get("channel_count") or self.CHANNEL_NUM)
+            for channel in range(1, channel_count + 1):
+                status = self.set_module_voltage(
+                    module,
+                    channel,
+                    0.0,
+                    timeout_s=timeout_s,
+                )
                 if status != self.NO_ERR:
                     raise RuntimeError(
                         "Failed to set AMPR module "
                         f"{module} channel {channel} to 0 V: {self.format_status(status)}"
                     )
 
-        status, _ = self.enable_psu(False)
+        status, _ = self.enable_psu(False, timeout_s=timeout_s)
         if status != self.NO_ERR:
             raise RuntimeError(
                 f"AMPR disable_psu failed: {self.format_status(status)}"
@@ -691,11 +781,17 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
 
     # Override key methods with logging
     
-    def enable_psu(self, enable):
+    def enable_psu(self, enable, timeout_s: Optional[float] = None):
         """Enable/disable PSUs with logging."""
         self.logger.info(f"Setting PSU enable to {enable}")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            status, enable_value = self._call_locked(super().enable_psu, enable)
+            status, enable_value = self._call_locked_with_timeout(
+                super().enable_psu,
+                timeout_s,
+                "enable_psu",
+                enable,
+            )
             if status == self.NO_ERR:
                 self.logger.info(f"PSU enable set to {enable_value}")
             else:
@@ -707,9 +803,14 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             self.logger.error(f"Error setting PSU enable: {e}")
             raise
 
-    def get_state(self):
+    def get_state(self, timeout_s: Optional[float] = None):
         """Get main state with logging."""
-        status, state_hex, state_name = self._call_locked(super().get_state)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, state_hex, state_name = self._call_locked_with_timeout(
+            super().get_state,
+            timeout_s,
+            "get_state",
+        )
         if status == self.NO_ERR:
             self.logger.info(f"Main state: {state_name} ({state_hex})")
         else:
@@ -718,11 +819,16 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             )
         return status, state_hex, state_name
 
-    def restart(self):
+    def restart(self, timeout_s: Optional[float] = None):
         """Restart device with logging."""
         self.logger.info("Restarting AMPR device")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            status = self._call_locked(super().restart)
+            status = self._call_locked_with_timeout(
+                super().restart,
+                timeout_s,
+                "restart",
+            )
             if status == self.NO_ERR:
                 self.logger.info("Device restart successful")
             else:
@@ -734,25 +840,45 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             self.logger.error(f"Error restarting device: {e}")
             raise
 
-    def get_scanned_module_state(self):
+    def get_scanned_module_state(self, timeout_s: Optional[float] = None):
         """Get the scanned module state through the shared DLL lock."""
-        return self._call_locked(super().get_scanned_module_state)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            super().get_scanned_module_state,
+            timeout_s,
+            "get_scanned_module_state",
+        )
 
-    def rescan_modules(self):
+    def rescan_modules(self, timeout_s: Optional[float] = None):
         """Rescan module addresses through the shared DLL lock."""
-        return self._call_locked(super().rescan_modules)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            super().rescan_modules,
+            timeout_s,
+            "rescan_modules",
+        )
 
-    def set_scanned_module_state(self):
+    def set_scanned_module_state(self, timeout_s: Optional[float] = None):
         """Persist the current module scan through the shared DLL lock."""
-        return self._call_locked(super().set_scanned_module_state)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            super().set_scanned_module_state,
+            timeout_s,
+            "set_scanned_module_state",
+        )
 
     # Module management convenience methods with logging
     
-    def scan_modules(self):
+    def scan_modules(self, timeout_s: Optional[float] = None):
         """Scan and log all connected modules."""
         self.logger.info("Scanning for connected modules")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            modules = self._call_locked(super().scan_all_modules)
+            modules = self._call_locked_with_timeout(
+                super().scan_all_modules,
+                timeout_s,
+                "scan_all_modules",
+            )
             if modules:
                 self.logger.info(f"Found {len(modules)} modules:")
                 for addr, info in modules.items():
@@ -766,11 +892,25 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             self.logger.error(f"Error scanning modules: {e}")
             raise
 
-    def set_module_voltage(self, address, channel, voltage):
+    def set_module_voltage(
+        self,
+        address,
+        channel,
+        voltage,
+        timeout_s: Optional[float] = None,
+    ):
         """Set module voltage with logging."""
         self.logger.info(f"Setting module {address} channel {channel} voltage to {voltage:.3f}V")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            status = self._call_locked(super().set_module_voltage, address, channel, voltage)
+            status = self._call_locked_with_timeout(
+                super().set_module_voltage,
+                timeout_s,
+                f"set_module_voltage[{address}:{channel}]",
+                address,
+                channel,
+                voltage,
+            )
             if status == self.NO_ERR:
                 self.logger.info(f"Module {address} channel {channel} voltage set successfully")
             else:
@@ -783,11 +923,17 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             self.logger.error(f"Error setting module voltage: {e}")
             raise
 
-    def get_module_voltages(self, address):
+    def get_module_voltages(self, address, timeout_s: Optional[float] = None):
         """Get all voltages for a module with logging."""
         self.logger.info(f"Getting voltages for module {address}")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            voltages = self._call_locked(super().get_all_module_voltages, address)
+            voltages = self._call_locked_with_timeout(
+                super().get_all_module_voltages,
+                timeout_s,
+                f"get_all_module_voltages[{address}]",
+                address,
+            )
             for channel, data in voltages.items():
                 setpoint = data.get('setpoint', 'N/A')
                 measured = data.get('measured', 'N/A')
@@ -797,11 +943,23 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             self.logger.error(f"Error getting module voltages: {e}")
             raise
 
-    def set_module_voltages(self, address, voltages):
-        """Set multiple module voltages with logging."""
+    def set_module_voltages(self, address, voltages, timeout_s: Optional[float] = None):
+        """Set multiple module voltages with logging.
+
+        The vendor bulk API has proven less reliable in practice than the
+        per-channel call on some AMPR crates. Prefer the safer sequential path.
+        """
         self.logger.info(f"Setting multiple voltages for module {address}")
+        timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            results = self._call_locked(super().set_all_module_voltages, address, voltages)
+            results = {}
+            for channel, voltage in sorted(dict(voltages).items()):
+                results[channel] = self.set_module_voltage(
+                    address,
+                    channel,
+                    voltage,
+                    timeout_s=timeout_s,
+                )
             success_count = sum(1 for status in results.values() if status == self.NO_ERR)
             self.logger.info(f"Set {success_count}/{len(results)} voltages successfully on module {address}")
             
@@ -865,6 +1023,15 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             
             # Get voltage data for all channels
             info['voltages'] = self.get_module_voltages(address)
+
+            capabilities = _resolve_module_capabilities(
+                product_id=info.get("product_id"),
+                product_no=info.get("product_no"),
+                hw_type=info.get("hw_type"),
+            )
+            for key, value in capabilities.items():
+                if value is not None:
+                    info[key] = value
             
             self.logger.info(f"Retrieved information for module {address}")
             return info
@@ -895,9 +1062,7 @@ class AMPR(ProcessIsolatedClientMixin):
 
     _INSTRUMENT_NAME = "AMPR"
     _PROCESS_CONTROLLER_CLASS = _AMPRController
-    _PROCESS_CONTROLLER_PATH = (
-        "esibd_ampr_a_plugin_runtime.ampr.ampr:_AMPRController"
-    )
+    _PROCESS_CONTROLLER_PATH = f"{__name__}:_AMPRController"
     _PROCESS_TIMEOUT_RULES = {
         "connect": (4.0, 5.0, 15.0),
         "initialize": (8.0, 5.0, 30.0),
@@ -969,6 +1134,80 @@ class AMPR(ProcessIsolatedClientMixin):
                 "product_id": product_id,
             }
         return module_product_ids
+
+    def get_module_capabilities(self, address: Optional[int] = None):
+        """Return resolved AMPR module capabilities for one module or all modules."""
+        if address is not None:
+            module_address = int(address)
+            status, product_id = self._call_backend_method(
+                "get_module_product_id", module_address
+            )
+            try:
+                product_no_status, product_no = self._call_backend_method(
+                    "get_module_product_no", module_address
+                )
+            except AttributeError:
+                product_no_status, product_no = status, None
+            try:
+                hw_type_status, hw_type = self._call_backend_method(
+                    "get_module_hw_type", module_address
+                )
+            except AttributeError:
+                hw_type_status, hw_type = status, None
+            combined_status = status
+            for candidate_status in (product_no_status, hw_type_status):
+                if candidate_status != getattr(self, "NO_ERR", candidate_status):
+                    combined_status = candidate_status
+                    break
+            capabilities = _resolve_module_capabilities(
+                product_id=product_id,
+                product_no=product_no,
+                hw_type=hw_type,
+            )
+            return {
+                "status": combined_status,
+                "product_id": product_id,
+                "product_no": product_no,
+                "hw_type": hw_type,
+                **capabilities,
+            }
+
+        module_capabilities = {}
+        for module_address in self._resolve_module_addresses():
+            module_capabilities[module_address] = self.get_module_capabilities(
+                module_address
+            )
+        return module_capabilities
+
+    def get_module_voltage_rating(self, address: Optional[int] = None):
+        """Return one module voltage rating or all scanned module voltage ratings."""
+        if address is not None:
+            capabilities = self.get_module_capabilities(int(address))
+            return capabilities["status"], capabilities["voltage_rating"]
+
+        module_voltage_ratings = {}
+        for module_address, capabilities in self.get_module_capabilities().items():
+            module_voltage_ratings[module_address] = {
+                "status": capabilities["status"],
+                "product_id": capabilities["product_id"],
+                "voltage_rating": capabilities["voltage_rating"],
+            }
+        return module_voltage_ratings
+
+    def get_module_channel_count(self, address: Optional[int] = None):
+        """Return one module channel count or all scanned module channel counts."""
+        if address is not None:
+            capabilities = self.get_module_capabilities(int(address))
+            return capabilities["status"], capabilities["channel_count"]
+
+        module_channel_counts = {}
+        for module_address, capabilities in self.get_module_capabilities().items():
+            module_channel_counts[module_address] = {
+                "status": capabilities["status"],
+                "product_id": capabilities["product_id"],
+                "channel_count": capabilities["channel_count"],
+            }
+        return module_channel_counts
 
     def get_module_product_no(self, address: Optional[int] = None):
         """Return one module product number or all scanned module product numbers."""

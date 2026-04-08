@@ -146,6 +146,42 @@ def test_public_ampr_module_metadata_helpers_support_omitted_address():
         2: {"status": AMPRBase.NO_ERR, "product_id": "ID-2"},
         5: {"status": AMPRBase.NO_ERR, "product_id": "ID-5"},
     }
+    assert ampr.get_module_capabilities(2) == {
+        "status": AMPRBase.NO_ERR,
+        "product_id": "ID-2",
+        "product_no": 200,
+        "hw_type": 20,
+        "voltage_rating": None,
+        "channel_count": None,
+    }
+    assert ampr.get_module_capabilities() == {
+        2: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "ID-2",
+            "product_no": 200,
+            "hw_type": 20,
+            "voltage_rating": None,
+            "channel_count": None,
+        },
+        5: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "ID-5",
+            "product_no": 500,
+            "hw_type": 50,
+            "voltage_rating": None,
+            "channel_count": None,
+        },
+    }
+    assert ampr.get_module_voltage_rating(2) == (AMPRBase.NO_ERR, None)
+    assert ampr.get_module_voltage_rating() == {
+        2: {"status": AMPRBase.NO_ERR, "product_id": "ID-2", "voltage_rating": None},
+        5: {"status": AMPRBase.NO_ERR, "product_id": "ID-5", "voltage_rating": None},
+    }
+    assert ampr.get_module_channel_count(2) == (AMPRBase.NO_ERR, None)
+    assert ampr.get_module_channel_count() == {
+        2: {"status": AMPRBase.NO_ERR, "product_id": "ID-2", "channel_count": None},
+        5: {"status": AMPRBase.NO_ERR, "product_id": "ID-5", "channel_count": None},
+    }
     assert ampr.get_module_product_no() == {
         2: {"status": AMPRBase.NO_ERR, "product_no": 200},
         5: {"status": AMPRBase.NO_ERR, "product_no": 500},
@@ -174,6 +210,202 @@ def test_public_ampr_module_metadata_helpers_support_omitted_address():
         2: {"address": 2, "product_id": "ID-2"},
         5: {"address": 5, "product_id": "ID-5"},
     }
+
+
+def test_public_ampr_module_voltage_rating_is_derived_from_product_id():
+    class FakeBackend:
+        def scan_modules(self):
+            return {2: {"state": "ST_STBY"}, 5: {"state": "ST_ON"}}
+
+        def get_module_product_id(self, address):
+            labels = {
+                2: "Quadruple Voltage Source 500V",
+                5: "Quadruple Voltage Source 1000V",
+            }
+            return AMPRBase.NO_ERR, labels[address]
+
+    ampr = object.__new__(AMPR)
+    object.__setattr__(ampr, "_backend_mode", "inline")
+    object.__setattr__(ampr, "_backend", FakeBackend())
+    object.__setattr__(ampr, "_process_backend_disabled_reason", "")
+    object.__setattr__(ampr, "logger", types.SimpleNamespace(info=lambda *a, **k: None))
+
+    assert ampr.get_module_voltage_rating(2) == (AMPRBase.NO_ERR, 500)
+    assert ampr.get_module_voltage_rating() == {
+        2: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "Quadruple Voltage Source 500V",
+            "voltage_rating": 500,
+        },
+        5: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "Quadruple Voltage Source 1000V",
+            "voltage_rating": 1000,
+        },
+    }
+    assert ampr.get_module_channel_count() == {
+        2: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "Quadruple Voltage Source 500V",
+            "channel_count": 4,
+        },
+        5: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "Quadruple Voltage Source 1000V",
+            "channel_count": 4,
+        },
+    }
+
+
+def test_public_ampr_module_capabilities_prefer_known_ids_over_strings():
+    class FakeBackend:
+        def scan_modules(self):
+            return {2: {"state": "ST_STBY"}}
+
+        def get_module_product_id(self, address):
+            return AMPRBase.NO_ERR, "Mystery Module"
+
+        def get_module_product_no(self, address):
+            return AMPRBase.NO_ERR, 132401
+
+        def get_module_hw_type(self, address):
+            return AMPRBase.NO_ERR, 222308
+
+    ampr = object.__new__(AMPR)
+    object.__setattr__(ampr, "_backend_mode", "inline")
+    object.__setattr__(ampr, "_backend", FakeBackend())
+    object.__setattr__(ampr, "_process_backend_disabled_reason", "")
+    object.__setattr__(ampr, "logger", types.SimpleNamespace(info=lambda *a, **k: None))
+
+    assert ampr.get_module_capabilities() == {
+        2: {
+            "status": AMPRBase.NO_ERR,
+            "product_id": "Mystery Module",
+            "product_no": 132401,
+            "hw_type": 222308,
+            "voltage_rating": 1000,
+            "channel_count": 4,
+        }
+    }
+
+
+def test_scan_modules_uses_timeout_safe_dll_wrapper(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    backend = object.__getattribute__(ampr, "_backend")
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        return {2: {"state": "ST_STBY"}}
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    modules = backend.scan_modules()
+
+    assert modules == {2: {"state": "ST_STBY"}}
+    assert calls == [("scan_all_modules", 5.0, "scan_all_modules", ())]
+
+
+def test_module_voltage_writes_use_timeout_safe_dll_wrapper(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    backend = object.__getattribute__(ampr, "_backend")
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "set_module_voltage":
+            return backend.NO_ERR
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.set_module_voltage(2, 1, 10.0) == backend.NO_ERR
+    assert backend.set_module_voltages(2, {1: 10.0}) == {1: backend.NO_ERR}
+    assert calls == [
+        ("set_module_voltage", 5.0, "set_module_voltage[2:1]", (2, 1, 10.0)),
+        ("set_module_voltage", 5.0, "set_module_voltage[2:1]", (2, 1, 10.0)),
+    ]
+
+
+def test_timeout_safe_wrapper_methods_use_dll_timeout_guard(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    backend = object.__getattribute__(ampr, "_backend")
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "enable_psu":
+            return backend.NO_ERR, args[0]
+        if method.__name__ == "get_state":
+            return backend.NO_ERR, "0x0", "ST_STBY"
+        if method.__name__ == "restart":
+            return backend.NO_ERR
+        if method.__name__ == "get_scanned_module_state":
+            return backend.NO_ERR, False, False
+        if method.__name__ == "rescan_modules":
+            return backend.NO_ERR
+        if method.__name__ == "set_scanned_module_state":
+            return backend.NO_ERR
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.enable_psu(True) == (backend.NO_ERR, True)
+    assert backend.get_state() == (backend.NO_ERR, "0x0", "ST_STBY")
+    assert backend.restart() == backend.NO_ERR
+    assert backend.get_scanned_module_state() == (backend.NO_ERR, False, False)
+    assert backend.rescan_modules() == backend.NO_ERR
+    assert backend.set_scanned_module_state() == backend.NO_ERR
+    assert calls == [
+        ("enable_psu", 5.0, "enable_psu", (True,)),
+        ("get_state", 5.0, "get_state", ()),
+        ("restart", 5.0, "restart", ()),
+        ("get_scanned_module_state", 5.0, "get_scanned_module_state", ()),
+        ("rescan_modules", 5.0, "rescan_modules", ()),
+        ("set_scanned_module_state", 5.0, "set_scanned_module_state", ()),
+    ]
+
+
+def test_shutdown_respects_detected_module_channel_count(monkeypatch):
+    ampr, _dll = make_ampr(monkeypatch)
+    backend = object.__getattribute__(ampr, "_backend")
+    set_calls = []
+    enable_calls = []
+    scan_calls = []
+
+    def fake_scan_modules(timeout_s=None):
+        scan_calls.append(timeout_s)
+        return {
+            2: {"product_no": 132401, "hw_type": 222308},
+            3: {"product_id": "Dual Voltage Source 500V"},
+        }
+
+    def fake_set_module_voltage(address, channel, voltage, timeout_s=None):
+        set_calls.append((address, channel, voltage, timeout_s))
+        return backend.NO_ERR
+
+    def fake_enable_psu(enable, timeout_s=None):
+        enable_calls.append((enable, timeout_s))
+        return backend.NO_ERR, enable
+
+    monkeypatch.setattr(backend, "scan_modules", fake_scan_modules)
+    monkeypatch.setattr(backend, "set_module_voltage", fake_set_module_voltage)
+    monkeypatch.setattr(backend, "enable_psu", fake_enable_psu)
+    monkeypatch.setattr(backend, "disconnect", Mock(return_value=True))
+
+    backend.shutdown(timeout_s=1.5)
+
+    assert scan_calls == [1.5]
+    assert set_calls == [
+        (2, 1, 0.0, 1.5),
+        (2, 2, 0.0, 1.5),
+        (2, 3, 0.0, 1.5),
+        (2, 4, 0.0, 1.5),
+        (3, 1, 0.0, 1.5),
+        (3, 2, 0.0, 1.5),
+    ]
+    assert enable_calls == [(False, 1.5)]
+    backend.disconnect.assert_called_once_with()
 
 
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
