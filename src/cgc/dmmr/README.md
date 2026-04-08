@@ -9,6 +9,8 @@ Python driver for the CGC DMMR-8 picoammeter controller.
 - Scans installed DPA-1F current-measurement modules
 - Reads controller and module state
 - Reads live current measurements and configuration data
+- Exposes structured metadata and runtime snapshots through
+  `get_product_info()` and `collect_housekeeping()`
 - Provides a safer shutdown path through `shutdown()`
 
 ## Files
@@ -42,9 +44,10 @@ process boundaries.
 from cgc.dmmr import DMMR
 
 dmmr = DMMR("dmmr_main", com=8)
-dmmr.connect()
+dmmr.initialize()
 try:
-    print(dmmr.scan_modules())
+    print(dmmr.get_product_info())
+    print(dmmr.collect_housekeeping())
 finally:
     dmmr.shutdown()
 ```

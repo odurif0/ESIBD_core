@@ -5,10 +5,11 @@ from cgc.dmmr import DMMR
 
 def main():
     dmmr = DMMR("dmmr_demo", com=8)
-    dmmr.connect()
+    dmmr.initialize()
     try:
+        print("Product:", dmmr.get_product_info())
         print("Status:", dmmr.get_status())
-        print("Modules:", dmmr.scan_modules())
+        print("Snapshot:", dmmr.collect_housekeeping())
     finally:
         dmmr.shutdown()
 

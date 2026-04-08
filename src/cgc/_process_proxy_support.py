@@ -19,6 +19,9 @@ class DummyController:
     def get_value(self) -> int:
         return self.value
 
+    def echo_timeout(self, timeout_s: float | None = None):
+        return timeout_s
+
     def explode(self):
         raise ValueError("boom")
 

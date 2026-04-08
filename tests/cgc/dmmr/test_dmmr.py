@@ -193,6 +193,383 @@ def test_scan_modules_uses_timeout_safe_dll_wrapper(monkeypatch):
     assert calls == [("scan_all_modules", 5.0, "scan_all_modules", ())]
 
 
+def test_initialize_rescans_modules_and_returns_scan(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        calls.append(("connect", timeout_s))
+        backend.connected = True
+        return True
+
+    def fake_rescan_modules(timeout_s=None):
+        calls.append(("rescan_modules", timeout_s))
+        return backend.NO_ERR
+
+    def fake_scan_modules(timeout_s=None):
+        calls.append(("scan_modules", timeout_s))
+        return {3: {"product_no": 132306}}
+
+    def fake_get_scanned_module_state(timeout_s=None):
+        calls.append(("get_scanned_module_state", timeout_s))
+        return backend.NO_ERR, False
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "rescan_modules", fake_rescan_modules)
+    monkeypatch.setattr(backend, "scan_modules", fake_scan_modules)
+    monkeypatch.setattr(
+        backend,
+        "get_scanned_module_state",
+        fake_get_scanned_module_state,
+    )
+
+    modules = backend.initialize(timeout_s=1.5)
+
+    assert modules == {3: {"product_no": 132306}}
+    assert calls == [
+        ("connect", 1.5),
+        ("rescan_modules", 1.5),
+        ("scan_modules", 1.5),
+        ("get_scanned_module_state", 1.5),
+    ]
+
+
+def test_initialize_can_persist_scan_state(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    monkeypatch.setattr(backend, "connect", lambda timeout_s=5.0: True)
+    monkeypatch.setattr(backend, "rescan_modules", lambda timeout_s=None: backend.NO_ERR)
+    monkeypatch.setattr(backend, "scan_modules", lambda timeout_s=None: {3: {"state": 0}})
+    monkeypatch.setattr(
+        backend,
+        "get_scanned_module_state",
+        lambda timeout_s=None: (backend.NO_ERR, True),
+    )
+    persist = Mock(return_value=backend.NO_ERR)
+    monkeypatch.setattr(backend, "set_scanned_module_state", persist)
+
+    modules = backend.initialize(timeout_s=2.0, persist_scan=True)
+
+    assert modules == {3: {"state": 0}}
+    persist.assert_called_once_with(timeout_s=2.0)
+
+
+def test_get_product_info_returns_structured_metadata(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    dmmr.connected = True
+    monkeypatch.setattr(DMMRBase, "get_product_no", lambda self: (self.NO_ERR, 132306))
+    monkeypatch.setattr(
+        DMMRBase, "get_product_id", lambda self: (self.NO_ERR, "DMMR-CTRL-8")
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_device_type", lambda self: (self.NO_ERR, self.DEVICE_TYPE)
+    )
+    monkeypatch.setattr(DMMRBase, "get_fw_version", lambda self: (self.NO_ERR, 0x0104))
+    monkeypatch.setattr(
+        DMMRBase, "get_fw_date", lambda self: (self.NO_ERR, "2026-04-08")
+    )
+    monkeypatch.setattr(DMMRBase, "get_hw_type", lambda self: (self.NO_ERR, 18))
+    monkeypatch.setattr(DMMRBase, "get_hw_version", lambda self: (self.NO_ERR, 2))
+    monkeypatch.setattr(
+        DMMRBase, "get_manuf_date", lambda self: (self.NO_ERR, 2026, 14)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_base_product_no", lambda self: (self.NO_ERR, 132300)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_base_manuf_date", lambda self: (self.NO_ERR, 2025, 50)
+    )
+    monkeypatch.setattr(DMMRBase, "get_base_hw_type", lambda self: (self.NO_ERR, 7))
+    monkeypatch.setattr(DMMRBase, "get_base_hw_version", lambda self: (self.NO_ERR, 3))
+
+    info = dmmr.get_product_info()
+
+    assert info == {
+        "product_no": 132306,
+        "product_id": "DMMR-CTRL-8",
+        "device_type": DMMRBase.DEVICE_TYPE,
+        "firmware": {
+            "version": 0x0104,
+            "date": "2026-04-08",
+        },
+        "hardware": {
+            "type": 18,
+            "version": 2,
+        },
+        "manufacturing": {
+            "year": 2026,
+            "calendar_week": 14,
+        },
+        "base": {
+            "product_no": 132300,
+            "hardware": {
+                "type": 7,
+                "version": 3,
+            },
+            "manufacturing": {
+                "year": 2025,
+                "calendar_week": 50,
+            },
+        },
+    }
+
+
+def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    dmmr.connected = True
+    monkeypatch.setattr(
+        DMMRBase, "get_state", lambda self: (self.NO_ERR, "0x0000", "ST_ON")
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_device_state",
+        lambda self: (self.NO_ERR, "0x1000", ["DS_MODULE_FAIL"]),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_voltage_state",
+        lambda self: (self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_temperature_state",
+        lambda self: (self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_enable", lambda self: (self.NO_ERR, True))
+    monkeypatch.setattr(
+        DMMRBase, "get_automatic_current", lambda self: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_housekeeping",
+        lambda self: (self.NO_ERR, 12.0, 5.0, 3.3, 41.5),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_cpu_data", lambda self: (self.NO_ERR, 0.2, 180_000_000.0)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_uptime_int", lambda self: (self.NO_ERR, 10, 20, 100, 200)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_optime_int", lambda self: (self.NO_ERR, 3, 4, 30, 40)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_base_state",
+        lambda self: (self.NO_ERR, "0x4e80", ["BS_ENABLE", "BS_ON_TEMP"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_base_temp", lambda self: (self.NO_ERR, 37.5))
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_base_fan_pwm",
+        lambda self: (self.NO_ERR, 1200, "0x1600", ["FAN_OK", "FAN_INSTAL"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_base_fan_rpm", lambda self: (self.NO_ERR, 950.0))
+    monkeypatch.setattr(
+        DMMRBase, "get_base_led_data", lambda self: (self.NO_ERR, False, True, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_presence",
+        lambda self: (self.NO_ERR, True, 8, [0, 0, 0, self.MODULE_PRESENT, 0, 0, 0, 0]),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_scanned_module_state", lambda self: (self.NO_ERR, True)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_product_id",
+        lambda self, address: (self.NO_ERR, f"DPA-{address}"),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_product_no", lambda self, address: (self.NO_ERR, 4500 + address)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_device_type",
+        lambda self, address: (self.NO_ERR, self.MODULE_TYPE),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_version", lambda self, address: (self.NO_ERR, 0x0201)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_date", lambda self, address: (self.NO_ERR, "2026-04-07")
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_type", lambda self, address: (self.NO_ERR, 91)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_version", lambda self, address: (self.NO_ERR, 5)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_manuf_date", lambda self, address: (self.NO_ERR, 2026, 12)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_uptime_int", lambda self, address: (self.NO_ERR, 1, 2, 10, 20)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_optime_int", lambda self, address: (self.NO_ERR, 3, 4, 30, 40)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_cpu_data", lambda self, address: (self.NO_ERR, 0.15)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_housekeeping",
+        lambda self, address: (
+            self.NO_ERR,
+            3.3,
+            44.0,
+            5.0,
+            12.0,
+            3.31,
+            45.0,
+            2.5,
+            -36.0,
+            20.0,
+            -20.0,
+            15.0,
+            -15.0,
+            1.8,
+            -1.8,
+            2.048,
+            -2.048,
+        ),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_state", lambda self, address: (self.NO_ERR, 7)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_buffer_state", lambda self, address: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_ready_flags",
+        lambda self, address: (
+            self.NO_ERR,
+            self.MEAS_CUR_RDY | self.HK_MOD_DATA_RDY,
+        ),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_meas_range",
+        lambda self, address: (self.ERR_COMMAND_RECEIVE, 0, False),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_current",
+        lambda self, address: (self.NO_ERR, 2.5e-12, 3),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_scanned_module_params",
+        lambda self, address: (self.NO_ERR, 4503, 4503, 91, 91),
+    )
+
+    snapshot = dmmr.collect_housekeeping()
+
+    assert snapshot["device_enabled"] is True
+    assert snapshot["automatic_current"] is False
+    assert snapshot["main_state"] == {"hex": "0x0000", "name": "ST_ON"}
+    assert snapshot["device_state"] == {
+        "hex": "0x1000",
+        "flags": ["DS_MODULE_FAIL"],
+    }
+    assert snapshot["voltage_state"] == {
+        "hex": "0x0007",
+        "flags": ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"],
+    }
+    assert snapshot["temperature_state"] == {
+        "hex": "0x0000",
+        "flags": ["TEMPERATURE_OK"],
+    }
+    assert snapshot["housekeeping"] == {
+        "volt_12v_v": 12.0,
+        "volt_5v0_v": 5.0,
+        "volt_3v3_v": 3.3,
+        "temp_cpu_c": 41.5,
+    }
+    assert snapshot["cpu"] == {"load": 0.2, "frequency_hz": 180_000_000.0}
+    assert snapshot["uptime"] == {
+        "seconds": 10,
+        "milliseconds": 20,
+        "operation_seconds": 3,
+        "operation_milliseconds": 4,
+        "total_uptime_seconds": 100,
+        "total_uptime_milliseconds": 200,
+        "total_operation_seconds": 30,
+        "total_operation_milliseconds": 40,
+    }
+    assert snapshot["base"] == {
+        "state": {
+            "hex": "0x4e80",
+            "flags": ["BS_ENABLE", "BS_ON_TEMP"],
+        },
+        "temperature_c": 37.5,
+        "fan": {
+            "pwm": 1200,
+            "rpm": 950.0,
+            "state": {
+                "hex": "0x1600",
+                "flags": ["FAN_OK", "FAN_INSTAL"],
+            },
+        },
+        "led": {
+            "red": False,
+            "green": True,
+            "blue": False,
+        },
+    }
+    assert snapshot["module_presence"] == {
+        "valid": True,
+        "max_module": 8,
+        "present": [3],
+        "raw": [0, 0, 0, DMMRBase.MODULE_PRESENT, 0, 0, 0, 0],
+    }
+    assert snapshot["scanned_module_state"] == {"module_mismatch": True}
+    assert snapshot["modules"][3]["product_id"] == "DPA-3"
+    assert snapshot["modules"][3]["product_no"] == 4503
+    assert snapshot["modules"][3]["device_type"] == DMMRBase.MODULE_TYPE
+    assert snapshot["modules"][3]["firmware"] == {
+        "version": 0x0201,
+        "date": "2026-04-07",
+    }
+    assert snapshot["modules"][3]["hardware"] == {"type": 91, "version": 5}
+    assert snapshot["modules"][3]["manufacturing"] == {
+        "year": 2026,
+        "calendar_week": 12,
+    }
+    assert snapshot["modules"][3]["uptime"] == {
+        "seconds": 1,
+        "milliseconds": 2,
+        "total_seconds": 10,
+        "total_milliseconds": 20,
+        "operation_seconds": 3,
+        "operation_milliseconds": 4,
+        "total_operation_seconds": 30,
+        "total_operation_milliseconds": 40,
+    }
+    assert snapshot["modules"][3]["cpu"] == {"load": 0.15}
+    assert snapshot["modules"][3]["state"] == 7
+    assert snapshot["modules"][3]["buffer"] == {"empty": False}
+    assert snapshot["modules"][3]["ready_flags"] == {
+        "raw": DMMRBase.MEAS_CUR_RDY | DMMRBase.HK_MOD_DATA_RDY,
+        "measurement_current_ready": True,
+        "measurement_housekeeping_ready": False,
+        "module_housekeeping_ready": True,
+    }
+    assert snapshot["modules"][3]["current"] == {"value": 2.5e-12, "range": 3}
+    assert snapshot["modules"][3]["scanned_params"] == {
+        "scanned_product_no": 4503,
+        "saved_product_no": 4503,
+        "scanned_hw_type": 91,
+        "saved_hw_type": 91,
+    }
+    assert "measurement_range" not in snapshot["modules"][3]
+
+
 def test_list_configs_filters_empty_slots(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")

@@ -254,6 +254,57 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
             self.connected = False
             raise
 
+    def initialize(
+        self,
+        timeout_s: float = 5.0,
+        *,
+        persist_scan: bool = False,
+    ) -> dict:
+        """
+        Connect to the controller, refresh the module scan, and return modules.
+
+        By default this does not overwrite the saved controller scan. Pass
+        ``persist_scan=True`` when the currently detected module population is
+        known-good and should become the new stored reference.
+        """
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        self.logger.info(
+            f"Initializing DMMR device {self.device_id} by rescanning modules"
+        )
+
+        self.connect(timeout_s=timeout_s)
+
+        rescan_status = self.rescan_modules(timeout_s=timeout_s)
+        self._raise_on_status(rescan_status, "rescan_modules")
+
+        modules = self.scan_modules(timeout_s=timeout_s)
+        mismatch_status, module_mismatch = self.get_scanned_module_state(
+            timeout_s=timeout_s
+        )
+        self._raise_on_status(mismatch_status, "get_scanned_module_state")
+
+        if module_mismatch:
+            warning = (
+                "DMMR module scan does not match the saved controller "
+                "configuration."
+            )
+            if persist_scan:
+                persist_status = self.set_scanned_module_state(timeout_s=timeout_s)
+                self._raise_on_status(persist_status, "set_scanned_module_state")
+                self.logger.warning(
+                    f"{warning} Saved the current scan as the new reference."
+                )
+            else:
+                self.logger.warning(
+                    f"{warning} If the detected hardware is correct, call "
+                    "set_scanned_module_state() once to acknowledge it."
+                )
+
+        if not modules:
+            self.logger.warning("DMMR initialize detected no installed modules.")
+
+        return modules
+
     def disconnect(self) -> bool:
         """Disconnect from the DMMR device."""
         self.stop_housekeeping()
@@ -506,6 +557,344 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
         except Exception as exc:
             self.logger.error(f"Housekeeping cycle error: {exc}")
             return False
+
+    def _get_product_info_unlocked(self) -> dict:
+        product_no_status, product_no = DMMRBase.get_product_no(self)
+        self._raise_on_status(product_no_status, "get_product_no")
+        product_id_status, product_id = DMMRBase.get_product_id(self)
+        self._raise_on_status(product_id_status, "get_product_id")
+        device_type_status, device_type = DMMRBase.get_device_type(self)
+        self._raise_on_status(device_type_status, "get_device_type")
+        fw_version_status, fw_version = DMMRBase.get_fw_version(self)
+        self._raise_on_status(fw_version_status, "get_fw_version")
+        fw_date_status, fw_date = DMMRBase.get_fw_date(self)
+        self._raise_on_status(fw_date_status, "get_fw_date")
+        hw_type_status, hw_type = DMMRBase.get_hw_type(self)
+        self._raise_on_status(hw_type_status, "get_hw_type")
+        hw_version_status, hw_version = DMMRBase.get_hw_version(self)
+        self._raise_on_status(hw_version_status, "get_hw_version")
+        manuf_date_status, manuf_year, manuf_week = DMMRBase.get_manuf_date(self)
+        self._raise_on_status(manuf_date_status, "get_manuf_date")
+        base_product_no_status, base_product_no = DMMRBase.get_base_product_no(self)
+        self._raise_on_status(base_product_no_status, "get_base_product_no")
+        base_manuf_status, base_manuf_year, base_manuf_week = DMMRBase.get_base_manuf_date(
+            self
+        )
+        self._raise_on_status(base_manuf_status, "get_base_manuf_date")
+        base_hw_type_status, base_hw_type = DMMRBase.get_base_hw_type(self)
+        self._raise_on_status(base_hw_type_status, "get_base_hw_type")
+        base_hw_version_status, base_hw_version = DMMRBase.get_base_hw_version(self)
+        self._raise_on_status(base_hw_version_status, "get_base_hw_version")
+
+        return {
+            "product_no": product_no,
+            "product_id": product_id,
+            "device_type": device_type,
+            "firmware": {
+                "version": fw_version,
+                "date": fw_date,
+            },
+            "hardware": {
+                "type": hw_type,
+                "version": hw_version,
+            },
+            "manufacturing": {
+                "year": manuf_year,
+                "calendar_week": manuf_week,
+            },
+            "base": {
+                "product_no": base_product_no,
+                "hardware": {
+                    "type": base_hw_type,
+                    "version": base_hw_version,
+                },
+                "manufacturing": {
+                    "year": base_manuf_year,
+                    "calendar_week": base_manuf_week,
+                },
+            },
+        }
+
+    def get_product_info(self) -> dict:
+        """Return stable controller and base metadata."""
+        self._require_connected()
+        return self._call_locked(self._get_product_info_unlocked)
+
+    def _collect_module_snapshot_unlocked(self, address: int) -> dict:
+        address = int(address)
+        module = {"address": address}
+
+        status, product_id = DMMRBase.get_module_product_id(self, address)
+        if status == self.NO_ERR:
+            module["product_id"] = product_id
+
+        status, product_no = DMMRBase.get_module_product_no(self, address)
+        if status == self.NO_ERR:
+            module["product_no"] = product_no
+
+        status, device_type = DMMRBase.get_module_device_type(self, address)
+        if status == self.NO_ERR:
+            module["device_type"] = device_type
+
+        status, fw_version = DMMRBase.get_module_fw_version(self, address)
+        if status == self.NO_ERR:
+            module["firmware"] = {"version": fw_version}
+
+        status, fw_date = DMMRBase.get_module_fw_date(self, address)
+        if status == self.NO_ERR:
+            module.setdefault("firmware", {})["date"] = fw_date
+
+        status, hw_type = DMMRBase.get_module_hw_type(self, address)
+        if status == self.NO_ERR:
+            module["hardware"] = {"type": hw_type}
+
+        status, hw_version = DMMRBase.get_module_hw_version(self, address)
+        if status == self.NO_ERR:
+            module.setdefault("hardware", {})["version"] = hw_version
+
+        status, manuf_year, manuf_week = DMMRBase.get_module_manuf_date(self, address)
+        if status == self.NO_ERR:
+            module["manufacturing"] = {
+                "year": manuf_year,
+                "calendar_week": manuf_week,
+            }
+
+        module_runtime = {}
+        status, uptime_s, uptime_ms, total_uptime_s, total_uptime_ms = (
+            DMMRBase.get_module_uptime_int(self, address)
+        )
+        if status == self.NO_ERR:
+            module_runtime.update(
+                {
+                    "seconds": uptime_s,
+                    "milliseconds": uptime_ms,
+                    "total_seconds": total_uptime_s,
+                    "total_milliseconds": total_uptime_ms,
+                }
+            )
+
+        status, operation_s, operation_ms, total_operation_s, total_operation_ms = (
+            DMMRBase.get_module_optime_int(self, address)
+        )
+        if status == self.NO_ERR:
+            module_runtime.update(
+                {
+                    "operation_seconds": operation_s,
+                    "operation_milliseconds": operation_ms,
+                    "total_operation_seconds": total_operation_s,
+                    "total_operation_milliseconds": total_operation_ms,
+                }
+            )
+
+        if module_runtime:
+            module["uptime"] = module_runtime
+
+        status, cpu_load = DMMRBase.get_module_cpu_data(self, address)
+        if status == self.NO_ERR:
+            module["cpu"] = {"load": cpu_load}
+
+        hk_result = DMMRBase.get_module_housekeeping(self, address)
+        if hk_result[0] == self.NO_ERR:
+            module["housekeeping"] = {
+                "volt_3v3_v": hk_result[1],
+                "temp_cpu_c": hk_result[2],
+                "volt_5v0_v": hk_result[3],
+                "volt_12v_v": hk_result[4],
+                "volt_3v3i_v": hk_result[5],
+                "temp_cpui_c": hk_result[6],
+                "volt_2v5i_v": hk_result[7],
+                "volt_36vn_v": hk_result[8],
+                "volt_20vp_v": hk_result[9],
+                "volt_20vn_v": hk_result[10],
+                "volt_15vp_v": hk_result[11],
+                "volt_15vn_v": hk_result[12],
+                "volt_1v8p_v": hk_result[13],
+                "volt_1v8n_v": hk_result[14],
+                "volt_vrefp_v": hk_result[15],
+                "volt_vrefn_v": hk_result[16],
+            }
+
+        status, module_state = DMMRBase.get_module_state(self, address)
+        if status == self.NO_ERR:
+            module["state"] = module_state
+
+        status, buffer_empty = DMMRBase.get_module_buffer_state(self, address)
+        if status == self.NO_ERR:
+            module["buffer"] = {"empty": buffer_empty}
+
+        status, ready_flags = DMMRBase.get_module_ready_flags(self, address)
+        if status == self.NO_ERR:
+            module["ready_flags"] = {
+                "raw": ready_flags,
+                "measurement_current_ready": bool(ready_flags & self.MEAS_CUR_RDY),
+                "measurement_housekeeping_ready": bool(
+                    ready_flags & self.HK_MEAS_DATA_RDY
+                ),
+                "module_housekeeping_ready": bool(ready_flags & self.HK_MOD_DATA_RDY),
+            }
+
+        status, meas_range, auto_range = DMMRBase.get_module_meas_range(self, address)
+        if status == self.NO_ERR:
+            module["measurement_range"] = {
+                "range": meas_range,
+                "auto_range": auto_range,
+            }
+
+        status, meas_current, current_range = DMMRBase.get_module_current(self, address)
+        if status == self.NO_ERR:
+            module["current"] = {
+                "value": meas_current,
+                "range": current_range,
+            }
+
+        status, scanned_product_no, saved_product_no, scanned_hw_type, saved_hw_type = (
+            DMMRBase.get_scanned_module_params(self, address)
+        )
+        if status == self.NO_ERR:
+            module["scanned_params"] = {
+                "scanned_product_no": scanned_product_no,
+                "saved_product_no": saved_product_no,
+                "scanned_hw_type": scanned_hw_type,
+                "saved_hw_type": saved_hw_type,
+            }
+
+        return module
+
+    def _collect_housekeeping_unlocked(self) -> dict:
+        main_status, main_state_hex, main_state_name = DMMRBase.get_state(self)
+        self._raise_on_status(main_status, "get_state")
+        device_state_status, device_state_hex, device_state_flags = DMMRBase.get_device_state(
+            self
+        )
+        self._raise_on_status(device_state_status, "get_device_state")
+        voltage_state_status, voltage_state_hex, voltage_state_flags = DMMRBase.get_voltage_state(
+            self
+        )
+        self._raise_on_status(voltage_state_status, "get_voltage_state")
+        temp_state_status, temp_state_hex, temp_state_flags = DMMRBase.get_temperature_state(
+            self
+        )
+        self._raise_on_status(temp_state_status, "get_temperature_state")
+        enable_status, device_enabled = DMMRBase.get_enable(self)
+        self._raise_on_status(enable_status, "get_enable")
+        automatic_current_status, automatic_current = DMMRBase.get_automatic_current(self)
+        self._raise_on_status(automatic_current_status, "get_automatic_current")
+        housekeeping_status, volt_12v, volt_5v0, volt_3v3, temp_cpu = DMMRBase.get_housekeeping(
+            self
+        )
+        self._raise_on_status(housekeeping_status, "get_housekeeping")
+        cpu_status, cpu_load, cpu_frequency = DMMRBase.get_cpu_data(self)
+        self._raise_on_status(cpu_status, "get_cpu_data")
+        uptime_status, uptime_s, uptime_ms, total_uptime_s, total_uptime_ms = (
+            DMMRBase.get_uptime_int(self)
+        )
+        self._raise_on_status(uptime_status, "get_uptime_int")
+        optime_status, operation_s, operation_ms, total_operation_s, total_operation_ms = (
+            DMMRBase.get_optime_int(self)
+        )
+        self._raise_on_status(optime_status, "get_optime_int")
+        base_state_status, base_state_hex, base_state_flags = DMMRBase.get_base_state(self)
+        self._raise_on_status(base_state_status, "get_base_state")
+        base_temp_status, base_temp_c = DMMRBase.get_base_temp(self)
+        self._raise_on_status(base_temp_status, "get_base_temp")
+        fan_status, fan_pwm, fan_state_hex, fan_state_flags = DMMRBase.get_base_fan_pwm(self)
+        self._raise_on_status(fan_status, "get_base_fan_pwm")
+        fan_rpm_status, fan_rpm = DMMRBase.get_base_fan_rpm(self)
+        self._raise_on_status(fan_rpm_status, "get_base_fan_rpm")
+        led_status, led_red, led_green, led_blue = DMMRBase.get_base_led_data(self)
+        self._raise_on_status(led_status, "get_base_led_data")
+        presence_status, presence_valid, max_module, presence_list = DMMRBase.get_module_presence(
+            self
+        )
+        self._raise_on_status(presence_status, "get_module_presence")
+        mismatch_status, module_mismatch = DMMRBase.get_scanned_module_state(self)
+        self._raise_on_status(mismatch_status, "get_scanned_module_state")
+
+        present_modules = [
+            address
+            for address, present in enumerate(presence_list[: self.MODULE_NUM])
+            if present == self.MODULE_PRESENT
+        ]
+        modules = {
+            address: self._collect_module_snapshot_unlocked(address)
+            for address in present_modules
+        }
+
+        return {
+            "device_enabled": device_enabled,
+            "automatic_current": automatic_current,
+            "main_state": {
+                "hex": main_state_hex,
+                "name": main_state_name,
+            },
+            "device_state": {
+                "hex": device_state_hex,
+                "flags": device_state_flags,
+            },
+            "voltage_state": {
+                "hex": voltage_state_hex,
+                "flags": voltage_state_flags,
+            },
+            "temperature_state": {
+                "hex": temp_state_hex,
+                "flags": temp_state_flags,
+            },
+            "housekeeping": {
+                "volt_12v_v": volt_12v,
+                "volt_5v0_v": volt_5v0,
+                "volt_3v3_v": volt_3v3,
+                "temp_cpu_c": temp_cpu,
+            },
+            "cpu": {
+                "load": cpu_load,
+                "frequency_hz": cpu_frequency,
+            },
+            "uptime": {
+                "seconds": uptime_s,
+                "milliseconds": uptime_ms,
+                "operation_seconds": operation_s,
+                "operation_milliseconds": operation_ms,
+                "total_uptime_seconds": total_uptime_s,
+                "total_uptime_milliseconds": total_uptime_ms,
+                "total_operation_seconds": total_operation_s,
+                "total_operation_milliseconds": total_operation_ms,
+            },
+            "base": {
+                "state": {
+                    "hex": base_state_hex,
+                    "flags": base_state_flags,
+                },
+                "temperature_c": base_temp_c,
+                "fan": {
+                    "pwm": fan_pwm,
+                    "rpm": fan_rpm,
+                    "state": {
+                        "hex": fan_state_hex,
+                        "flags": fan_state_flags,
+                    },
+                },
+                "led": {
+                    "red": led_red,
+                    "green": led_green,
+                    "blue": led_blue,
+                },
+            },
+            "module_presence": {
+                "valid": presence_valid,
+                "max_module": max_module,
+                "present": present_modules,
+                "raw": presence_list[: self.MODULE_NUM],
+            },
+            "scanned_module_state": {
+                "module_mismatch": module_mismatch,
+            },
+            "modules": modules,
+        }
+
+    def collect_housekeeping(self) -> dict:
+        """Return a structured runtime snapshot suitable for monitoring."""
+        self._require_connected()
+        return self._call_locked(self._collect_housekeeping_unlocked)
 
     def get_status(self) -> dict:
         """Return the current driver status."""
@@ -806,6 +1195,10 @@ class DMMR(ProcessIsolatedClientMixin):
     _INSTRUMENT_NAME = "DMMR"
     _PROCESS_CONTROLLER_CLASS = _DMMRController
     _PROCESS_CONTROLLER_PATH = "cgc.dmmr.dmmr:_DMMRController"
+    _PROCESS_TIMEOUT_RULES = {
+        "connect": (4.0, 5.0, 15.0),
+        "initialize": (8.0, 5.0, 30.0),
+    }
     _active_connections_lock = _DMMRController._active_connections_lock
     _active_connections = _DMMRController._active_connections
 
