@@ -199,18 +199,31 @@ def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch
 def test_scan_modules_uses_timeout_safe_dll_wrapper(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
     calls = []
 
     def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
         calls.append((method.__name__, timeout_s, step_name, args))
-        return {2: {"state": 0}}
+        if step_name == "get_module_presence":
+            return backend.NO_ERR, True, 8, [0, 0, backend.MODULE_PRESENT, 0, 0, 0, 0, 0]
+        if step_name == "scan_present_modules":
+            return {2: {"state": 0}}
+        raise AssertionError(f"unexpected step {step_name}")
 
     monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
 
     modules = backend.scan_modules()
 
     assert modules == {2: {"state": 0}}
-    assert calls == [("scan_all_modules", 5.0, "scan_all_modules", ())]
+    assert calls == [
+        ("get_module_presence", 5.0, "get_module_presence", (backend,)),
+        (
+            "_scan_present_modules_unlocked",
+            5.0,
+            "scan_present_modules",
+            ([0, 0, backend.MODULE_PRESENT, 0, 0, 0, 0, 0], 8),
+        ),
+    ]
 
 
 def test_initialize_rescans_modules_and_returns_scan(monkeypatch):
@@ -276,6 +289,27 @@ def test_initialize_persists_scan_state_by_default(monkeypatch):
     persist.assert_called_once_with(timeout_s=2.0)
 
 
+def test_initialize_disconnects_when_rescan_fails(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend, "rescan_modules", lambda timeout_s=None: backend.ERR_COMMAND_RECEIVE
+    )
+    disconnect = Mock(return_value=True)
+    monkeypatch.setattr(backend, "disconnect", disconnect)
+
+    with pytest.raises(RuntimeError, match="rescan_modules failed"):
+        backend.initialize(timeout_s=2.0)
+
+    disconnect.assert_called_once_with()
+
+
 def test_initialize_can_skip_persisting_scan_state(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")
@@ -295,6 +329,21 @@ def test_initialize_can_skip_persisting_scan_state(monkeypatch):
 
     assert modules == {3: {"state": 0}}
     persist.assert_not_called()
+
+
+def test_scan_modules_raises_when_presence_read_fails(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_presence",
+        lambda self: (self.ERR_NOT_CONNECTED, False, 0, [0] * self.MODULE_NUM),
+    )
+
+    with pytest.raises(RuntimeError, match="get_module_presence failed"):
+        backend.scan_modules(timeout_s=1.5)
 
 
 def test_get_product_info_returns_structured_metadata(monkeypatch):
@@ -654,7 +703,7 @@ def test_shutdown_disables_measurement_before_disconnect(monkeypatch):
 
 def test_public_get_module_info_supports_omitted_address():
     class FakeBackend:
-        def scan_modules(self):
+        def scan_modules(self, timeout_s=None):
             return {2: {"state": 0}, 5: {"state": 0}}
 
         def get_module_info(self, address, **kwargs):
@@ -672,9 +721,37 @@ def test_public_get_module_info_supports_omitted_address():
     }
 
 
+def test_public_get_module_info_forwards_timeout_to_scan():
+    calls = []
+
+    class FakeBackend:
+        def scan_modules(self, timeout_s=None):
+            calls.append(("scan_modules", timeout_s))
+            return {2: {"state": 0}, 5: {"state": 0}}
+
+        def get_module_info(self, address, **kwargs):
+            calls.append(("get_module_info", address, kwargs.get("timeout_s")))
+            return {"address": address, "product_id": f"ID-{address}"}
+
+    dmmr = object.__new__(DMMR)
+    object.__setattr__(dmmr, "_backend_mode", "inline")
+    object.__setattr__(dmmr, "_backend", FakeBackend())
+    object.__setattr__(dmmr, "_process_backend_disabled_reason", "")
+
+    assert dmmr.get_module_info(timeout_s=2.5) == {
+        2: {"address": 2, "product_id": "ID-2"},
+        5: {"address": 5, "product_id": "ID-5"},
+    }
+    assert calls == [
+        ("scan_modules", 2.5),
+        ("get_module_info", 2, 2.5),
+        ("get_module_info", 5, 2.5),
+    ]
+
+
 def test_public_get_module_current_supports_omitted_address():
     class FakeBackend:
-        def scan_modules(self):
+        def scan_modules(self, timeout_s=None):
             return {2: {"state": 0}, 5: {"state": 0}}
 
         def get_module_current(self, address, timeout_s=None):
@@ -690,3 +767,31 @@ def test_public_get_module_current_supports_omitted_address():
         2: {"status": DMMRBase.NO_ERR, "current": 2e-12, "meas_range": 2},
         5: {"status": DMMRBase.NO_ERR, "current": 5e-12, "meas_range": 5},
     }
+
+
+def test_public_get_module_current_forwards_timeout_to_scan():
+    calls = []
+
+    class FakeBackend:
+        def scan_modules(self, timeout_s=None):
+            calls.append(("scan_modules", timeout_s))
+            return {2: {"state": 0}, 5: {"state": 0}}
+
+        def get_module_current(self, address, timeout_s=None):
+            calls.append(("get_module_current", address, timeout_s))
+            return DMMRBase.NO_ERR, address * 1e-12, address
+
+    dmmr = object.__new__(DMMR)
+    object.__setattr__(dmmr, "_backend_mode", "inline")
+    object.__setattr__(dmmr, "_backend", FakeBackend())
+    object.__setattr__(dmmr, "_process_backend_disabled_reason", "")
+
+    assert dmmr.get_module_current(timeout_s=3.0) == {
+        2: {"status": DMMRBase.NO_ERR, "current": 2e-12, "meas_range": 2},
+        5: {"status": DMMRBase.NO_ERR, "current": 5e-12, "meas_range": 5},
+    }
+    assert calls == [
+        ("scan_modules", 3.0),
+        ("get_module_current", 2, 3.0),
+        ("get_module_current", 5, 3.0),
+    ]

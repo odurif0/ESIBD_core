@@ -269,42 +269,48 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
         updating the stored reference.
         """
         timeout_s = self._resolve_io_timeout(timeout_s)
+        was_connected = self.connected
         self.logger.info(
             f"Initializing DMMR device {self.device_id} by rescanning modules"
         )
 
-        self.connect(timeout_s=timeout_s)
+        try:
+            self.connect(timeout_s=timeout_s)
 
-        rescan_status = self.rescan_modules(timeout_s=timeout_s)
-        self._raise_on_status(rescan_status, "rescan_modules")
+            rescan_status = self.rescan_modules(timeout_s=timeout_s)
+            self._raise_on_status(rescan_status, "rescan_modules")
 
-        modules = self.scan_modules(timeout_s=timeout_s)
-        mismatch_status, module_mismatch = self.get_scanned_module_state(
-            timeout_s=timeout_s
-        )
-        self._raise_on_status(mismatch_status, "get_scanned_module_state")
-
-        if module_mismatch:
-            warning = (
-                "DMMR module scan does not match the saved controller "
-                "configuration."
+            modules = self.scan_modules(timeout_s=timeout_s)
+            mismatch_status, module_mismatch = self.get_scanned_module_state(
+                timeout_s=timeout_s
             )
-            if persist_scan:
-                persist_status = self.set_scanned_module_state(timeout_s=timeout_s)
-                self._raise_on_status(persist_status, "set_scanned_module_state")
-                self.logger.warning(
-                    f"{warning} Saved the current scan as the new reference."
-                )
-            else:
-                self.logger.warning(
-                    f"{warning} If the detected hardware is correct, call "
-                    "set_scanned_module_state() once to acknowledge it."
-                )
+            self._raise_on_status(mismatch_status, "get_scanned_module_state")
 
-        if not modules:
-            self.logger.warning("DMMR initialize detected no installed modules.")
+            if module_mismatch:
+                warning = (
+                    "DMMR module scan does not match the saved controller "
+                    "configuration."
+                )
+                if persist_scan:
+                    persist_status = self.set_scanned_module_state(timeout_s=timeout_s)
+                    self._raise_on_status(persist_status, "set_scanned_module_state")
+                    self.logger.warning(
+                        f"{warning} Saved the current scan as the new reference."
+                    )
+                else:
+                    self.logger.warning(
+                        f"{warning} If the detected hardware is correct, call "
+                        "set_scanned_module_state() once to acknowledge it."
+                    )
 
-        return modules
+            if not modules:
+                self.logger.warning("DMMR initialize detected no installed modules.")
+
+            return modules
+        except Exception:
+            if was_connected or self.connected or self._transport_poisoned:
+                self.disconnect()
+            raise
 
     def disconnect(self) -> bool:
         """Disconnect from the DMMR device."""
@@ -994,6 +1000,42 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
             "set_scanned_module_state",
         )
 
+    def _scan_present_modules_unlocked(
+        self,
+        presence_list: list[int],
+        max_module: int,
+    ) -> dict[int, dict]:
+        modules = {}
+        for address in range(min(int(max_module) + 1, self.MODULE_NUM)):
+            if presence_list[address] != self.MODULE_PRESENT:
+                continue
+
+            module_info = {}
+
+            fw_status, fw_version = DMMRBase.get_module_fw_version(self, address)
+            if fw_status == self.NO_ERR:
+                module_info["fw_version"] = fw_version
+
+            prod_status, product_no = DMMRBase.get_module_product_no(self, address)
+            if prod_status == self.NO_ERR:
+                module_info["product_no"] = product_no
+
+            hw_status, hw_type = DMMRBase.get_module_hw_type(self, address)
+            if hw_status == self.NO_ERR:
+                module_info["hw_type"] = hw_type
+
+            hwv_status, hw_version = DMMRBase.get_module_hw_version(self, address)
+            if hwv_status == self.NO_ERR:
+                module_info["hw_version"] = hw_version
+
+            state_status, state = DMMRBase.get_module_state(self, address)
+            if state_status == self.NO_ERR:
+                module_info["state"] = state
+
+            modules[address] = module_info
+
+        return modules
+
     def set_automatic_current(
         self,
         automatic_current: bool,
@@ -1040,12 +1082,27 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
     def scan_modules(self, timeout_s: Optional[float] = None):
         """Scan and summarize connected modules."""
         self.logger.info("Scanning for connected DMMR modules")
+        self._require_connected()
         timeout_s = self._resolve_io_timeout(timeout_s)
         try:
-            modules = self._call_locked_with_timeout(
-                super().scan_all_modules,
+            status, valid, max_module, presence_list = self._call_locked_with_timeout(
+                DMMRBase.get_module_presence,
                 timeout_s,
-                "scan_all_modules",
+                "get_module_presence",
+                self,
+            )
+            self._raise_on_status(status, "get_module_presence")
+            if not valid:
+                self.logger.warning(
+                    "DMMR module presence flags are marked invalid; returning the current scan result."
+                )
+
+            modules = self._call_locked_with_timeout(
+                self._scan_present_modules_unlocked,
+                timeout_s,
+                "scan_present_modules",
+                presence_list,
+                max_module,
             )
             if modules:
                 self.logger.info(f"Found {len(modules)} modules:")
@@ -1244,10 +1301,15 @@ class DMMR(ProcessIsolatedClientMixin):
             return getattr(backend, method_name)(*args, **kwargs)
         return self._call_process_method(method_name, *args, **kwargs)
 
-    def _resolve_module_addresses(self, address: Optional[int] = None) -> list[int]:
+    def _resolve_module_addresses(
+        self,
+        address: Optional[int] = None,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> list[int]:
         if address is not None:
             return [int(address)]
-        modules = self.scan_modules()
+        modules = self.scan_modules(timeout_s=timeout_s)
         if isinstance(modules, dict):
             return sorted(int(module_address) for module_address in modules)
         return sorted(int(module_address) for module_address in (modules or []))
@@ -1258,7 +1320,9 @@ class DMMR(ProcessIsolatedClientMixin):
             return self._call_backend_method("get_module_info", int(address), **kwargs)
 
         module_info = {}
-        for module_address in self._resolve_module_addresses():
+        for module_address in self._resolve_module_addresses(
+            timeout_s=kwargs.get("timeout_s")
+        ):
             module_info[module_address] = self.get_module_info(module_address, **kwargs)
         return module_info
 
@@ -1277,7 +1341,7 @@ class DMMR(ProcessIsolatedClientMixin):
             )
 
         module_currents = {}
-        for module_address in self._resolve_module_addresses():
+        for module_address in self._resolve_module_addresses(timeout_s=timeout_s):
             status, current, meas_range = self._call_backend_method(
                 "get_module_current",
                 module_address,
