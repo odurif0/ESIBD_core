@@ -62,8 +62,13 @@ def build_device_logger(
 
 
 def supports_process_backend(*shared_objects) -> bool:
-    """Return True when the current runtime can isolate the controller process."""
-    return RUNTIME_IS_WINDOWS and all(value is None for value in shared_objects)
+    """Return False for the ESIBD plugin runtime.
+
+    The standalone plugin runs inside a GUI host where Windows ``spawn`` based
+    worker startup has proven unreliable in practice. The inline backend is the
+    stable path for this packaged runtime.
+    """
+    return False
 
 
 class TimeoutSafeDllMixin:

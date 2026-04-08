@@ -62,8 +62,13 @@ def build_device_logger(
 
 
 def supports_process_backend(*shared_objects) -> bool:
-    """Return True when the current runtime can isolate the controller process."""
-    return RUNTIME_IS_WINDOWS and all(value is None for value in shared_objects)
+    """Return False for the ESIBD plugin runtime.
+
+    The standalone plugin runs inside a GUI host where Windows ``spawn`` based
+    worker startup has proven unreliable in practice. The inline backend is the
+    stable path for this packaged runtime.
+    """
+    return False
 
 
 class TimeoutSafeDllMixin:
@@ -259,18 +264,29 @@ class ProcessIsolatedClientMixin:
             process_kwargs = dict(backend_kwargs)
             if "logger" in process_kwargs:
                 process_kwargs["logger"] = None
-            object.__setattr__(self, "_backend_mode", "process")
-            object.__setattr__(
-                self,
-                "_backend",
-                ControllerProcessProxy(
+            try:
+                backend = ControllerProcessProxy(
                     self._PROCESS_CONTROLLER_PATH,
                     process_kwargs,
                     label=f"{self._INSTRUMENT_NAME} {backend_kwargs['device_id']}",
                     startup_timeout_s=self._PROCESS_STARTUP_TIMEOUT_S,
-                ),
-            )
-            return
+                )
+            except Exception as exc:
+                object.__setattr__(
+                    self,
+                    "_process_backend_disabled_reason",
+                    f"{self._INSTRUMENT_NAME} process isolation startup failed; "
+                    f"falling back to inline controller: {exc}",
+                )
+                warnings.warn(
+                    self._process_backend_disabled_reason,
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                object.__setattr__(self, "_backend_mode", "process")
+                object.__setattr__(self, "_backend", backend)
+                return
 
         if RUNTIME_IS_WINDOWS and any(
             value is not None for value in incompatible_objects.values()

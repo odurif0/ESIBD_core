@@ -2,6 +2,7 @@ from pathlib import Path
 import logging
 import tempfile
 import threading
+import types
 from unittest.mock import Mock
 
 import pytest
@@ -89,6 +90,90 @@ def test_ampr_external_logger_prefixes_device_id(monkeypatch, caplog):
         ampr.logger.info("hello")
 
     assert "ampr_test - hello" in caplog.messages
+
+
+def test_ampr_base_get_module_product_id_decodes_vendor_string(monkeypatch):
+    ampr, dll = make_ampr(monkeypatch)
+    backend = object.__getattribute__(ampr, "_backend")
+
+    def fake_get_module_product_id(address, identification):
+        assert int(address.value) == 2
+        identification.value = b"AMPR-1000"
+        return AMPRBase.NO_ERR
+
+    dll.COM_AMPR_12_GetModuleProductID.side_effect = fake_get_module_product_id
+
+    status, product_id = backend.get_module_product_id(2)
+
+    assert status == AMPRBase.NO_ERR
+    assert product_id == "AMPR-1000"
+
+
+def test_public_ampr_module_metadata_helpers_support_omitted_address():
+    class FakeBackend:
+        def scan_modules(self):
+            return {2: {"state": "ST_STBY"}, 5: {"state": "ST_ON"}}
+
+        def get_module_product_id(self, address):
+            return AMPRBase.NO_ERR, f"ID-{address}"
+
+        def get_module_product_no(self, address):
+            return AMPRBase.NO_ERR, address * 100
+
+        def get_module_hw_type(self, address):
+            return AMPRBase.NO_ERR, address * 10
+
+        def get_scanned_module_params(self, address):
+            return (
+                AMPRBase.NO_ERR,
+                address * 1000,
+                address * 1000 + 1,
+                address * 1000 + 2,
+                address * 1000 + 3,
+            )
+
+        def get_module_info(self, address):
+            return {"address": address, "product_id": f"ID-{address}"}
+
+    ampr = object.__new__(AMPR)
+    object.__setattr__(ampr, "_backend_mode", "inline")
+    object.__setattr__(ampr, "_backend", FakeBackend())
+    object.__setattr__(ampr, "_process_backend_disabled_reason", "")
+    object.__setattr__(ampr, "logger", types.SimpleNamespace(info=lambda *a, **k: None))
+
+    assert ampr.get_module_product_id(2) == (AMPRBase.NO_ERR, "ID-2")
+    assert ampr.get_module_product_id() == {
+        2: {"status": AMPRBase.NO_ERR, "product_id": "ID-2"},
+        5: {"status": AMPRBase.NO_ERR, "product_id": "ID-5"},
+    }
+    assert ampr.get_module_product_no() == {
+        2: {"status": AMPRBase.NO_ERR, "product_no": 200},
+        5: {"status": AMPRBase.NO_ERR, "product_no": 500},
+    }
+    assert ampr.get_module_hw_type() == {
+        2: {"status": AMPRBase.NO_ERR, "hw_type": 20},
+        5: {"status": AMPRBase.NO_ERR, "hw_type": 50},
+    }
+    assert ampr.get_scanned_module_params() == {
+        2: {
+            "status": AMPRBase.NO_ERR,
+            "scanned_product_no": 2000,
+            "saved_product_no": 2001,
+            "scanned_hw_type": 2002,
+            "saved_hw_type": 2003,
+        },
+        5: {
+            "status": AMPRBase.NO_ERR,
+            "scanned_product_no": 5000,
+            "saved_product_no": 5001,
+            "scanned_hw_type": 5002,
+            "saved_hw_type": 5003,
+        },
+    }
+    assert ampr.get_module_info() == {
+        2: {"address": 2, "product_id": "ID-2"},
+        5: {"address": 5, "product_id": "ID-5"},
+    }
 
 
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
@@ -405,3 +490,13 @@ def test_get_all_module_voltages_reads_measured_values_once(monkeypatch):
         3: {"setpoint": 3.0, "measured": 30.0},
         4: {"setpoint": 4.0, "measured": 40.0},
     }
+
+
+@pytest.mark.parametrize("voltage", [1000.1, -1000.1, float("nan"), float("inf")])
+def test_set_module_voltage_rejects_values_outside_module_rating(monkeypatch, voltage):
+    ampr, dll = make_ampr(monkeypatch)
+
+    status = AMPRBase.set_module_voltage(ampr, 0, 1, voltage)
+
+    assert status == AMPRBase.ERR_ARGUMENT
+    dll.COM_AMPR_12_SetModuleOutputVoltage.assert_not_called()

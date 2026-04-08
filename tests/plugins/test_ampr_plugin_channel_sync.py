@@ -8,13 +8,15 @@ import types
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
+
 
 PLUGIN_PATH = (
     Path(__file__).resolve().parents[2]
     / "plugins"
     / "esibd_explorer"
-    / "ampr"
-    / "ampr_plugin.py"
+    / "ampr_a"
+    / "ampr_a_plugin.py"
 )
 
 
@@ -57,6 +59,10 @@ def _install_esibd_stubs() -> None:
         def initComplete(self):
             self.super_init_complete_called = True
 
+    class ToolButton:
+        def setChecked(self, checked):
+            self.checked = checked
+
     class Device:
         pass
 
@@ -72,6 +78,7 @@ def _install_esibd_stubs() -> None:
     core.Channel = Channel
     core.DeviceController = DeviceController
     core.Parameter = Parameter
+    core.ToolButton = ToolButton
     core.parameterDict = parameterDict
     plugins.Device = Device
     plugins.Plugin = Plugin
@@ -89,8 +96,7 @@ def _clear_test_modules() -> None:
         or name.startswith("esibd.")
         or name == "cgc"
         or name.startswith("cgc.")
-        or name == "esibd_ampr_plugin_runtime"
-        or name.startswith("esibd_ampr_plugin_runtime.")
+        or name.startswith("esibd_ampr")
         or name == "ampr_plugin_sync_test"
     ]:
         sys.modules.pop(name, None)
@@ -113,7 +119,15 @@ def _load_module():
 
 def test_bootstrap_config_is_replaced_from_detected_modules():
     module = _load_module()
-    default_item = {"Module": 0, "CH": 1, "Real": True, "Enabled": True}
+    default_item = {
+        "Module": "0",
+        "CH": "1",
+        "Real": True,
+        "Enabled": True,
+        "Min": -50,
+        "Max": 50,
+        "Collapse": False,
+    }
 
     bootstrap_items = [
         {"Name": f"AMPR{index}", "Module": 0, "CH": 1, "Real": True, "Enabled": True}
@@ -132,7 +146,51 @@ def test_bootstrap_config_is_replaced_from_detected_modules():
     assert synced_items[-1]["Name"] == "AMPR_M05_CH4"
     assert all(item["Enabled"] is False for item in synced_items)
     assert all(item["Real"] is True for item in synced_items)
+    assert all(item["Min"] == -50 for item in synced_items)
+    assert all(item["Collapse"] is False for item in synced_items)
     assert log_entries == [("AMPR bootstrap config replaced from hardware scan.", None)]
+
+
+def test_bootstrap_detection_accepts_stringified_numeric_defaults():
+    module = _load_module()
+
+    assert module._looks_like_bootstrap_items(
+        items=[
+            {
+                "Name": "AMPR1",
+                "Module": "0",
+                "CH": "1",
+                "Real": "true",
+                "Enabled": "true",
+                "Value": "0",
+                "Min": "-50",
+                "Max": "50",
+                "Display": "true",
+            },
+            {
+                "Name": "AMPR2",
+                "Module": "0",
+                "CH": "1",
+                "Real": "true",
+                "Enabled": "true",
+                "Value": "0",
+                "Min": "-50",
+                "Max": "50",
+                "Display": "true",
+            },
+        ],
+        device_name="AMPR",
+        default_item={
+            "Module": "0",
+            "CH": "1",
+            "Real": True,
+            "Enabled": True,
+            "Value": 0.0,
+            "Min": -50.0,
+            "Max": 50.0,
+            "Display": True,
+        },
+    ) is True
 
 
 def test_sequential_names_with_user_changes_are_not_treated_as_bootstrap():
@@ -207,6 +265,44 @@ def test_existing_config_is_merged_and_new_channels_are_generic():
     assert "Reactivated AMPR channels for modules: 2" in log_messages
 
 
+def test_legacy_bootstrap_residue_is_removed_from_mixed_config():
+    module = _load_module()
+
+    default_item = {
+        "Module": "0",
+        "CH": "1",
+        "Real": True,
+        "Enabled": True,
+    }
+    current_items = [
+        {"Name": f"AMPR{index}", "Module": 0, "CH": 1, "Real": False, "Enabled": True}
+        for index in range(1, 10)
+    ] + [
+        {"Name": "AMPR_M02_CH1", "Module": "2", "CH": "1", "Real": True, "Enabled": False},
+        {"Name": "AMPR_M02_CH2", "Module": "2", "CH": "2", "Real": True, "Enabled": False},
+        {"Name": "AMPR_M02_CH3", "Module": "2", "CH": "3", "Real": True, "Enabled": False},
+        {"Name": "AMPR_M02_CH4", "Module": "2", "CH": "4", "Real": True, "Enabled": False},
+    ]
+
+    synced_items, log_entries = module._plan_channel_sync(
+        current_items=current_items,
+        detected_modules=[2],
+        device_name="AMPR",
+        default_item=default_item,
+    )
+
+    assert [item["Name"] for item in synced_items] == [
+        "AMPR_M02_CH1",
+        "AMPR_M02_CH2",
+        "AMPR_M02_CH3",
+        "AMPR_M02_CH4",
+    ]
+    assert (
+        "Removed legacy AMPR bootstrap channels: AMPR1..AMPR9",
+        None,
+    ) in log_entries
+
+
 def test_duplicate_mappings_are_neutralized():
     module = _load_module()
 
@@ -251,8 +347,1123 @@ def test_init_complete_skips_sync_without_real_device():
     controller = module.AMPRController(controllerParent=parent)
     controller.detected_module_ids = [1]
     controller.device = None
+    logs = []
+    controller.print = lambda message, flag=None: logs.append((message, flag))
 
     controller.initComplete()
 
     assert parent.sync_calls == []
     assert controller.super_init_complete_called is True
+    assert logs == [
+        (
+            "AMPR initialization simulated because ESIBD Test mode is active. "
+            "No hardware communication was attempted.",
+            module.PRINT.WARNING,
+        )
+    ]
+
+
+def test_init_complete_logs_success_for_real_initialization():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(com=5, main_state="", detected_modules="", sync_calls=[])
+    parent._sync_channels_from_detected_modules = lambda modules: parent.sync_calls.append(
+        list(modules)
+    )
+
+    controller = module.AMPRController(controllerParent=parent)
+    controller.detected_module_ids = [1, 3]
+    controller.detected_modules_text = "1, 3"
+    controller.main_state = "ST_STBY"
+    controller.device = object()
+    acquisition_calls = []
+    controller.startAcquisition = lambda: acquisition_calls.append("start")
+    logs = []
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    controller.initComplete()
+
+    assert parent.sync_calls == [[1, 3]]
+    assert acquisition_calls == []
+    assert controller.super_init_complete_called is True
+    assert logs == [
+        ("AMPR initialized on COM5. State: ST_STBY. Detected modules: 1, 3.", None)
+    ]
+
+
+def test_init_complete_starts_acquisition_only_when_device_is_st_on():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(com=5, main_state="", detected_modules="", sync_calls=[])
+    parent._sync_channels_from_detected_modules = lambda modules: parent.sync_calls.append(
+        list(modules)
+    )
+
+    controller = module.AMPRController(controllerParent=parent)
+    controller.detected_module_ids = [2]
+    controller.detected_modules_text = "2"
+    controller.main_state = "ST_ON"
+    controller.device = object()
+    acquisition_calls = []
+    controller.startAcquisition = lambda: acquisition_calls.append("start")
+    controller.print = lambda message, flag=None: None
+
+    controller.initComplete()
+
+    assert parent.sync_calls == [[2]]
+    assert acquisition_calls == ["start"]
+
+
+def test_read_numbers_skips_acquisition_before_successful_initialization():
+    module = _load_module()
+
+    class FakeChannel:
+        real = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 3
+
+    class FakeDevice:
+        def get_module_voltages(self, module):
+            assert module == 2
+            return {
+                1: {"measured": 11.0},
+                2: {"measured": 22.0},
+                3: {"measured": 33.0},
+                4: {"measured": 44.0},
+            }
+
+    controller = object.__new__(module.AMPRController)
+    controller.device = FakeDevice()
+    controller.controllerParent = types.SimpleNamespace(
+        getChannels=lambda: [FakeChannel()],
+        getConfiguredModules=lambda: [2],
+    )
+    controller.initialized = False
+    controller.detected_module_ids = [2]
+    controller.errorCount = 0
+    controller.main_state = "Disconnected"
+    controller.values = {(2, 3): 123.0}
+    controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
+
+    module.AMPRController.readNumbers(controller)
+
+    assert list(controller.values) == [(2, 3)]
+    assert np.isnan(controller.values[(2, 3)])
+
+
+def test_read_numbers_blocks_channel_acquisition_until_st_on():
+    module = _load_module()
+
+    class FakeChannel:
+        real = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 3
+
+    class FakeDevice:
+        def get_module_voltages(self, module):
+            assert module == 2
+            return {
+                1: {"measured": 11.0},
+                2: {"measured": 22.0},
+                3: {"measured": 33.0},
+                4: {"measured": 44.0},
+            }
+
+    controller = object.__new__(module.AMPRController)
+    controller.device = FakeDevice()
+    controller.controllerParent = types.SimpleNamespace(
+        getChannels=lambda: [FakeChannel()],
+        getConfiguredModules=lambda: [2],
+    )
+    controller.initialized = True
+    controller.detected_module_ids = [2]
+    controller.errorCount = 0
+    controller.main_state = "Disconnected"
+    controller.values = {(2, 3): 123.0}
+    controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
+
+    module.AMPRController.readNumbers(controller)
+
+    assert list(controller.values) == [(2, 3)]
+    assert np.isnan(controller.values[(2, 3)])
+
+
+def test_read_numbers_reads_voltages_only_once_st_on_is_reached():
+    module = _load_module()
+
+    class FakeChannel:
+        real = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 3
+
+    class FakeDevice:
+        def get_module_voltages(self, module):
+            assert module == 2
+            return {
+                1: {"measured": 11.0},
+                2: {"measured": 22.0},
+                3: {"measured": 33.0},
+                4: {"measured": 44.0},
+            }
+
+    controller = object.__new__(module.AMPRController)
+    controller.device = FakeDevice()
+    controller.controllerParent = types.SimpleNamespace(
+        getChannels=lambda: [FakeChannel()],
+        getConfiguredModules=lambda: [2],
+    )
+    controller.initialized = True
+    controller.detected_module_ids = [2]
+    controller.errorCount = 0
+    controller.main_state = "Disconnected"
+    controller.values = {(2, 3): 123.0}
+    controller._update_state = lambda: setattr(controller, "main_state", "ST_ON")
+
+    module.AMPRController.readNumbers(controller)
+
+    assert controller.values == {
+        (2, 1): 11.0,
+        (2, 2): 22.0,
+        (2, 3): 33.0,
+        (2, 4): 44.0,
+    }
+
+
+def test_fake_numbers_does_not_invent_ampr_monitors():
+    module = _load_module()
+
+    class FakeChannel:
+        enabled = True
+        real = True
+        value = 42.0
+
+        def module_address(self):
+            return 1
+
+        def channel_number(self):
+            return 4
+
+    controller = object.__new__(module.AMPRController)
+    controller.controllerParent = types.SimpleNamespace(
+        getChannels=lambda: [FakeChannel()],
+        isOn=lambda: True,
+    )
+    controller.values = None
+
+    module.AMPRController.fakeNumbers(controller)
+
+    assert list(controller.values) == [(1, 4)]
+    assert np.isnan(controller.values[(1, 4)])
+
+
+def test_run_initialization_logs_explicit_failure():
+    module = _load_module()
+
+    controller = object.__new__(module.AMPRController)
+    controller.device = None
+    controller.detected_module_ids = []
+    controller.detected_modules_text = ""
+    controller.main_state = "Disconnected"
+    controller.initializing = True
+    controller.controllerParent = types.SimpleNamespace(
+        com=7,
+        baudrate=230400,
+        connect_timeout_s=5.0,
+        name="AMPR",
+    )
+    controller._dispose_device = lambda: None
+    logs = []
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    original = module._get_ampr_driver_class
+    module._get_ampr_driver_class = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        module.AMPRController.runInitialization(controller)
+    finally:
+        module._get_ampr_driver_class = original
+
+    assert controller.initializing is False
+    assert logs == [
+        (
+            "AMPR initialization failed on COM7: RuntimeError: boom",
+            module.PRINT.ERROR,
+        )
+    ]
+
+
+def test_run_initialization_logs_process_backend_fallback_warning():
+    module = _load_module()
+
+    class FakeDriver:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._process_backend_disabled_reason = (
+                "AMPR process isolation startup failed; "
+                "falling back to inline controller: "
+                "worker timed out during worker startup"
+            )
+
+        def connect(self, timeout_s):
+            self.timeout_s = timeout_s
+
+    emitted = []
+    controller = object.__new__(module.AMPRController)
+    controller.device = None
+    controller.detected_module_ids = []
+    controller.detected_modules_text = ""
+    controller.main_state = "Disconnected"
+    controller.initialized = False
+    controller.initializing = True
+    controller.signalComm = types.SimpleNamespace(
+        initCompleteSignal=types.SimpleNamespace(emit=lambda: emitted.append(True))
+    )
+    controller.controllerParent = types.SimpleNamespace(
+        com=5,
+        baudrate=230400,
+        connect_timeout_s=5.0,
+        name="AMPR",
+    )
+    controller._dispose_device = lambda: None
+    controller._refresh_module_scan = lambda: None
+    controller._update_state = lambda: None
+    logs = []
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    original = module._get_ampr_driver_class
+    module._get_ampr_driver_class = lambda: FakeDriver
+    try:
+        module.AMPRController.runInitialization(controller)
+    finally:
+        module._get_ampr_driver_class = original
+
+    assert emitted == [True]
+    assert controller.initializing is False
+    assert logs == [
+        (
+            "AMPR process isolation startup failed; "
+            "falling back to inline controller: "
+            "worker timed out during worker startup",
+            module.PRINT.WARNING,
+        )
+    ]
+
+
+def test_refresh_module_scan_ignores_bootstrap_module_zero_warning():
+    module = _load_module()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def get_scanned_module_state(self):
+            return self.NO_ERR, False, False
+
+        def scan_modules(self):
+            return [2]
+
+    controller = object.__new__(module.AMPRController)
+    controller.device = FakeDevice()
+    controller.detected_module_ids = []
+    controller.detected_modules_text = ""
+    controller.controllerParent = types.SimpleNamespace(
+        name="AMPR",
+        getConfiguredModules=lambda: [0],
+        _current_channel_items=lambda: [
+            {"Name": f"AMPR{index}", "Module": "0", "CH": "1", "Real": True, "Enabled": True}
+            for index in range(1, 10)
+        ],
+        _default_channel_item=lambda: {"Module": "0", "CH": "1", "Real": True, "Enabled": True},
+    )
+    logs = []
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    module.AMPRController._refresh_module_scan(controller)
+
+    assert controller.detected_module_ids == [2]
+    assert logs == []
+
+
+def test_apply_value_ignores_device_disposal_race():
+    module = _load_module()
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self, controller):
+            self.controller = controller
+
+        def set_module_voltage(self, module, channel_id, target_voltage):
+            self.controller.device = None
+            return self.NO_ERR
+
+    class FakeChannel:
+        value = 12.5
+        enabled = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 4
+
+    controller = object.__new__(module.AMPRController)
+    controller.lock = FakeLock()
+    controller.errorCount = 0
+    controller.initialized = True
+    controller.main_state = "ST_ON"
+    controller.ramping = False
+    controller.transitioning = False
+    controller.controllerParent = types.SimpleNamespace(isOn=lambda: True)
+    controller.print = lambda *args, **kwargs: None
+    controller.device = FakeDevice(controller)
+
+    module.AMPRController.applyValue(controller, FakeChannel())
+
+    assert controller.errorCount == 0
+
+
+def test_apply_value_skips_hardware_writes_until_psu_is_on():
+    module = _load_module()
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def set_module_voltage(self, module, channel_id, target_voltage):
+            self.calls.append((module, channel_id, target_voltage))
+            return self.NO_ERR
+
+    class FakeChannel:
+        value = 10.0
+        enabled = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    controller = object.__new__(module.AMPRController)
+    controller.lock = FakeLock()
+    controller.errorCount = 0
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.main_state = "ST_STBY"
+    controller.ramping = False
+    controller.transitioning = False
+    controller.controllerParent = types.SimpleNamespace(isOn=lambda: False)
+    controller.print = lambda *args, **kwargs: None
+
+    module.AMPRController.applyValue(controller, FakeChannel())
+
+    assert controller.device.calls == []
+
+
+def test_toggle_on_runs_full_initialize_sequence_when_switching_on():
+    module = _load_module()
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def initialize(self, timeout_s):
+            self.calls.append(("initialize", timeout_s))
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        device = FakeDevice()
+        state_calls = []
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.acquiring = False
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: True,
+            connect_timeout_s=7.5,
+            startup_timeout_s=12.0,
+        )
+        acquisition_calls = []
+        controller.startAcquisition = lambda: acquisition_calls.append("start")
+        controller._refresh_module_scan = lambda: state_calls.append("scan")
+        controller._update_state = lambda: (
+            state_calls.append("state"),
+            setattr(controller, "main_state", "ST_ON"),
+        )
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert device.calls == [("initialize", 12.0)]
+    assert state_calls == ["scan", "state"]
+    assert acquisition_calls == ["start"]
+    assert logs == [
+        ("Starting AMPR PSU. Waiting up to 12.0 s for ST_ON.", None),
+        ("AMPR PSU turned ON. State: ST_ON.", None),
+    ]
+
+
+def test_toggle_on_disables_psu_when_switching_off():
+    module = _load_module()
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def enable_psu(self, enabled):
+            self.calls.append(("enable_psu", enabled))
+            return self.NO_ERR, enabled
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        device = FakeDevice()
+        state_calls = []
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.acquiring = True
+        stop_calls = []
+        controller.stopAcquisition = lambda: stop_calls.append("stop")
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: False,
+            connect_timeout_s=7.5,
+        )
+        controller._refresh_module_scan = lambda: state_calls.append("scan")
+        controller._update_state = lambda: (
+            state_calls.append("state"),
+            setattr(controller, "main_state", "ST_STBY"),
+        )
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert device.calls == [("enable_psu", False)]
+    assert state_calls == ["state"]
+    assert stop_calls == ["stop"]
+    assert logs == [("AMPR PSU turned OFF. State: ST_STBY.", None)]
+
+
+def test_toggle_on_ramps_enabled_channels_after_startup(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class FakeChannel:
+        real = True
+        enabled = True
+        value = 2.0
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def set_module_voltages(self, module, voltages):
+            self.calls.append(("set_module_voltages", module, dict(voltages)))
+            return {channel_id: self.NO_ERR for channel_id in voltages}
+
+        def initialize(self, timeout_s):
+            self.calls.append(("initialize", timeout_s))
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        device = FakeDevice()
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.ramping = False
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: True,
+            connect_timeout_s=7.5,
+            startup_timeout_s=12.0,
+            ramp_rate_v_s=10.0,
+            getChannels=lambda: [FakeChannel()],
+            updateValues=lambda apply=False: logs.append((f"update:{apply}", None)),
+        )
+        controller._refresh_module_scan = lambda: logs.append(("scan", None))
+        controller._update_state = lambda: setattr(controller, "main_state", "ST_ON")
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert device.calls == [
+        ("set_module_voltages", 2, {1: 0.0}),
+        ("initialize", 12.0),
+        ("set_module_voltages", 2, {1: 1.0}),
+        ("set_module_voltages", 2, {1: 2.0}),
+    ]
+    assert logs == [
+        ("update:False", None),
+        ("Starting AMPR PSU. Waiting up to 12.0 s for ST_ON.", None),
+        ("scan", None),
+        ("Starting AMPR ramp-up at 10.0 V/s (estimated 0.2 s).", None),
+        ("AMPR ramp-up completed.", None),
+        ("AMPR PSU turned ON. State: ST_ON.", None),
+    ]
+
+
+def test_toggle_off_ramps_down_before_disabling_psu(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class FakeChannel:
+        real = True
+        enabled = True
+        value = 2.0
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def set_module_voltages(self, module, voltages):
+            self.calls.append(("set_module_voltages", module, dict(voltages)))
+            return {channel_id: self.NO_ERR for channel_id in voltages}
+
+        def enable_psu(self, enabled):
+            self.calls.append(("enable_psu", enabled))
+            return self.NO_ERR, enabled
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        device = FakeDevice()
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.ramping = False
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: False,
+            connect_timeout_s=7.5,
+            ramp_rate_v_s=10.0,
+            getChannels=lambda: [FakeChannel()],
+        )
+        controller._refresh_module_scan = lambda: logs.append(("scan", None))
+        controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert device.calls == [
+        ("set_module_voltages", 2, {1: 1.0}),
+        ("set_module_voltages", 2, {1: 0.0}),
+        ("enable_psu", False),
+    ]
+    assert logs == [
+        ("Starting AMPR ramp-down at 10.0 V/s (estimated 0.2 s).", None),
+        ("AMPR ramp-down completed.", None),
+        ("AMPR PSU turned OFF. State: ST_STBY.", None),
+    ]
+
+
+def test_toggle_on_cleans_up_psu_after_ramp_failure(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class FakeChannel:
+        real = True
+        enabled = True
+        value = 2.0
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+            self.ramp_calls = 0
+
+        def set_module_voltages(self, module, voltages):
+            self.calls.append(("set_module_voltages", module, dict(voltages)))
+            if dict(voltages) == {1: 0.0} and self.ramp_calls == 0:
+                return {1: self.NO_ERR}
+            if dict(voltages) == {1: 1.0}:
+                self.ramp_calls += 1
+                return {1: 123}
+            return {1: self.NO_ERR}
+
+        def initialize(self, timeout_s):
+            self.calls.append(("initialize", timeout_s))
+
+        def enable_psu(self, enabled):
+            self.calls.append(("enable_psu", enabled))
+            return self.NO_ERR, enabled
+
+        def format_status(self, status):
+            return f"STATUS_{status}"
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        device = FakeDevice()
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.ramping = False
+        controller.transitioning = True
+        controller.transition_target_on = True
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: True,
+            connect_timeout_s=7.5,
+            startup_timeout_s=12.0,
+            ramp_rate_v_s=10.0,
+            getChannels=lambda: [FakeChannel()],
+            updateValues=lambda apply=False: None,
+        )
+        controller._refresh_module_scan = lambda: None
+        controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert device.calls == [
+        ("set_module_voltages", 2, {1: 0.0}),
+        ("initialize", 12.0),
+        ("set_module_voltages", 2, {1: 1.0}),
+        ("set_module_voltages", 2, {1: 0.0}),
+        ("enable_psu", False),
+    ]
+    assert controller.transitioning is False
+    assert logs == [
+        ("Starting AMPR PSU. Waiting up to 12.0 s for ST_ON.", None),
+        ("Starting AMPR ramp-up at 10.0 V/s (estimated 0.2 s).", None),
+        ("AMPR startup cleanup disabled the PSU after failure.", module.PRINT.WARNING),
+        (
+            "Failed to toggle AMPR PSU: RuntimeError: AMPR rejected 1.000 V for module 2 CH1: STATUS_123",
+            module.PRINT.ERROR,
+        ),
+    ]
+
+
+def test_ramp_replays_updated_targets_changed_during_transition(monkeypatch):
+    module = _load_module()
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+
+    class FakeChannel:
+        real = True
+        enabled = True
+        value = 2.0
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    channel = FakeChannel()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def set_module_voltages(self, module, voltages):
+            self.calls.append(("set_module_voltages", module, dict(voltages)))
+            if dict(voltages) == {1: 1.0}:
+                channel.value = 3.0
+            return {1: self.NO_ERR}
+
+    controller = object.__new__(module.AMPRController)
+    controller.lock = FakeLock()
+    controller.device = FakeDevice()
+    controller.errorCount = 0
+    controller.ramping = False
+    controller.transitioning = True
+    logs = []
+    controller.controllerParent = types.SimpleNamespace(
+        isOn=lambda: True,
+        getChannels=lambda: [channel],
+    )
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    module.AMPRController._ramp_target_voltages(
+        controller,
+        start_targets={(2, 1): 0.0},
+        end_targets={(2, 1): 2.0},
+        rate_v_s=10.0,
+        label="up",
+    )
+
+    assert controller.device.calls == [
+        ("set_module_voltages", 2, {1: 1.0}),
+        ("set_module_voltages", 2, {1: 2.0}),
+        ("set_module_voltages", 2, {1: 3.0}),
+    ]
+    assert logs == [
+        ("Starting AMPR ramp-up at 10.0 V/s (estimated 0.2 s).", None),
+        ("Applying updated AMPR targets queued during ramp.", None),
+        ("AMPR ramp-up completed.", None),
+    ]
+
+
+def test_toggle_on_failure_logs_runtime_diagnostics():
+    module = _load_module()
+
+    class FakeContext:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeLock:
+        def acquire_timeout(self, *args, **kwargs):
+            return FakeContext()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def initialize(self, timeout_s):
+            raise RuntimeError("AMPR did not reach ST_ON")
+
+        def get_state(self):
+            return self.NO_ERR, "0x2", "ST_STBY"
+
+        def get_device_state(self):
+            return self.NO_ERR, "0x1", ["DS_PSU_ENB"]
+
+        def get_voltage_state(self):
+            return self.NO_ERR, "0x0", ["VOLTAGE_OK"]
+
+        def get_interlock_state(self):
+            return self.NO_ERR, "0x0", []
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        logs = []
+        controller = object.__new__(module.AMPRController)
+        controller.lock = FakeLock()
+        controller.device = FakeDevice()
+        controller.errorCount = 0
+        controller.main_state = "Disconnected"
+        controller.controllerParent = types.SimpleNamespace(
+            isOn=lambda: True,
+            connect_timeout_s=7.5,
+            startup_timeout_s=15.0,
+        )
+        controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert controller.errorCount == 1
+    assert logs == [
+        ("Starting AMPR PSU. Waiting up to 15.0 s for ST_ON.", None),
+        (
+            "Failed to toggle AMPR PSU: RuntimeError: AMPR did not reach ST_ON "
+            "(main state: ST_STBY; device state: DS_PSU_ENB; voltage state: VOLTAGE_OK; interlock state: OK)",
+            module.PRINT.ERROR,
+        ),
+    ]
+
+
+def test_shutdown_communication_runs_full_device_shutdown():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self):
+            self.calls.append("shutdown")
+
+    original_close = getattr(module.DeviceController, "closeCommunication", None)
+    module.DeviceController.closeCommunication = lambda self: setattr(
+        self, "super_close_called", True
+    )
+    try:
+        device = FakeDevice()
+        logs = []
+        synced = []
+        disposed = []
+        controller = object.__new__(module.AMPRController)
+        controller.device = device
+        controller.errorCount = 0
+        controller.main_state = "ST_ON"
+        controller.detected_module_ids = [2]
+        controller.detected_modules_text = "2"
+        controller._sync_status_to_gui = lambda: synced.append(
+            (controller.main_state, controller.detected_module_ids, controller.detected_modules_text)
+        )
+        controller._dispose_device = lambda: disposed.append(True)
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.shutdownCommunication(controller)
+    finally:
+        if original_close is None:
+            delattr(module.DeviceController, "closeCommunication")
+        else:
+            module.DeviceController.closeCommunication = original_close
+
+    assert device.calls == ["shutdown"]
+    assert controller.super_close_called is True
+    assert logs == [
+        ("Starting AMPR shutdown sequence.", None),
+        ("AMPR shutdown sequence completed.", None),
+    ]
+    assert synced == [("Disconnected", [], "")]
+    assert disposed == [True]
+    assert controller.initialized is False
+
+
+def test_shutdown_communication_logs_diagnostics_on_failure():
+    module = _load_module()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def shutdown(self):
+            raise RuntimeError("boom")
+
+        def get_state(self):
+            return self.NO_ERR, "0x8006", "ST_ERR_PSU_DIS"
+
+        def get_device_state(self):
+            return self.NO_ERR, "0x0", ["DEVICE_OK"]
+
+        def get_voltage_state(self):
+            return self.NO_ERR, "0x0", ["VOLTAGE_OK"]
+
+        def get_interlock_state(self):
+            return self.NO_ERR, "0x0", []
+
+    original_close = getattr(module.DeviceController, "closeCommunication", None)
+    module.DeviceController.closeCommunication = lambda self: None
+    try:
+        logs = []
+        disposed = []
+        controller = object.__new__(module.AMPRController)
+        controller.device = FakeDevice()
+        controller.errorCount = 0
+        controller.main_state = "ST_ON"
+        controller.detected_module_ids = [2]
+        controller.detected_modules_text = "2"
+        controller._update_state = lambda: setattr(controller, "main_state", "ST_ERR_PSU_DIS")
+        controller._sync_status_to_gui = lambda: None
+        controller._dispose_device = lambda: disposed.append(True)
+        controller.print = lambda message, flag=None: logs.append((message, flag))
+
+        module.AMPRController.shutdownCommunication(controller)
+    finally:
+        if original_close is None:
+            delattr(module.DeviceController, "closeCommunication")
+        else:
+            module.DeviceController.closeCommunication = original_close
+
+    assert controller.errorCount == 1
+    assert logs == [
+        ("Starting AMPR shutdown sequence.", None),
+        (
+            "AMPR shutdown failed: RuntimeError: boom "
+            "(main state: ST_ERR_PSU_DIS; device state: DEVICE_OK; voltage state: VOLTAGE_OK; interlock state: OK)",
+            module.PRINT.ERROR,
+        ),
+    ]
+    assert disposed == [True]
+    assert controller.initialized is False
+
+
+def test_update_values_clears_monitor_when_channel_or_device_is_off():
+    module = _load_module()
+
+    channel_enabled = types.SimpleNamespace(
+        enabled=True,
+        real=True,
+        waitToStabilize=False,
+        monitor=11.0,
+        module_address=lambda: 2,
+        channel_number=lambda: 1,
+    )
+    channel_disabled = types.SimpleNamespace(
+        enabled=False,
+        real=True,
+        waitToStabilize=False,
+        monitor=22.0,
+        module_address=lambda: 2,
+        channel_number=lambda: 2,
+    )
+
+    controller = object.__new__(module.AMPRController)
+    controller.values = {(2, 1): 100.0, (2, 2): 200.0}
+    controller.controllerParent = types.SimpleNamespace(
+        isOn=lambda: False,
+        getChannels=lambda: [channel_enabled, channel_disabled],
+    )
+    controller._sync_status_to_gui = lambda: None
+
+    module.AMPRController.updateValues(controller)
+
+    assert np.isnan(channel_enabled.monitor)
+    assert np.isnan(channel_disabled.monitor)

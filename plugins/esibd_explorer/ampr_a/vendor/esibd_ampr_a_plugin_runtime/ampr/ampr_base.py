@@ -2,6 +2,7 @@
 
 import ctypes
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -110,6 +111,7 @@ class AMPRBase:
     # Module constants
     MODULE_NUM = 12          # Maximum module number
     CHANNEL_NUM = 4          # Channels per module
+    MAX_ABS_MODULE_VOLTAGE = 1000.0  # Voltage rating per AMPR module channel
     ADDR_BASE = 0x80        # Base-module address
     ADDR_BROADCAST = 0xFF   # Broadcasting address
     
@@ -918,6 +920,27 @@ class AMPRBase:
             ctypes.c_uint(address), ctypes.byref(fw_version))
         return status, fw_version.value
 
+    def get_module_product_id(self, address):
+        """
+        Get the module product identification string.
+
+        Parameters
+        ----------
+        address : int
+            Module address.
+
+        Returns
+        -------
+        tuple
+            (status, identification).
+
+        """
+        identification = ctypes.create_string_buffer(81)
+        status = self.ampr_dll.COM_AMPR_12_GetModuleProductID(
+            ctypes.c_uint(address), identification
+        )
+        return status, identification.value.decode()
+
     def get_module_product_no(self, address):
         """
         Get the module product number.
@@ -1057,6 +1080,12 @@ class AMPRBase:
         """
         if not 1 <= channel <= self.CHANNEL_NUM:
             return self.ERR_ARGUMENT
+        try:
+            voltage = float(voltage)
+        except (TypeError, ValueError):
+            return self.ERR_ARGUMENT
+        if not math.isfinite(voltage) or abs(voltage) > self.MAX_ABS_MODULE_VOLTAGE:
+            return self.ERR_ARGUMENT
 
         status = self.ampr_dll.COM_AMPR_12_SetModuleOutputVoltage(
             ctypes.c_uint(address), ctypes.c_uint(channel - 1), ctypes.c_double(voltage))
@@ -1168,7 +1197,12 @@ class AMPRBase:
                 prod_status, product_no = self.get_module_product_no(addr)
                 if prod_status == self.NO_ERR:
                     module_info['product_no'] = product_no
-                
+
+                # Get module product identification
+                product_id_status, product_id = self.get_module_product_id(addr)
+                if product_id_status == self.NO_ERR:
+                    module_info['product_id'] = product_id
+
                 # Get module hardware info
                 hw_status, hw_type = self.get_module_hw_type(addr)
                 if hw_status == self.NO_ERR:

@@ -895,7 +895,9 @@ class AMPR(ProcessIsolatedClientMixin):
 
     _INSTRUMENT_NAME = "AMPR"
     _PROCESS_CONTROLLER_CLASS = _AMPRController
-    _PROCESS_CONTROLLER_PATH = "cgc.ampr.ampr:_AMPRController"
+    _PROCESS_CONTROLLER_PATH = (
+        "esibd_ampr_b_plugin_runtime.ampr.ampr:_AMPRController"
+    )
     _PROCESS_TIMEOUT_RULES = {
         "connect": (4.0, 5.0, 15.0),
         "initialize": (8.0, 5.0, 30.0),

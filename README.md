@@ -29,7 +29,8 @@ Current implemented CGC instruments:
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
 - AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
 - PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
-- ESIBD Explorer AMPR plugin (self-contained): [`plugins/esibd_explorer/ampr/README.md`](plugins/esibd_explorer/ampr/README.md)
+- ESIBD Explorer AMPR_A plugin (self-contained): [`plugins/esibd_explorer/ampr_a/README.md`](plugins/esibd_explorer/ampr_a/README.md)
+- ESIBD Explorer AMPR_B plugin (self-contained): [`plugins/esibd_explorer/ampr_b/README.md`](plugins/esibd_explorer/ampr_b/README.md)
 - CGC notebooks: [`docs/notebooks/cgc/README.md`](docs/notebooks/cgc/README.md)
 
 ## Installation

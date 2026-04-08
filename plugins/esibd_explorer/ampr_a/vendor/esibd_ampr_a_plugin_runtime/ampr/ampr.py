@@ -822,7 +822,11 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
         self.logger.info(f"Getting information for module {address}")
         try:
             info = {}
-            
+
+            status, product_id = self._call_locked(super().get_module_product_id, address)
+            if status == self.NO_ERR:
+                info["product_id"] = product_id
+
             status, product_no = self._call_locked(super().get_module_product_no, address)
             if status == self.NO_ERR:
                 info["product_no"] = product_no
@@ -892,7 +896,7 @@ class AMPR(ProcessIsolatedClientMixin):
     _INSTRUMENT_NAME = "AMPR"
     _PROCESS_CONTROLLER_CLASS = _AMPRController
     _PROCESS_CONTROLLER_PATH = (
-        "esibd_ampr_plugin_runtime.ampr.ampr:_AMPRController"
+        "esibd_ampr_a_plugin_runtime.ampr.ampr:_AMPRController"
     )
     _PROCESS_TIMEOUT_RULES = {
         "connect": (4.0, 5.0, 15.0),
@@ -932,3 +936,101 @@ class AMPR(ProcessIsolatedClientMixin):
                 "thread_lock": thread_lock,
             },
         )
+
+    def _call_backend_method(self, method_name: str, *args, **kwargs):
+        """Invoke one backend method regardless of inline/process mode."""
+        backend_mode = object.__getattribute__(self, "_backend_mode")
+        if backend_mode == "inline":
+            backend = object.__getattribute__(self, "_backend")
+            return getattr(backend, method_name)(*args, **kwargs)
+        return self._call_process_method(method_name, *args, **kwargs)
+
+    def _resolve_module_addresses(self, address: Optional[int] = None) -> list[int]:
+        """Return one explicit module address or all scanned module addresses."""
+        if address is not None:
+            return [int(address)]
+        modules = self.scan_modules()
+        if isinstance(modules, dict):
+            return sorted(int(module_address) for module_address in modules)
+        return sorted(int(module_address) for module_address in (modules or []))
+
+    def get_module_product_id(self, address: Optional[int] = None):
+        """Return one module product ID or all scanned module product IDs."""
+        if address is not None:
+            return self._call_backend_method("get_module_product_id", int(address))
+
+        module_product_ids = {}
+        for module_address in self._resolve_module_addresses():
+            status, product_id = self._call_backend_method(
+                "get_module_product_id", module_address
+            )
+            module_product_ids[module_address] = {
+                "status": status,
+                "product_id": product_id,
+            }
+        return module_product_ids
+
+    def get_module_product_no(self, address: Optional[int] = None):
+        """Return one module product number or all scanned module product numbers."""
+        if address is not None:
+            return self._call_backend_method("get_module_product_no", int(address))
+
+        module_product_numbers = {}
+        for module_address in self._resolve_module_addresses():
+            status, product_no = self._call_backend_method(
+                "get_module_product_no", module_address
+            )
+            module_product_numbers[module_address] = {
+                "status": status,
+                "product_no": product_no,
+            }
+        return module_product_numbers
+
+    def get_module_hw_type(self, address: Optional[int] = None):
+        """Return one module hardware type or all scanned module hardware types."""
+        if address is not None:
+            return self._call_backend_method("get_module_hw_type", int(address))
+
+        module_hw_types = {}
+        for module_address in self._resolve_module_addresses():
+            status, hw_type = self._call_backend_method(
+                "get_module_hw_type", module_address
+            )
+            module_hw_types[module_address] = {
+                "status": status,
+                "hw_type": hw_type,
+            }
+        return module_hw_types
+
+    def get_scanned_module_params(self, address: Optional[int] = None):
+        """Return saved/scanned parameters for one module or all scanned modules."""
+        if address is not None:
+            return self._call_backend_method("get_scanned_module_params", int(address))
+
+        scanned_module_params = {}
+        for module_address in self._resolve_module_addresses():
+            (
+                status,
+                scanned_product_no,
+                saved_product_no,
+                scanned_hw_type,
+                saved_hw_type,
+            ) = self._call_backend_method("get_scanned_module_params", module_address)
+            scanned_module_params[module_address] = {
+                "status": status,
+                "scanned_product_no": scanned_product_no,
+                "saved_product_no": saved_product_no,
+                "scanned_hw_type": scanned_hw_type,
+                "saved_hw_type": saved_hw_type,
+            }
+        return scanned_module_params
+
+    def get_module_info(self, address: Optional[int] = None):
+        """Return detailed info for one module or all scanned modules."""
+        if address is not None:
+            return self._call_backend_method("get_module_info", int(address))
+
+        module_info = {}
+        for module_address in self._resolve_module_addresses():
+            module_info[module_address] = self.get_module_info(module_address)
+        return module_info

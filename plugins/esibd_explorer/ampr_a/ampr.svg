@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges">
+  <rect width="64" height="64" rx="12" fill="#131c2c"/>
+  <rect x="8" y="14" width="48" height="34" rx="4" fill="#30445b"/>
+  <rect x="11" y="17" width="42" height="28" fill="#233345"/>
+  <rect x="15" y="20" width="8" height="22" fill="#ffd35a"/>
+  <rect x="28" y="20" width="8" height="22" fill="#f4a24e"/>
+  <rect x="41" y="20" width="8" height="22" fill="#ff734c"/>
+  <rect x="17" y="24" width="4" height="1" fill="#f8fbff"/>
+  <rect x="18.5" y="22.5" width="1" height="4" fill="#f8fbff"/>
+  <rect x="17" y="37" width="4" height="1" fill="#f8fbff"/>
+  <rect x="30" y="24" width="4" height="1" fill="#f8fbff"/>
+  <rect x="31.5" y="22.5" width="1" height="4" fill="#f8fbff"/>
+  <rect x="30" y="37" width="4" height="1" fill="#f8fbff"/>
+  <rect x="43" y="24" width="4" height="1" fill="#f8fbff"/>
+  <rect x="44.5" y="22.5" width="1" height="4" fill="#f8fbff"/>
+  <rect x="43" y="37" width="4" height="1" fill="#f8fbff"/>
+  <rect x="28" y="49" width="8" height="3" fill="#76d28b"/>
+  <rect x="18" y="54" width="28" height="4" rx="2" fill="#edf3fb"/>
+  <rect x="46" y="6" width="12" height="12" rx="4" fill="#f0b54d"/>
+  <text x="52" y="14.2" text-anchor="middle" font-family="DejaVu Sans, Arial, sans-serif" font-size="8" font-weight="700" fill="#1d2a3a">A</text>
+</svg>
