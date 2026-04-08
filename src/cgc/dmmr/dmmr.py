@@ -258,14 +258,15 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
         self,
         timeout_s: float = 5.0,
         *,
-        persist_scan: bool = False,
+        persist_scan: bool = True,
     ) -> dict:
         """
         Connect to the controller, refresh the module scan, and return modules.
 
-        By default this does not overwrite the saved controller scan. Pass
-        ``persist_scan=True`` when the currently detected module population is
-        known-good and should become the new stored reference.
+        By default, a detected module mismatch is acknowledged after the rescan
+        and the current module population is stored as the new controller
+        reference. Pass ``persist_scan=False`` to inspect the scan without
+        updating the stored reference.
         """
         timeout_s = self._resolve_io_timeout(timeout_s)
         self.logger.info(

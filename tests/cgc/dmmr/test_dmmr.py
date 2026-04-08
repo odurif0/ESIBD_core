@@ -59,6 +59,26 @@ def test_dmmr_base_formats_vendor_error_codes(monkeypatch):
     assert dmmr.format_status(DMMRBase.ERR_RATE) == "-16 (Error setting baud rate)"
 
 
+@pytest.mark.parametrize(
+    ("state_value", "state_name"),
+    [
+        (1, "ST_OVERLOAD"),
+        (2, "ST_STBY"),
+    ],
+)
+def test_dmmr_base_decodes_documented_main_states(monkeypatch, state_value, state_name):
+    dmmr, dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    def fake_get_state(ptr):
+        ptr._obj.value = state_value
+        return backend.NO_ERR
+
+    dll.COM_DMMR_8_GetState.side_effect = fake_get_state
+
+    assert backend.get_state() == (backend.NO_ERR, hex(state_value), state_name)
+
+
 def test_dmmr_rejects_unknown_init_kwargs():
     with pytest.raises(TypeError, match="Unexpected DMMR init kwargs: unexpected"):
         DMMR("dmmr_test", com=8, unexpected=True)
@@ -235,7 +255,7 @@ def test_initialize_rescans_modules_and_returns_scan(monkeypatch):
     ]
 
 
-def test_initialize_can_persist_scan_state(monkeypatch):
+def test_initialize_persists_scan_state_by_default(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")
 
@@ -250,10 +270,31 @@ def test_initialize_can_persist_scan_state(monkeypatch):
     persist = Mock(return_value=backend.NO_ERR)
     monkeypatch.setattr(backend, "set_scanned_module_state", persist)
 
-    modules = backend.initialize(timeout_s=2.0, persist_scan=True)
+    modules = backend.initialize(timeout_s=2.0)
 
     assert modules == {3: {"state": 0}}
     persist.assert_called_once_with(timeout_s=2.0)
+
+
+def test_initialize_can_skip_persisting_scan_state(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    monkeypatch.setattr(backend, "connect", lambda timeout_s=5.0: True)
+    monkeypatch.setattr(backend, "rescan_modules", lambda timeout_s=None: backend.NO_ERR)
+    monkeypatch.setattr(backend, "scan_modules", lambda timeout_s=None: {3: {"state": 0}})
+    monkeypatch.setattr(
+        backend,
+        "get_scanned_module_state",
+        lambda timeout_s=None: (backend.NO_ERR, True),
+    )
+    persist = Mock(return_value=backend.NO_ERR)
+    monkeypatch.setattr(backend, "set_scanned_module_state", persist)
+
+    modules = backend.initialize(timeout_s=2.0, persist_scan=False)
+
+    assert modules == {3: {"state": 0}}
+    persist.assert_not_called()
 
 
 def test_get_product_info_returns_structured_metadata(monkeypatch):

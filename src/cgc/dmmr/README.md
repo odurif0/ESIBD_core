@@ -51,3 +51,7 @@ try:
 finally:
     dmmr.shutdown()
 ```
+
+`initialize()` rescans the controller and, when a module mismatch is detected,
+acknowledges the current module population as the stored reference. Pass
+`persist_scan=False` to inspect the scan without updating the controller state.
