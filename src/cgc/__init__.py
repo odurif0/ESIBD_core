@@ -2,10 +2,12 @@
 
 from .ampr import AMPR
 from .amx import AMX
+from .dmmr import DMMR
 from .psu import PSU
 
 __all__ = [
     "AMPR",
     "AMX",
+    "DMMR",
     "PSU",
 ]

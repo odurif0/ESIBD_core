@@ -12,6 +12,7 @@ Current package families:
 Current implemented CGC instruments:
 - `cgc.ampr`
 - `cgc.amx`
+- `cgc.dmmr`
 - `cgc.psu`
 
 ## Repository Layout
@@ -28,6 +29,7 @@ Current implemented CGC instruments:
 - CGC family: [`src/cgc/README.md`](src/cgc/README.md)
 - AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
 - AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
+- DMMR: [`src/cgc/dmmr/README.md`](src/cgc/dmmr/README.md)
 - PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
 - ESIBD Explorer AMPR_A plugin (self-contained): [`plugins/esibd_explorer/ampr_a/README.md`](plugins/esibd_explorer/ampr_a/README.md)
 - ESIBD Explorer AMPR_B plugin (self-contained): [`plugins/esibd_explorer/ampr_b/README.md`](plugins/esibd_explorer/ampr_b/README.md)

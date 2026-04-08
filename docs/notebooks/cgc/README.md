@@ -6,6 +6,7 @@ Files:
 
 - `ampr_wrapper.ipynb`: AMPR simple sequence, then wrapper methods one by one
 - `amx_wrapper.ipynb`: AMX simple sequence, then wrapper methods one by one
+- `dmmr_wrapper.ipynb`: DMMR simple sequence, then wrapper methods one by one
 - `psu_wrapper.ipynb`: PSU simple sequence, then wrapper methods one by one
 
 Notes:

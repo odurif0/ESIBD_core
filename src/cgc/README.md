@@ -7,6 +7,7 @@ This package contains the instrument drivers for CGC hardware supported by
 
 - `cgc.ampr`: AMPR controller driver
 - `cgc.amx`: AMX controller driver
+- `cgc.dmmr`: DMMR picoammeter driver
 - `cgc.psu`: PSU controller driver
 
 ## Package Layout
@@ -15,11 +16,12 @@ This package contains the instrument drivers for CGC hardware supported by
 - `src/cgc/error_codes.json`: shared vendor error descriptions
 - `src/cgc/ampr/`: AMPR driver, vendor DLL, and AMPR-specific documentation
 - `src/cgc/amx/`: AMX driver, vendor DLL, and AMX-specific documentation
+- `src/cgc/dmmr/`: DMMR driver, vendor DLL, and DMMR-specific documentation
 - `src/cgc/psu/`: PSU driver, vendor DLL, and PSU-specific documentation
 
 ## Process Isolation
 
-On Windows, the high-level CGC clients (`AMPR`, `AMX`, and `PSU`) run their
+On Windows, the high-level CGC clients (`AMPR`, `AMX`, `DMMR`, and `PSU`) run their
 DLL-backed controllers inside dedicated worker processes when possible. This
 contains blocked vendor DLL calls to the worker process instead of poisoning
 the main Python process, which is especially useful in notebooks. Advanced

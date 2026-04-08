@@ -23,6 +23,7 @@ package-dir = {"" = "src"}
 cgc = ["error_codes.json", "README.md"]
 "cgc.ampr" = ["vendor/COM-AMPR-12.h", "vendor/x64/COM-AMPR-12.dll", "README.md"]
 "cgc.amx" = ["vendor/COM-HVAMX4ED.h", "vendor/x64/COM-HVAMX4ED.dll", "README.md"]
+"cgc.dmmr" = ["vendor/COM-DMMR-8.h", "vendor/x64/COM-DMMR-8.dll", "README.md"]
 "cgc.psu" = ["vendor/COM-HVPSU2D.h", "vendor/x64/COM-HVPSU2D.dll", "README.md"]
 
 [tool.setuptools.packages.find]
