@@ -1349,7 +1349,7 @@ class DMMR(ProcessIsolatedClientMixin):
 
     _INSTRUMENT_NAME = "DMMR"
     _PROCESS_CONTROLLER_CLASS = _DMMRController
-    _PROCESS_CONTROLLER_PATH = "cgc.dmmr.dmmr:_DMMRController"
+    _PROCESS_CONTROLLER_PATH = f"{__name__}:_DMMRController"
     _PROCESS_TIMEOUT_RULES = {
         "connect": (4.0, 5.0, 15.0),
         "initialize": (8.0, 5.0, 30.0),

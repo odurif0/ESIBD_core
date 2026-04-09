@@ -6,3 +6,4 @@ discover and load.
 Current AMPR variants:
 - `ampr_a/`: autonomous AMPR_A plugin
 - `ampr_b/`: autonomous AMPR_B plugin
+- `dmmr/`: autonomous DMMR plugin

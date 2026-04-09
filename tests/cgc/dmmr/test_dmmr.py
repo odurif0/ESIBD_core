@@ -76,7 +76,11 @@ def test_dmmr_base_decodes_documented_main_states(monkeypatch, state_value, stat
 
     dll.COM_DMMR_8_GetState.side_effect = fake_get_state
 
-    assert backend.get_state() == (backend.NO_ERR, hex(state_value), state_name)
+    assert backend.get_state() == (
+        backend.NO_ERR,
+        f"0x{state_value:04X}",
+        state_name,
+    )
 
 
 def test_dmmr_rejects_unknown_init_kwargs():
@@ -406,6 +410,22 @@ def test_get_product_info_returns_structured_metadata(monkeypatch):
     }
 
 
+def test_get_product_info_uses_timeout_safe_batch_wrapper(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        return {"product_id": "DMMR-CTRL-8"}
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.get_product_info(timeout_s=2.0) == {"product_id": "DMMR-CTRL-8"}
+    assert calls == [("_get_product_info_unlocked", 10.0, "get_product_info", ())]
+
+
 def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     dmmr.connected = True
@@ -660,6 +680,195 @@ def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
     assert "measurement_range" not in snapshot["modules"][3]
 
 
+def test_collect_housekeeping_uses_timeout_safe_batch_wrapper(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        return {"main_state": {"name": "ST_ON"}}
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.collect_housekeeping(timeout_s=3.0) == {
+        "main_state": {"name": "ST_ON"}
+    }
+    assert calls == [("_collect_housekeeping_unlocked", 20.0, "collect_housekeeping", ())]
+
+
+def test_collect_housekeeping_caches_optional_module_commands(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = {"optime": 0, "meas_range": 0}
+
+    monkeypatch.setattr(
+        DMMRBase, "get_state", lambda self: (self.NO_ERR, "0x0000", "ST_ON")
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_device_state", lambda self: (self.NO_ERR, "0x0000", ["DEVICE_OK"])
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_voltage_state",
+        lambda self: (self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_temperature_state",
+        lambda self: (self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_enable", lambda self: (self.NO_ERR, True))
+    monkeypatch.setattr(
+        DMMRBase, "get_automatic_current", lambda self: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_housekeeping",
+        lambda self: (self.NO_ERR, 12.0, 5.0, 3.3, 41.5),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_cpu_data", lambda self: (self.NO_ERR, 0.2, 180_000_000.0)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_uptime_int", lambda self: (self.NO_ERR, 10, 20, 100, 200)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_optime_int", lambda self: (self.NO_ERR, 3, 4, 30, 40)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_base_state",
+        lambda self: (self.NO_ERR, "0x0000", ["BASE_OK"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_base_temp", lambda self: (self.NO_ERR, 37.5))
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_base_fan_pwm",
+        lambda self: (self.NO_ERR, 1200, "0x1600", ["FAN_OK"]),
+    )
+    monkeypatch.setattr(DMMRBase, "get_base_fan_rpm", lambda self: (self.NO_ERR, 950.0))
+    monkeypatch.setattr(
+        DMMRBase, "get_base_led_data", lambda self: (self.NO_ERR, False, True, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_presence",
+        lambda self: (self.NO_ERR, True, 8, [0, self.MODULE_PRESENT, 0, 0, 0, 0, 0, 0]),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_scanned_module_state", lambda self: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_product_id",
+        lambda self, address: (self.NO_ERR, f"DPA-{address}"),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_product_no", lambda self, address: (self.NO_ERR, 4500 + address)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_device_type",
+        lambda self, address: (self.NO_ERR, self.MODULE_TYPE),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_version", lambda self, address: (self.NO_ERR, 0x0201)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_date", lambda self, address: (self.NO_ERR, "2026-04-07")
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_type", lambda self, address: (self.NO_ERR, 91)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_version", lambda self, address: (self.NO_ERR, 5)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_manuf_date", lambda self, address: (self.NO_ERR, 2026, 12)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_uptime_int", lambda self, address: (self.NO_ERR, 1, 2, 10, 20)
+    )
+
+    def fake_get_module_optime_int(self, address):
+        calls["optime"] += 1
+        return self.ERR_COMMAND_RECEIVE, 0, 0, 0, 0
+
+    def fake_get_module_meas_range(self, address):
+        calls["meas_range"] += 1
+        return self.ERR_DATA_RECEIVE, 0, False
+
+    monkeypatch.setattr(DMMRBase, "get_module_optime_int", fake_get_module_optime_int)
+    monkeypatch.setattr(DMMRBase, "get_module_cpu_data", lambda self, address: (self.NO_ERR, 0.15))
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_housekeeping",
+        lambda self, address: (
+            self.NO_ERR,
+            3.3,
+            44.0,
+            5.0,
+            12.0,
+            3.31,
+            45.0,
+            2.5,
+            -36.0,
+            20.0,
+            -20.0,
+            15.0,
+            -15.0,
+            1.8,
+            -1.8,
+            2.048,
+            -2.048,
+        ),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_state", lambda self, address: (self.NO_ERR, 7)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_buffer_state", lambda self, address: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_ready_flags",
+        lambda self, address: (self.NO_ERR, self.MEAS_CUR_RDY),
+    )
+    monkeypatch.setattr(DMMRBase, "get_module_meas_range", fake_get_module_meas_range)
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_current",
+        lambda self, address: (self.NO_ERR, 2.5e-12, 3),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_scanned_module_params",
+        lambda self, address: (self.NO_ERR, 4501, 4501, 91, 91),
+    )
+
+    first_snapshot = backend.collect_housekeeping()
+    second_snapshot = backend.collect_housekeeping()
+
+    assert "measurement_range" not in first_snapshot["modules"][1]
+    assert "measurement_range" not in second_snapshot["modules"][1]
+    assert first_snapshot["modules"][1]["uptime"] == {
+        "seconds": 1,
+        "milliseconds": 2,
+        "total_seconds": 10,
+        "total_milliseconds": 20,
+    }
+    assert second_snapshot["modules"][1]["uptime"] == {
+        "seconds": 1,
+        "milliseconds": 2,
+        "total_seconds": 10,
+        "total_milliseconds": 20,
+    }
+    assert calls == {"optime": 1, "meas_range": 1}
+
+
 def test_list_configs_filters_empty_slots(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")
@@ -686,6 +895,69 @@ def test_list_configs_filters_empty_slots(monkeypatch):
     ]
 
 
+def test_get_config_list_falls_back_to_per_slot_flags(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+
+    monkeypatch.setattr(
+        backend,
+        "_call_locked_with_timeout",
+        lambda method, timeout_s, step_name, *args, **kwargs: method(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_config_list",
+        lambda self: (self.ERR_DATA_RECEIVE, [], []),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_config_flags",
+        lambda self, index: (
+            self.NO_ERR,
+            index == 0,
+            index in {0, 1},
+        ),
+    )
+
+    status, active_list, valid_list = backend.get_config_list(timeout_s=1.0)
+
+    assert status == backend.NO_ERR
+    assert active_list[:3] == [True, False, False]
+    assert valid_list[:3] == [True, True, False]
+    assert len(active_list) == backend.MAX_CONFIG
+    assert len(valid_list) == backend.MAX_CONFIG
+
+
+def test_get_config_list_caches_optional_direct_query_failure(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = {"config_list": 0}
+
+    monkeypatch.setattr(
+        backend,
+        "_call_locked_with_timeout",
+        lambda method, timeout_s, step_name, *args, **kwargs: method(*args, **kwargs),
+    )
+
+    def fake_get_config_list(self):
+        calls["config_list"] += 1
+        return self.ERR_DATA_RECEIVE, [], []
+
+    monkeypatch.setattr(DMMRBase, "get_config_list", fake_get_config_list)
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_config_flags",
+        lambda self, index: (self.NO_ERR, False, index == 0),
+    )
+
+    backend.get_config_list(timeout_s=1.0)
+    backend.get_config_list(timeout_s=1.0)
+
+    assert calls["config_list"] == 1
+
+
 def test_shutdown_disables_measurement_before_disconnect(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")
@@ -699,6 +971,222 @@ def test_shutdown_disables_measurement_before_disconnect(monkeypatch):
     backend.set_automatic_current.assert_called_once_with(False, timeout_s=5.0)
     backend.set_enable.assert_called_once_with(False, timeout_s=5.0)
     backend.disconnect.assert_called_once_with()
+
+
+def test_disconnect_keeps_connected_true_when_close_port_fails(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    monkeypatch.setattr(backend, "stop_housekeeping", Mock(return_value=True))
+    monkeypatch.setattr(backend, "_call_locked", Mock(return_value=backend.ERR_CLOSE))
+
+    assert backend.disconnect() is False
+    assert backend.connected is True
+
+
+def test_dmmr_base_rejects_invalid_config_number(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    with pytest.raises(ValueError, match="config_number"):
+        backend.get_config_name(backend.MAX_CONFIG)
+
+
+def test_dmmr_base_rejects_wrong_config_data_length(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    with pytest.raises(ValueError, match=f"{backend.MAX_REG} register values"):
+        backend.set_current_config([0] * (backend.MAX_REG - 1))
+
+
+def test_dmmr_base_rejects_non_integer_config_data(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    config_data = [0] * backend.MAX_REG
+    config_data[5] = 1.5
+
+    with pytest.raises(TypeError, match="config_data\\[5\\]"):
+        backend.set_config_data(0, config_data)
+
+
+def test_dmmr_base_rejects_overlong_config_name(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    with pytest.raises(ValueError, match="shorter than"):
+        backend.set_config_name(0, "x" * backend.CONFIG_NAME_SIZE)
+
+
+def test_get_module_info_returns_normalized_module_snapshot(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_product_id",
+        lambda self, address: (self.NO_ERR, f"DPA-{address}"),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_product_no", lambda self, address: (self.NO_ERR, 4500 + address)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_device_type",
+        lambda self, address: (self.NO_ERR, self.MODULE_TYPE),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_version", lambda self, address: (self.NO_ERR, 0x0201)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_fw_date", lambda self, address: (self.NO_ERR, "2026-04-07")
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_type", lambda self, address: (self.NO_ERR, 91)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_hw_version", lambda self, address: (self.NO_ERR, 5)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_manuf_date", lambda self, address: (self.NO_ERR, 2026, 12)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_uptime_int", lambda self, address: (self.NO_ERR, 1, 2, 10, 20)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_optime_int", lambda self, address: (self.NO_ERR, 3, 4, 30, 40)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_cpu_data", lambda self, address: (self.NO_ERR, 0.15)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_housekeeping",
+        lambda self, address: (
+            self.NO_ERR,
+            3.3,
+            44.0,
+            5.0,
+            12.0,
+            3.31,
+            45.0,
+            2.5,
+            -36.0,
+            20.0,
+            -20.0,
+            15.0,
+            -15.0,
+            1.8,
+            -1.8,
+            2.048,
+            -2.048,
+        ),
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_state", lambda self, address: (self.NO_ERR, 7)
+    )
+    monkeypatch.setattr(
+        DMMRBase, "get_module_buffer_state", lambda self, address: (self.NO_ERR, False)
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_ready_flags",
+        lambda self, address: (
+            self.NO_ERR,
+            self.MEAS_CUR_RDY | self.HK_MOD_DATA_RDY,
+        ),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_meas_range",
+        lambda self, address: (self.NO_ERR, 4, True),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_module_current",
+        lambda self, address: (self.NO_ERR, 2.5e-12, 3),
+    )
+    monkeypatch.setattr(
+        DMMRBase,
+        "get_scanned_module_params",
+        lambda self, address: (self.NO_ERR, 4503, 4503, 91, 91),
+    )
+
+    snapshot = backend.get_module_info(3)
+
+    assert snapshot == {
+        "address": 3,
+        "product_id": "DPA-3",
+        "product_no": 4503,
+        "device_type": DMMRBase.MODULE_TYPE,
+        "firmware": {
+            "version": 0x0201,
+            "date": "2026-04-07",
+        },
+        "hardware": {
+            "type": 91,
+            "version": 5,
+        },
+        "manufacturing": {
+            "year": 2026,
+            "calendar_week": 12,
+        },
+        "uptime": {
+            "seconds": 1,
+            "milliseconds": 2,
+            "total_seconds": 10,
+            "total_milliseconds": 20,
+            "operation_seconds": 3,
+            "operation_milliseconds": 4,
+            "total_operation_seconds": 30,
+            "total_operation_milliseconds": 40,
+        },
+        "cpu": {
+            "load": 0.15,
+        },
+        "housekeeping": {
+            "volt_3v3_v": 3.3,
+            "temp_cpu_c": 44.0,
+            "volt_5v0_v": 5.0,
+            "volt_12v_v": 12.0,
+            "volt_3v3i_v": 3.31,
+            "temp_cpui_c": 45.0,
+            "volt_2v5i_v": 2.5,
+            "volt_36vn_v": -36.0,
+            "volt_20vp_v": 20.0,
+            "volt_20vn_v": -20.0,
+            "volt_15vp_v": 15.0,
+            "volt_15vn_v": -15.0,
+            "volt_1v8p_v": 1.8,
+            "volt_1v8n_v": -1.8,
+            "volt_vrefp_v": 2.048,
+            "volt_vrefn_v": -2.048,
+        },
+        "state": 7,
+        "buffer": {
+            "empty": False,
+        },
+        "ready_flags": {
+            "raw": DMMRBase.MEAS_CUR_RDY | DMMRBase.HK_MOD_DATA_RDY,
+            "measurement_current_ready": True,
+            "measurement_housekeeping_ready": False,
+            "module_housekeeping_ready": True,
+        },
+        "measurement_range": {
+            "range": 4,
+            "auto_range": True,
+        },
+        "current": {
+            "value": 2.5e-12,
+            "range": 3,
+        },
+        "scanned_params": {
+            "scanned_product_no": 4503,
+            "saved_product_no": 4503,
+            "scanned_hw_type": 91,
+            "saved_hw_type": 91,
+        },
+    }
 
 
 def test_public_get_module_info_supports_omitted_address():

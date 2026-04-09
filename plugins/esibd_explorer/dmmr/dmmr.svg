@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="panel" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14324a"/>
+      <stop offset="100%" stop-color="#071723"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#47c4e1"/>
+      <stop offset="100%" stop-color="#b6f06b"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="104" rx="14" fill="url(#panel)"/>
+  <rect x="18" y="24" width="92" height="16" rx="6" fill="#0f2537" stroke="#6fc8de" stroke-width="2"/>
+  <rect x="18" y="52" width="34" height="48" rx="8" fill="#0d2233" stroke="#6fc8de" stroke-width="2"/>
+  <rect x="60" y="52" width="50" height="48" rx="8" fill="#0d2233" stroke="#6fc8de" stroke-width="2"/>
+  <circle cx="35" cy="76" r="11" fill="#071723" stroke="#b6f06b" stroke-width="4"/>
+  <path d="M68 64h34" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+  <path d="M68 76h26" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+  <path d="M68 88h18" stroke="url(#accent)" stroke-width="5" stroke-linecap="round"/>
+  <text x="64" y="117" font-size="18" text-anchor="middle" fill="#d6eef5" font-family="DejaVu Sans, sans-serif" font-weight="700">DMMR</text>
+</svg>
+*** Update File: /home/durif/Git/ESIBD_core/plugins/esibd_explorer/README.md
+@@
+ Current AMPR variants:
+ - `ampr_a/`: autonomous AMPR_A plugin
+ - `ampr_b/`: autonomous AMPR_B plugin
++- `dmmr/`: autonomous DMMR plugin
+*** Add File: /home/durif/Git/ESIBD_core/plugins/esibd_explorer/dmmr/vendor/runtime/__init__.py
+"""Minimal bundled CGC runtime for the standalone DMMR ESIBD plugin."""
+
+from .dmmr import DMMR
+
+__all__ = ["DMMR"]
