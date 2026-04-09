@@ -9,6 +9,8 @@ import types
 from enum import Enum
 from pathlib import Path
 
+from PIL import Image
+
 
 PLUGIN_PATH = (
     Path(__file__).resolve().parents[2]
@@ -22,7 +24,7 @@ ICON_PATH = (
     / "plugins"
     / "esibd_explorer"
     / "dmmr"
-    / "dmmr.svg"
+    / "dmmr.png"
 )
 
 
@@ -167,7 +169,9 @@ def test_dmmr_plugin_exposes_expected_metadata():
     assert module.DMMRDevice.unit == "A"
     assert module.DMMRDevice.useMonitors is True
     assert module.DMMRDevice.useOnOffLogic is True
-    assert module.DMMRDevice.iconFile == "dmmr.svg"
+    assert module.DMMRDevice.iconFile == "dmmr.png"
+    with Image.open(ICON_PATH) as image:
+        assert image.size == (64, 64)
 
 
 def test_dmmr_plugin_loads_driver_from_private_runtime():
@@ -198,3 +202,90 @@ def test_dmmr_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):
         assert "vendor/runtime; plugin installation is incomplete" in str(exc)
     else:
         raise AssertionError("Expected ModuleNotFoundError when vendor/runtime is missing")
+
+
+def test_dmmr_recording_action_reflects_device_readiness():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.DMMRDevice)
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=True,
+        transitioning=False,
+        main_state="ST_STBY",
+    )
+    device.isOn = lambda: True
+
+    module.DMMRDevice._sync_acquisition_controls(device)
+    assert device.recordingAction.enabled is False
+
+    device.controller.main_state = "ST_ON"
+    module.DMMRDevice._sync_acquisition_controls(device)
+    assert device.recordingAction.enabled is True
+
+
+def test_dmmr_toggle_recording_rejects_unready_device():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+    super_calls = []
+
+    def fake_super_toggle(self, on=None, manual=True):
+        super_calls.append((on, manual))
+
+    module.Device.toggleRecording = fake_super_toggle
+
+    class FakeAction:
+        def __init__(self):
+            self.state = True
+            self.enabled = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.DMMRDevice)
+    device.name = "DMMR"
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=True,
+        transitioning=False,
+        main_state="ST_STBY",
+    )
+    device.isOn = lambda: True
+    device.printed = []
+    device.print = lambda message, flag=None: device.printed.append((message, flag))
+
+    module.DMMRDevice.toggleRecording(device, on=True, manual=True)
+
+    assert super_calls == []
+    assert device.recordingAction.state is False
+    assert device.recordingAction.enabled is False
+    assert device.printed == [
+        ("Cannot start DMMR data acquisition: state is ST_STBY.", module.PRINT.WARNING)
+    ]

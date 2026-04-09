@@ -498,6 +498,7 @@ class AMPRDevice(Device):
         self._ensure_local_on_action()
         self._ensure_status_widgets()
         self._update_channel_column_visibility()
+        self._sync_acquisition_controls()
 
     def getChannels(self) -> "list[AMPRChannel]":
         return cast("list[AMPRChannel]", super().getChannels())
@@ -673,6 +674,7 @@ class AMPRDevice(Device):
         """Refresh the global AMPR status labels in the toolbar."""
         badge = getattr(self, "statusBadgeLabel", None)
         summary = getattr(self, "statusSummaryLabel", None)
+        self._sync_acquisition_controls()
         if badge is None or summary is None:
             return
 
@@ -925,6 +927,84 @@ class AMPRDevice(Device):
         settings[f"{self.name}/{self.MAXDATAPOINTS}"][Parameter.VALUE] = 100000
         return settings
 
+    def _acquisition_readiness(self) -> tuple[bool, str]:
+        """Return whether manual recording can start and, if not, why."""
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False, "controller unavailable"
+        if getattr(controller, "device", None) is None:
+            return False, "device disconnected"
+        if getattr(controller, "initializing", False):
+            return False, "initialization in progress"
+        if not getattr(controller, "initialized", False):
+            return False, "communication not initialized"
+        if getattr(controller, "transitioning", False):
+            return False, "ON/OFF transition in progress"
+        is_on = getattr(self, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            return False, "device is OFF"
+        main_state = str(getattr(controller, "main_state", "Disconnected") or "Disconnected")
+        if main_state != "ST_ON":
+            return False, f"state is {main_state}"
+        return True, ""
+
+    def _set_action_enabled(self, action: Any | None, enabled: bool) -> None:
+        """Update QAction-like enabled state while tolerating lightweight test doubles."""
+        if action is None:
+            return
+        if hasattr(action, "setEnabled"):
+            action.setEnabled(enabled)
+            return
+        setattr(action, "enabled", enabled)
+
+    def _force_recording_action_state(self, state: bool) -> None:
+        """Force the acquisition action state without re-entering its callbacks."""
+        for action in (
+            getattr(self, "recordingAction", None),
+            getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
+        ):
+            if action is None:
+                continue
+            blocker = getattr(action, "blockSignals", None)
+            if callable(blocker):
+                blocker(True)
+            try:
+                if hasattr(action, "state"):
+                    action.state = bool(state)
+                elif hasattr(action, "setChecked"):
+                    action.setChecked(bool(state))
+            finally:
+                if callable(blocker):
+                    blocker(False)
+
+    def _sync_acquisition_controls(self) -> None:
+        """Disable manual acquisition controls until the AMPR is actually ready."""
+        ready, _reason = self._acquisition_readiness()
+        self._set_action_enabled(getattr(self, "recordingAction", None), ready)
+        self._set_action_enabled(
+            getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
+            ready,
+        )
+        if not ready and not bool(getattr(self, "recording", False)):
+            self._force_recording_action_state(False)
+
+    def toggleRecording(self, on: "bool | None" = None, manual: bool = True) -> None:
+        """Only allow data recording when the AMPR is initialized and in ST_ON."""
+        requested_on = (not bool(getattr(self, "recording", False))) if on is None else bool(on)
+        ready, reason = self._acquisition_readiness()
+        if requested_on and not ready:
+            self._force_recording_action_state(False)
+            self._sync_acquisition_controls()
+            if manual:
+                self.print(
+                    f"Cannot start {self.name} data acquisition: {reason}.",
+                    flag=PRINT.WARNING,
+                )
+            return
+
+        super().toggleRecording(on=on, manual=manual)
+        self._sync_acquisition_controls()
+
     def closeCommunication(self) -> None:
         """Close communication safely even if plugin finalization failed early."""
         if self.useOnOffLogic and not hasattr(self, "onAction"):
@@ -932,6 +1012,7 @@ class AMPRDevice(Device):
             if self.controller:
                 self.controller.closeCommunication()
             self.recording = False
+            self._sync_acquisition_controls()
             return
 
         if self.controller and getattr(self, "initialized", False):
@@ -945,6 +1026,7 @@ class AMPRDevice(Device):
         if self.controller:
             self.controller.closeCommunication()
         self.recording = False
+        self._sync_acquisition_controls()
 
     def shutdownCommunication(self) -> None:
         """Run the full AMPR hardware shutdown sequence from the toolbar action."""
@@ -955,6 +1037,7 @@ class AMPRDevice(Device):
         if self.controller:
             self.controller.shutdownCommunication()
         self.recording = False
+        self._sync_acquisition_controls()
 
     def _set_on_ui_state(self, on: bool) -> None:
         """Synchronize the ESIBD and local AMPR ON/OFF actions."""

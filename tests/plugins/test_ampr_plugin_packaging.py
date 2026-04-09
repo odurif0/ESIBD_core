@@ -1078,3 +1078,90 @@ def test_ampr_a_and_ampr_b_load_as_distinct_autonomous_plugins(monkeypatch):
         sys.modules[runtime_module_name_b].__file__
         == str(VENDOR_B_ROOT / "__init__.py")
     )
+
+
+def test_ampr_recording_action_reflects_device_readiness():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.AMPRDevice)
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=True,
+        transitioning=False,
+        main_state="ST_STBY",
+    )
+    device.isOn = lambda: True
+
+    module.AMPRDevice._sync_acquisition_controls(device)
+    assert device.recordingAction.enabled is False
+
+    device.controller.main_state = "ST_ON"
+    module.AMPRDevice._sync_acquisition_controls(device)
+    assert device.recordingAction.enabled is True
+
+
+def test_ampr_toggle_recording_rejects_unready_device():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+    super_calls = []
+
+    def fake_super_toggle(self, on=None, manual=True):
+        super_calls.append((on, manual))
+
+    module.Device.toggleRecording = fake_super_toggle
+
+    class FakeAction:
+        def __init__(self):
+            self.state = True
+            self.enabled = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.AMPRDevice)
+    device.name = "AMPR"
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=True,
+        transitioning=False,
+        main_state="ST_STBY",
+    )
+    device.isOn = lambda: True
+    device.printed = []
+    device.print = lambda message, flag=None: device.printed.append((message, flag))
+
+    module.AMPRDevice.toggleRecording(device, on=True, manual=True)
+
+    assert super_calls == []
+    assert device.recordingAction.state is False
+    assert device.recordingAction.enabled is False
+    assert device.printed == [
+        ("Cannot start AMPR data acquisition: state is ST_STBY.", module.PRINT.WARNING)
+    ]
