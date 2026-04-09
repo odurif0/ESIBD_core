@@ -853,7 +853,6 @@ def test_channel_monitor_feedback_uses_relative_color_bands():
     channel.waitToStabilize = False
     channel.value = 100.0
     channel.monitor = 100.5
-    channel.defaultStyleSheet = "background-color: #123456"
     channel.warningState = False
     channel.getParameterByName = lambda name: {"Monitor": FakeParameter(monitor_widget)}[name]
 
@@ -870,7 +869,7 @@ def test_channel_monitor_feedback_uses_relative_color_bands():
 
     channel.monitor = np.nan
     module.AMPRChannel.monitorChanged(channel)
-    assert monitor_widget.styles[-1] == "background-color: #123456"
+    assert monitor_widget.styles[-1] == ""
 
 
 def test_init_gui_rewires_close_action_to_shutdown():

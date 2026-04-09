@@ -1,4 +1,4 @@
-"""ESIBD Explorer plugin for the CGC DMMR picoammeter."""
+"""Read DMMR module currents and monitor live picoammeter measurements."""
 
 from __future__ import annotations
 
@@ -377,12 +377,10 @@ def providePlugins() -> "list[type[Plugin]]":
 
 
 class DMMRDevice(Device):
-    """Expose the CGC DMMR picoammeter as an ESIBD Explorer device plugin."""
+    """Read DMMR module currents and expose live current monitors."""
 
     documentation = (
-        "External ESIBD Explorer plugin for the CGC DMMR picoammeter. "
-        "It bundles the minimal cgc.dmmr runtime it needs, auto-discovers "
-        "installed modules, and exposes measured currents as channel monitors."
+        "Reads DMMR module currents and exposes live picoammeter measurements."
     )
 
     name = "DMMR"
@@ -1514,9 +1512,26 @@ class DMMRController(DeviceController):
         self.transitioning = False
         self.transition_target_on = None
 
-    @staticmethod
-    def _format_exception(exc: Exception) -> str:
+    def _format_exception(self, exc: Exception) -> str:
         message = str(exc).strip()
+        lower_message = message.lower()
+        com_number = _coerce_int(getattr(self.controllerParent, "com", None), 0)
+
+        if "timed out during 'open_port'" in lower_message:
+            hint = (
+                f" Selected COM{com_number} did not respond. Check that the DMMR is "
+                "powered, that the configured COM port is correct, and that no other "
+                "application is holding the port."
+            )
+            message = f"{message}{hint}"
+        elif "open_port failed:" in lower_message and "error opening port" in lower_message:
+            hint = (
+                f" Windows could not open COM{com_number}. The port is likely wrong, "
+                "already in use, or stale after a previous connection failure. Close "
+                "other serial tools and replug or power-cycle the DMMR before retrying."
+            )
+            message = f"{message}{hint}"
+
         if message:
             return f"{type(exc).__name__}: {message}"
         return repr(exc)

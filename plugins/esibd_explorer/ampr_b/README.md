@@ -1,7 +1,6 @@
-# AMPR_B Plugin For ESIBD Explorer
+# AMPR_B Plugin
 
-This plugin exposes the AMPR driver as an external `Device` plugin for ESIBD
-Explorer.
+Drives AMPR_B high-voltage channels and monitors measured output voltages.
 
 The plugin is self-contained: it embeds the minimal private runtime it needs,
 including the AMPR driver files and vendor DLL.

@@ -1,4 +1,4 @@
-"""ESIBD Explorer plugin for the CGC AMPR amplifier."""
+"""Drive AMPR high-voltage channels and monitor measured output voltages."""
 
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ _AMPR_CHANNEL_TOGGLE_MIN_WIDTH = 58
 _AMPR_MONITOR_OK_STYLE = "background-color: #2f855a; color: #ffffff; margin:0px;"
 _AMPR_MONITOR_WARN_STYLE = "background-color: #dd6b20; color: #ffffff; margin:0px;"
 _AMPR_MONITOR_ERROR_STYLE = "background-color: #c53030; color: #ffffff; margin:0px;"
+_AMPR_MONITOR_NEUTRAL_STYLE = ""
 _AMPR_MONITOR_OK_RELATIVE_TOLERANCE = 0.01
 _AMPR_MONITOR_WARN_RELATIVE_TOLERANCE = 0.10
 _AMPR_MONITOR_RELATIVE_FLOOR_V = 1.0
@@ -443,17 +444,10 @@ def providePlugins() -> "list[type[Plugin]]":
 
 
 class AMPRDevice(Device):
-    """Expose the CGC AMPR amplifier as an ESIBD Explorer device plugin.
-
-    The plugin maps each ESIBD channel to one AMPR module address and one AMPR
-    output channel. Channel values are applied as voltage setpoints and the
-    measured channel voltages are exposed as monitors.
-    """
+    """Drive AMPR channels and read back their measured voltages."""
 
     documentation = (
-        "External ESIBD Explorer plugin for the CGC AMPR amplifier. "
-        "It bundles the minimal cgc.ampr runtime it needs, applies channel "
-        "values as module setpoints, and exposes measured voltages as monitors."
+        "Drives AMPR high-voltage channels and monitors measured output voltages."
     )
 
     name = "AMPR_A"
@@ -1339,7 +1333,7 @@ class AMPRChannel(Channel):
         elif state == "error":
             style = _AMPR_MONITOR_ERROR_STYLE
         else:
-            style = getattr(self, "defaultStyleSheet", "") or ""
+            style = _AMPR_MONITOR_NEUTRAL_STYLE
 
         widget.setStyleSheet(style)
         self.warningState = state in {"warn", "error"}

@@ -1,7 +1,6 @@
-# DMMR Plugin For ESIBD Explorer
+# DMMR Plugin
 
-This plugin exposes the `DMMR` driver as an external `Device` plugin for ESIBD
-Explorer.
+Reads DMMR module currents and monitors live picoammeter measurements.
 
 The plugin is self-contained: it embeds the minimal private runtime it needs,
 including the DMMR driver files and vendor DLL.

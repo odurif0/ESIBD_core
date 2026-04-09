@@ -310,6 +310,40 @@ def test_controller_toggle_on_enables_measurement():
     assert controller.acquiring is True
 
 
+def test_controller_formats_open_port_timeout_with_operator_hint():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(com=3)
+    controller = module.DMMRController(parent)
+
+    message = controller._format_exception(
+        RuntimeError(
+            "DMMR DLL call timed out during 'open_port'. "
+            "The device may be powered off or unresponsive. "
+            "The DMMR instance is now marked unusable."
+        )
+    )
+
+    assert "RuntimeError:" in message
+    assert "Selected COM3 did not respond." in message
+    assert "configured COM port is correct" in message
+
+
+def test_controller_formats_open_port_error_with_operator_hint():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(com=3)
+    controller = module.DMMRController(parent)
+
+    message = controller._format_exception(
+        RuntimeError("DMMR open_port failed: -2 (Error opening port)")
+    )
+
+    assert "RuntimeError:" in message
+    assert "Windows could not open COM3." in message
+    assert "already in use" in message
+
+
 def test_controller_update_values_clears_monitor_when_channel_is_disabled():
     module = _load_module()
 
