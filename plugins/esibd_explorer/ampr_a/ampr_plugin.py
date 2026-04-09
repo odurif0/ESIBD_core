@@ -44,6 +44,15 @@ _AMPR_MIN_ROW_HEIGHT = 28
 _AMPR_RAMP_STEP_S = 0.1
 _AMPR_POWER_ON_ICON = "switch-medium_on.png"
 _AMPR_POWER_OFF_ICON = "switch-medium_off.png"
+_AMPR_CHANNEL_ON_LABEL = "HV ON"
+_AMPR_CHANNEL_OFF_LABEL = "HV OFF"
+_AMPR_CHANNEL_TOGGLE_MIN_WIDTH = 58
+_AMPR_MONITOR_OK_STYLE = "background-color: #2f855a; color: #ffffff; margin:0px;"
+_AMPR_MONITOR_WARN_STYLE = "background-color: #dd6b20; color: #ffffff; margin:0px;"
+_AMPR_MONITOR_ERROR_STYLE = "background-color: #c53030; color: #ffffff; margin:0px;"
+_AMPR_MONITOR_OK_RELATIVE_TOLERANCE = 0.01
+_AMPR_MONITOR_WARN_RELATIVE_TOLERANCE = 0.10
+_AMPR_MONITOR_RELATIVE_FLOOR_V = 1.0
 
 
 def _is_nan(value: Any) -> bool:
@@ -1156,10 +1165,12 @@ class AMPRChannel(Channel):
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)
-        self._upgrade_toggle_widget(self.ENABLED, "On", 40)
+        self._upgrade_toggle_widget(self.ENABLED, _AMPR_CHANNEL_ON_LABEL, _AMPR_CHANNEL_TOGGLE_MIN_WIDTH)
         self._upgrade_toggle_widget(self.ACTIVE, "Manual", 72)
         if self.useDisplays:
             self._upgrade_toggle_widget(self.DISPLAY, "Display", 72)
+        self._sync_enabled_toggle_widget()
+        self._sync_monitor_feedback()
         self.scalingChanged()
 
     def scalingChanged(self) -> None:
@@ -1195,22 +1206,7 @@ class AMPRChannel(Channel):
         parameter.value = initial_value
 
     def monitorChanged(self) -> None:
-        self.updateWarningState(
-            self.enabled
-            and self.channelParent.controller.acquiring
-            and (
-                (
-                    self.channelParent.isOn()
-                    and not np.isnan(self.monitor)
-                    and abs(self.monitor - self.value) > 1
-                )
-                or (
-                    not self.channelParent.isOn()
-                    and not np.isnan(self.monitor)
-                    and abs(self.monitor) > 1
-                )
-            )
-        )
+        self._sync_monitor_feedback()
 
     def _channel_log_prefix(self) -> str:
         return (
@@ -1229,6 +1225,7 @@ class AMPRChannel(Channel):
 
     def valueChanged(self) -> None:
         super().valueChanged()
+        self._sync_monitor_feedback()
         self._log_channel_event(f"Voltage setpoint changed to {float(self.value):.3f} V.")
 
     def equationChanged(self) -> None:
@@ -1252,6 +1249,8 @@ class AMPRChannel(Channel):
         super().enabledChanged()
         if not self.enabled:
             self.monitor = np.nan
+        self._sync_enabled_toggle_widget()
+        self._sync_monitor_feedback()
         state = "ON" if self.enabled else "OFF"
         self._log_channel_event(f"Output switched {state}.")
         if not getattr(self.channelParent, "loading", False):
@@ -1263,6 +1262,87 @@ class AMPRChannel(Channel):
         super().updateDisplay()
         state = "ON" if self.display else "OFF"
         self._log_channel_event(f"Display switched {state}.")
+
+    def _enabled_toggle_label(self) -> str:
+        """Return the explicit ON/OFF label used by the channel toggle."""
+        enabled_value = getattr(self, "enabled", None)
+        if enabled_value is None:
+            getter = getattr(self, "getParameterByName", None)
+            if callable(getter):
+                try:
+                    enabled_parameter = getter(getattr(self, "ENABLED", "Enabled"))
+                except Exception:  # noqa: BLE001
+                    enabled_parameter = None
+                enabled_value = getattr(enabled_parameter, "value", False)
+        return _AMPR_CHANNEL_ON_LABEL if bool(enabled_value) else _AMPR_CHANNEL_OFF_LABEL
+
+    def _sync_enabled_toggle_widget(self) -> None:
+        """Keep the per-channel toggle text synchronized with the enabled state."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        try:
+            parameter = getter(getattr(self, "ENABLED", "Enabled"))
+        except Exception:  # noqa: BLE001
+            return
+        widget = getattr(parameter, "check", None)
+        if widget is None or not hasattr(widget, "setText"):
+            return
+        widget.setText(self._enabled_toggle_label())
+
+    def _monitor_feedback_state(self) -> str:
+        """Classify monitor accuracy relative to the current setpoint."""
+        if not getattr(self, "enabled", False) or not getattr(self, "real", True):
+            return "default"
+        if getattr(self, "waitToStabilize", False):
+            return "default"
+
+        channel_parent = getattr(self, "channelParent", None)
+        controller = getattr(channel_parent, "controller", None)
+        if controller is None or not getattr(controller, "acquiring", False):
+            return "default"
+        if not callable(getattr(channel_parent, "isOn", None)) or not channel_parent.isOn():
+            return "default"
+
+        monitor_value = _coerce_float(getattr(self, "monitor", np.nan), np.nan)
+        target_value = _coerce_float(getattr(self, "value", np.nan), np.nan)
+        if _is_nan(monitor_value) or _is_nan(target_value):
+            return "default"
+
+        reference = max(abs(target_value), _AMPR_MONITOR_RELATIVE_FLOOR_V)
+        relative_error = abs(monitor_value - target_value) / reference
+        if relative_error <= _AMPR_MONITOR_OK_RELATIVE_TOLERANCE:
+            return "ok"
+        if relative_error <= _AMPR_MONITOR_WARN_RELATIVE_TOLERANCE:
+            return "warn"
+        return "error"
+
+    def _sync_monitor_feedback(self) -> None:
+        """Apply green/orange/red monitor background based on setpoint tracking accuracy."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        try:
+            parameter = getter(getattr(self, "MONITOR", "Monitor"))
+        except Exception:  # noqa: BLE001
+            return
+        widget_getter = getattr(parameter, "getWidget", None)
+        widget = widget_getter() if callable(widget_getter) else getattr(parameter, "widget", None)
+        if widget is None or not hasattr(widget, "setStyleSheet"):
+            return
+
+        state = self._monitor_feedback_state()
+        if state == "ok":
+            style = _AMPR_MONITOR_OK_STYLE
+        elif state == "warn":
+            style = _AMPR_MONITOR_WARN_STYLE
+        elif state == "error":
+            style = _AMPR_MONITOR_ERROR_STYLE
+        else:
+            style = getattr(self, "defaultStyleSheet", "") or ""
+
+        widget.setStyleSheet(style)
+        self.warningState = state in {"warn", "error"}
 
     def minChanged(self) -> None:
         super().updateMin()

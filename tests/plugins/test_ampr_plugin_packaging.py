@@ -777,13 +777,100 @@ def test_channel_uses_readable_toolbuttons_and_minimum_row_height():
 
     assert channel.super_init_gui_called == {"Name": "dummy"}
     assert channel.rowHeight == 28
-    assert parameters["Enabled"].check.text == "On"
-    assert parameters["Enabled"].check.minimum_width == 40
+    assert parameters["Enabled"].check.text == "HV ON"
+    assert parameters["Enabled"].check.minimum_width == 58
     assert parameters["Enabled"].check.maximum_height == 28
     assert parameters["Enabled"].check.checkable is True
     assert parameters["Active"].check.text == "Manual"
     assert parameters["Display"].check.text == "Display"
     assert channel.tree.layouts == 1
+
+
+def test_channel_enabled_toggle_text_becomes_explicitly_off():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    class FakeWidget:
+        def __init__(self):
+            self.text = None
+
+        def setText(self, text):
+            self.text = text
+
+    class FakeParameter:
+        def __init__(self, widget):
+            self.check = widget
+
+    enabled_widget = FakeWidget()
+    channel = object.__new__(module.AMPRChannel)
+    channel.channelParent = types.SimpleNamespace(
+        loading=False,
+        print=lambda message, flag=None: None,
+    )
+    channel.name = "AMPR_M02_CH3"
+    channel.module = "2"
+    channel.id = "3"
+    channel.enabled = False
+    channel.monitor = 42.0
+    channel.getParameterByName = lambda name: {"Enabled": FakeParameter(enabled_widget)}[name]
+
+    module.AMPRChannel.enabledChanged(channel)
+
+    assert enabled_widget.text == "HV OFF"
+    assert np.isnan(channel.monitor)
+
+
+def test_channel_monitor_feedback_uses_relative_color_bands():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    class FakeWidget:
+        def __init__(self):
+            self.styles = []
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeParameter:
+        def __init__(self, widget):
+            self.widget = widget
+
+        def getWidget(self):
+            return self.widget
+
+    monitor_widget = FakeWidget()
+    channel = object.__new__(module.AMPRChannel)
+    channel.channelParent = types.SimpleNamespace(
+        controller=types.SimpleNamespace(acquiring=True),
+        isOn=lambda: True,
+    )
+    channel.enabled = True
+    channel.real = True
+    channel.waitToStabilize = False
+    channel.value = 100.0
+    channel.monitor = 100.5
+    channel.defaultStyleSheet = "background-color: #123456"
+    channel.warningState = False
+    channel.getParameterByName = lambda name: {"Monitor": FakeParameter(monitor_widget)}[name]
+
+    module.AMPRChannel.monitorChanged(channel)
+    assert "#2f855a" in monitor_widget.styles[-1]
+
+    channel.monitor = 108.0
+    module.AMPRChannel.monitorChanged(channel)
+    assert "#dd6b20" in monitor_widget.styles[-1]
+
+    channel.monitor = 125.0
+    module.AMPRChannel.monitorChanged(channel)
+    assert "#c53030" in monitor_widget.styles[-1]
+
+    channel.monitor = np.nan
+    module.AMPRChannel.monitorChanged(channel)
+    assert monitor_widget.styles[-1] == "background-color: #123456"
 
 
 def test_init_gui_rewires_close_action_to_shutdown():
