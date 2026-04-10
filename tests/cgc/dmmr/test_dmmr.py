@@ -1027,6 +1027,45 @@ def test_shutdown_disables_measurement_before_disconnect(monkeypatch):
     backend.disconnect.assert_called_once_with()
 
 
+def test_set_module_auto_range_uses_timeout_safe_wrapper(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        return backend.NO_ERR
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.set_module_auto_range(3, True, timeout_s=2.0) == backend.NO_ERR
+    assert calls == [
+        ("set_module_auto_range", 2.0, "set_module_auto_range[3]", (backend, 3, True))
+    ]
+
+
+def test_get_module_ready_flags_uses_timeout_safe_wrapper(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        return backend.NO_ERR, backend.MEAS_CUR_RDY
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.get_module_ready_flags(3, timeout_s=2.0) == (
+        backend.NO_ERR,
+        backend.MEAS_CUR_RDY,
+    )
+    assert calls == [
+        ("get_module_ready_flags", 2.0, "get_module_ready_flags[3]", (backend, 3))
+    ]
+
+
 def test_disconnect_keeps_connected_true_when_close_port_fails(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")

@@ -1189,6 +1189,62 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
             "get_current",
         )
 
+    def set_module_meas_range(
+        self,
+        address: int,
+        meas_range: int,
+        timeout_s: Optional[float] = None,
+    ):
+        """Set the measurement range for one DMMR module."""
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            DMMRBase.set_module_meas_range,
+            timeout_s,
+            f"set_module_meas_range[{int(address)}]",
+            self,
+            int(address),
+            int(meas_range),
+        )
+
+    def set_module_auto_range(
+        self,
+        address: int,
+        auto_range: bool,
+        timeout_s: Optional[float] = None,
+    ):
+        """Enable or disable automatic range switching for one DMMR module."""
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            DMMRBase.set_module_auto_range,
+            timeout_s,
+            f"set_module_auto_range[{int(address)}]",
+            self,
+            int(address),
+            bool(auto_range),
+        )
+
+    def get_module_meas_range(self, address: int, timeout_s: Optional[float] = None):
+        """Return the measurement range state for one DMMR module."""
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            DMMRBase.get_module_meas_range,
+            timeout_s,
+            f"get_module_meas_range[{int(address)}]",
+            self,
+            int(address),
+        )
+
+    def get_module_ready_flags(self, address: int, timeout_s: Optional[float] = None):
+        """Return ready flags for one DMMR module."""
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            DMMRBase.get_module_ready_flags,
+            timeout_s,
+            f"get_module_ready_flags[{int(address)}]",
+            self,
+            int(address),
+        )
+
     def get_module_current(self, address: int, timeout_s: Optional[float] = None):
         """Return the current measurement for one DMMR module."""
         timeout_s = self._resolve_io_timeout(timeout_s)

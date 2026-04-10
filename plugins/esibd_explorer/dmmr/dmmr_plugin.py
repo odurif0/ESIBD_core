@@ -1343,6 +1343,8 @@ class DMMRController(DeviceController):
         poll_modules = self._measurement_modules()
 
         for module in poll_modules:
+            status = None
+            measured_current = np.nan
             try:
                 with self._controller_lock_section(
                     f"Could not acquire lock to read DMMR module {module}.",
@@ -1380,7 +1382,7 @@ class DMMRController(DeviceController):
                 )
                 continue
 
-            if status == getattr(self.device, "NO_ERR", status):
+            if status == getattr(device, "NO_ERR", status):
                 new_values[module] = float(measured_current)
                 continue
 
