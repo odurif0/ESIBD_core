@@ -496,6 +496,14 @@ class DMMRDevice(Device):
         finally:
             action.blockSignals(False)
 
+    def _display_main_state(self) -> str:
+        """Return the operator-facing state shown in the toolbar badge."""
+        raw_state = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
+        is_on = getattr(self, "isOn", None)
+        if raw_state != "Disconnected" and callable(is_on) and not bool(is_on()):
+            return "OFF"
+        return raw_state
+
     def _ensure_status_widgets(self) -> None:
         """Add compact global DMMR status labels to the plugin toolbar."""
         if (
@@ -528,9 +536,11 @@ class DMMRDevice(Device):
 
     def _status_badge_style(self) -> str:
         """Return a compact badge style that reflects the DMMR main state."""
-        state = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
+        state = self._display_main_state()
         if state == "ST_ON":
             background = "#2f855a"
+        elif state == "OFF":
+            background = "#4a5568"
         elif state == "ST_STBY":
             background = "#b7791f"
         elif state == "Disconnected":
@@ -564,15 +574,20 @@ class DMMRDevice(Device):
 
     def _status_tooltip_text(self) -> str:
         """Return the full DMMR status tooltip for the toolbar widgets."""
-        return "\n".join(
+        display_state = self._display_main_state()
+        hardware_state = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
+        lines = [f"State: {display_state}"]
+        if display_state != hardware_state:
+            lines.append(f"Hardware state: {hardware_state}")
+        lines.extend(
             (
-                f"State: {getattr(self, 'main_state', 'Disconnected') or 'Disconnected'}",
                 f"Modules: {getattr(self, 'detected_modules', '') or 'None'}",
                 f"Faults: {getattr(self, 'device_state_summary', '') or 'n/a'}",
                 f"Voltage rails: {getattr(self, 'voltage_state_summary', '') or 'n/a'}",
                 f"Temperature: {getattr(self, 'temperature_state_summary', '') or 'n/a'}",
             )
         )
+        return "\n".join(lines)
 
     def _update_status_widgets(self) -> None:
         """Refresh the global DMMR status labels in the toolbar."""
@@ -582,7 +597,7 @@ class DMMRDevice(Device):
         if badge is None or summary is None:
             return
 
-        badge_text = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
+        badge_text = self._display_main_state()
         summary_text = self._status_summary_text()
         tooltip = self._status_tooltip_text()
 
@@ -943,6 +958,7 @@ class DMMRDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._update_status_widgets()
 
     def setOn(self, on: "bool | None" = None) -> None:
         """Toggle the DMMR without relying on a channel apply path."""
@@ -966,6 +982,7 @@ class DMMRDevice(Device):
         if on is not None and hasattr(self, "onAction") and self.onAction.state is not on:
             self.onAction.state = on
         self._sync_local_on_action()
+        self._update_status_widgets()
         if getattr(self, "loading", False):
             return
 
@@ -1014,15 +1031,11 @@ class DMMRChannel(Channel):
         super().setDisplayedParameters()
         if self.OPTIMIZE in self.displayedParameters:
             self.displayedParameters.remove(self.OPTIMIZE)
-        if self.ACTIVE in self.displayedParameters:
-            self.displayedParameters.remove(self.ACTIVE)
         self.displayedParameters.append(self.MODULE)
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)
         self._upgrade_toggle_widget(self.ENABLED, "Read", 52)
-        if self.useDisplays:
-            self._upgrade_toggle_widget(self.DISPLAY, "Display", 72)
         self.scalingChanged()
 
     def scalingChanged(self) -> None:
@@ -1192,7 +1205,8 @@ class DMMRController(DeviceController):
         for module in poll_modules:
             try:
                 with self._controller_lock_section(
-                    f"Could not acquire lock to read DMMR module {module}."
+                    f"Could not acquire lock to read DMMR module {module}.",
+                    already_acquired=True,
                 ):
                     device = self.device
                     if device is None:
@@ -1325,6 +1339,7 @@ class DMMRController(DeviceController):
             )
         finally:
             self._end_transition()
+            self._sync_status_to_gui()
 
     def closeCommunication(self) -> None:
         base_close = getattr(super(), "closeCommunication", None)
@@ -1480,11 +1495,31 @@ class DMMRController(DeviceController):
             sync_local()
 
     @contextlib.contextmanager
-    def _controller_lock_section(self, timeout_message: str):
+    def _controller_lock_section(
+        self,
+        timeout_message: str,
+        *,
+        already_acquired: bool = False,
+    ):
         """Acquire the controller lock without swallowing hardware exceptions."""
+        acquire_timeout = getattr(self.lock, "acquire_timeout", None)
+        if callable(acquire_timeout):
+            with acquire_timeout(
+                1,
+                timeoutMessage=timeout_message,
+                already_acquired=already_acquired,
+            ) as lock_acquired:
+                if not lock_acquired:
+                    raise TimeoutError(timeout_message)
+                yield
+            return
+
         acquire = getattr(self.lock, "acquire", None)
         release = getattr(self.lock, "release", None)
         if callable(acquire) and callable(release):
+            if already_acquired:
+                yield
+                return
             if not acquire(timeout=1):
                 self.print(timeout_message, flag=PRINT.ERROR)
                 raise TimeoutError(timeout_message)

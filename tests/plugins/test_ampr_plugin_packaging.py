@@ -732,7 +732,7 @@ def test_channel_enabled_change_forces_apply_even_without_setpoint_change():
     assert applies == [True]
 
 
-def test_channel_uses_readable_toolbuttons_and_minimum_row_height():
+def test_channel_keeps_display_checkbox_and_explicit_toggle_buttons():
     _clear_test_modules()
     _install_esibd_stubs()
 
@@ -760,12 +760,15 @@ def test_channel_uses_readable_toolbuttons_and_minimum_row_height():
         def scheduleDelayedItemsLayout(self):
             self.layouts += 1
 
+    original_display_widget = object()
     channel = object.__new__(module.AMPRChannel)
     parameters = {
         "Enabled": FakeParameter(True),
         "Active": FakeParameter(False),
         "Display": FakeParameter(True),
     }
+    parameters["Display"].widget = original_display_widget
+    parameters["Display"].check = original_display_widget
     channel.parameters = list(parameters.values())
     channel.rowHeight = 18
     channel.loading = False
@@ -782,7 +785,7 @@ def test_channel_uses_readable_toolbuttons_and_minimum_row_height():
     assert parameters["Enabled"].check.maximum_height == 28
     assert parameters["Enabled"].check.checkable is True
     assert parameters["Active"].check.text == "Manual"
-    assert parameters["Display"].check.text == "Display"
+    assert parameters["Display"].check is original_display_widget
     assert channel.tree.layouts == 1
 
 

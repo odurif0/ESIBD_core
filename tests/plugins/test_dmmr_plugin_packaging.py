@@ -289,3 +289,79 @@ def test_dmmr_toggle_recording_rejects_unready_device():
     assert device.printed == [
         ("Cannot start DMMR data acquisition: state is ST_STBY.", module.PRINT.WARNING)
     ]
+
+
+def test_dmmr_channel_keeps_active_parameter_for_core_init():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    channel = object.__new__(module.DMMRChannel)
+    original_set_displayed = getattr(module.Channel, "setDisplayedParameters", None)
+    module.Channel.setDisplayedParameters = lambda self: setattr(
+        self,
+        "displayedParameters",
+        ["Collapse", "Enabled", "Name", "Value", "Display", "Active", "Real", "Optimize"],
+    )
+    try:
+        module.DMMRChannel.setDisplayedParameters(channel)
+    finally:
+        if original_set_displayed is None:
+            delattr(module.Channel, "setDisplayedParameters")
+        else:
+            module.Channel.setDisplayedParameters = original_set_displayed
+
+    assert "Active" in channel.displayedParameters
+    assert channel.displayedParameters[-1] == "Module"
+
+
+def test_dmmr_status_badge_shows_off_when_ui_is_off():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    device = object.__new__(module.DMMRDevice)
+    device.main_state = "ST_ON"
+    device.detected_modules = "3"
+    device.device_state_summary = "DEVICE_OK"
+    device.voltage_state_summary = "VS_3V3_OK"
+    device.temperature_state_summary = "TEMPERATURE_OK"
+    device.isOn = lambda: False
+
+    assert module.DMMRDevice._display_main_state(device) == "OFF"
+    tooltip = module.DMMRDevice._status_tooltip_text(device)
+    assert "State: OFF" in tooltip
+    assert "Hardware state: ST_ON" in tooltip
+
+
+def test_dmmr_channel_keeps_display_widget_default():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    channel = object.__new__(module.DMMRChannel)
+    channel.useDisplays = True
+    channel.scalingChanged = lambda: setattr(channel, "scaling_changed", True)
+    upgrade_calls = []
+    channel._upgrade_toggle_widget = (
+        lambda parameter_name, label, minimum_width: upgrade_calls.append(
+            (parameter_name, label, minimum_width)
+        )
+    )
+
+    original_init_gui = getattr(module.Channel, "initGUI", None)
+    module.Channel.initGUI = lambda self, item: setattr(self, "super_init_gui_called", item)
+    try:
+        module.DMMRChannel.initGUI(channel, {"Name": "dummy"})
+    finally:
+        if original_init_gui is None:
+            delattr(module.Channel, "initGUI")
+        else:
+            module.Channel.initGUI = original_init_gui
+
+    assert channel.super_init_gui_called == {"Name": "dummy"}
+    assert upgrade_calls == [("Enabled", "Read", 52)]
+    assert channel.scaling_changed is True

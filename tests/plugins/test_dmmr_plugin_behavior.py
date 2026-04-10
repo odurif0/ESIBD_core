@@ -310,6 +310,148 @@ def test_controller_toggle_on_enables_measurement():
     assert controller.acquiring is True
 
 
+def test_controller_toggle_off_syncs_status_back_to_gui():
+    module = _load_module()
+    calls = []
+    sync_calls = []
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def set_enable(self, enabled, timeout_s=None):
+            calls.append(("set_enable", enabled, timeout_s))
+            return self.NO_ERR
+
+        def set_automatic_current(self, enabled, timeout_s=None):
+            calls.append(("set_automatic_current", enabled, timeout_s))
+            return self.NO_ERR
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def format_status(self, status):
+            return str(status)
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.0,
+        isOn=lambda: False,
+        _update_status_widgets=lambda: sync_calls.append("sync"),
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.detected_modules_text = "3"
+
+    controller.toggleOn()
+
+    assert calls == [
+        ("set_automatic_current", False, 7.0),
+        ("set_enable", False, 7.0),
+    ]
+    assert parent.main_state == "ST_ON"
+    assert sync_calls == ["sync"]
+
+
+def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
+    module = _load_module()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def get_module_current(self, module, timeout_s=None):
+            self.calls.append((module, timeout_s))
+            return self.NO_ERR, 3.2e-12, 13
+
+    class FakeTimeoutLock:
+        def __init__(self):
+            self.calls = []
+
+        class _Section:
+            def __init__(self, owner, timeout, timeout_message, already_acquired):
+                self.owner = owner
+                self.payload = (timeout, timeout_message, already_acquired)
+
+            def __enter__(self):
+                self.owner.calls.append(self.payload)
+                return True
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def acquire_timeout(self, timeout, timeoutMessage="", already_acquired=False):
+            return self._Section(self, timeout, timeoutMessage, already_acquired)
+
+    class FakeChannel:
+        def __init__(self, module):
+            self._module = module
+            self.real = True
+            self.enabled = True
+
+        def module_address(self):
+            return self._module
+
+    device = FakeDevice()
+    lock = FakeTimeoutLock()
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        isOn=lambda: True,
+        getChannels=lambda: [FakeChannel(3)],
+        getConfiguredModules=lambda: [3],
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = device
+    controller.lock = lock
+    controller.initialized = True
+    controller.detected_module_ids = [3]
+
+    controller.readNumbers()
+
+    assert lock.calls[0] == (
+        1,
+        "Could not acquire lock to read DMMR module 3.",
+        True,
+    )
+    assert device.calls == [(3, 2.5)]
+    assert controller.values == {3: 3.2e-12}
+
+
 def test_controller_formats_open_port_timeout_with_operator_hint():
     module = _load_module()
 

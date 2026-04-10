@@ -1161,8 +1161,6 @@ class AMPRChannel(Channel):
         super().initGUI(item)
         self._upgrade_toggle_widget(self.ENABLED, _AMPR_CHANNEL_ON_LABEL, _AMPR_CHANNEL_TOGGLE_MIN_WIDTH)
         self._upgrade_toggle_widget(self.ACTIVE, "Manual", 72)
-        if self.useDisplays:
-            self._upgrade_toggle_widget(self.DISPLAY, "Display", 72)
         self._sync_enabled_toggle_widget()
         self._sync_monitor_feedback()
         self.scalingChanged()
