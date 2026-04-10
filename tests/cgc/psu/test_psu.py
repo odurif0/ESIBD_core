@@ -206,7 +206,10 @@ def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(m
     monkeypatch.setattr(psu, "set_device_enabled", Mock())
     monkeypatch.setattr(psu, "disconnect", Mock(return_value=True))
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(
+        RuntimeError,
+        match="set_output_enabled\\(False, False\\): boom",
+    ):
         psu.shutdown()
 
     psu.set_channel_current.assert_any_call(0, 0.0)
@@ -214,8 +217,8 @@ def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(m
     psu.set_channel_voltage.assert_any_call(0, 0.0)
     psu.set_channel_voltage.assert_any_call(1, 0.0)
     psu.set_output_enabled.assert_called_once_with(False, False)
-    psu.set_device_enabled.assert_not_called()
-    psu.disconnect.assert_not_called()
+    psu.set_device_enabled.assert_called_once_with(False)
+    psu.disconnect.assert_called_once()
 
 
 def test_shutdown_zeros_setpoints_before_disabling_outputs_and_device(monkeypatch):
@@ -260,6 +263,32 @@ def test_shutdown_zeros_setpoints_before_disabling_outputs_and_device(monkeypatc
         ("device", False),
         ("disconnect",),
     ]
+
+
+@pytest.mark.parametrize("voltage_v", [float("nan"), float("inf"), -float("inf")])
+def test_set_channel_voltage_rejects_non_finite_values(monkeypatch, voltage_v):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    call_locked = Mock()
+    monkeypatch.setattr(psu, "_call_locked", call_locked)
+
+    with pytest.raises(ValueError, match="voltage must be finite"):
+        psu.set_channel_voltage(0, voltage_v)
+
+    call_locked.assert_not_called()
+
+
+@pytest.mark.parametrize("current_a", [float("nan"), float("inf"), -float("inf")])
+def test_set_channel_current_rejects_non_finite_values(monkeypatch, current_a):
+    psu, _dll = make_psu(monkeypatch)
+    psu.connected = True
+    call_locked = Mock()
+    monkeypatch.setattr(psu, "_call_locked", call_locked)
+
+    with pytest.raises(ValueError, match="current must be finite"):
+        psu.set_channel_current(0, current_a)
+
+    call_locked.assert_not_called()
 
 
 def test_shutdown_rejects_standby_config_when_disable_flags_are_enabled(monkeypatch):
@@ -606,3 +635,140 @@ def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
     }
     assert snapshot["channels"][1]["label"] == "negative"
     assert snapshot["channels"][1]["enabled"] is False
+
+
+def test_psu_critical_operations_use_timeout_safe_wrapper(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "set_psu_output_voltage":
+            return backend.NO_ERR
+        if method.__name__ == "set_psu_output_current":
+            return backend.NO_ERR
+        if method.__name__ == "set_psu_enable":
+            return backend.NO_ERR
+        if method.__name__ == "set_device_enable":
+            return backend.NO_ERR
+        if method.__name__ == "close_port":
+            return backend.NO_ERR
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    backend.set_channel_voltage(0, 25.0, timeout_s=3.0)
+    backend.set_channel_current(1, 0.5, timeout_s=4.0)
+    backend.set_output_enabled(True, False, timeout_s=6.0)
+    backend.set_device_enabled(True, timeout_s=7.0)
+    assert backend.disconnect(timeout_s=8.0) is True
+
+    assert calls == [
+        ("set_psu_output_voltage", 3.0, "set_psu_output_voltage[0]", (backend, 0, 25.0)),
+        ("set_psu_output_current", 4.0, "set_psu_output_current[1]", (backend, 1, 0.5)),
+        ("set_psu_enable", 6.0, "set_psu_enable", (backend, True, False)),
+        ("set_device_enable", 7.0, "set_device_enable", (backend, True)),
+        ("close_port", 8.0, "close_port", ()),
+    ]
+
+
+def test_psu_product_info_and_housekeeping_use_batch_timeout_wrapper(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "_get_product_info_unlocked":
+            return {"product_no": 350}
+        if method.__name__ == "_collect_housekeeping_unlocked":
+            return {"device_enabled": True}
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.get_product_info(timeout_s=3.0) == {"product_no": 350}
+    assert backend.collect_housekeeping(timeout_s=3.0) == {"device_enabled": True}
+    assert calls == [
+        ("_get_product_info_unlocked", 11.0, "get_product_info", ()),
+        ("_collect_housekeeping_unlocked", 20.0, "collect_housekeeping", ()),
+    ]
+
+
+def test_psu_interlock_access_uses_timeout_safe_wrapper(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "get_interlock_enable":
+            return backend.NO_ERR, True, False
+        if method.__name__ == "set_interlock_enable":
+            return backend.NO_ERR
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.get_interlock_enabled(timeout_s=2.5) == (True, False)
+    backend.set_interlock_enabled(True, False, timeout_s=2.5)
+
+    assert calls == [
+        ("get_interlock_enable", 2.5, "get_interlock_enable", (backend,)),
+        ("set_interlock_enable", 2.5, "set_interlock_enable", (backend, True, False)),
+    ]
+
+
+def test_shutdown_forwards_explicit_timeout_to_each_best_effort_step(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    calls = []
+
+    monkeypatch.setattr(
+        backend,
+        "set_channel_current",
+        lambda channel, current, timeout_s=None: calls.append(
+            ("current", channel, current, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_channel_voltage",
+        lambda channel, voltage, timeout_s=None: calls.append(
+            ("voltage", channel, voltage, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_output_enabled",
+        lambda psu0, psu1, timeout_s=None: calls.append(
+            ("outputs", psu0, psu1, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_device_enabled",
+        lambda enabled, timeout_s=None: calls.append(("device", enabled, timeout_s)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "disconnect",
+        lambda timeout_s=None: calls.append(("disconnect", timeout_s)) or True,
+    )
+
+    assert backend.shutdown(timeout_s=7.0) is True
+
+    assert calls == [
+        ("current", 0, 0.0, 7.0),
+        ("current", 1, 0.0, 7.0),
+        ("voltage", 0, 0.0, 7.0),
+        ("voltage", 1, 0.0, 7.0),
+        ("outputs", False, False, 7.0),
+        ("device", False, 7.0),
+        ("disconnect", 7.0),
+    ]

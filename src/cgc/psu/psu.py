@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,7 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         PSUBase.PSU_POS: "positive",
         PSUBase.PSU_NEG: "negative",
     }
+    _DEFAULT_IO_TIMEOUT_S = 5.0
     _COMPAT_OPTIONAL_STATUSES = frozenset(
         {
             PSUBase.ERR_COMMAND_RECEIVE,
@@ -88,6 +90,68 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
     def _raise_on_status(self, status: int, action: str):
         if status != self.NO_ERR:
             raise RuntimeError(f"PSU {action} failed: {self.format_status(status)}")
+
+    def _resolve_io_timeout(self, timeout_s: Optional[float] = None) -> float:
+        if timeout_s is None:
+            return self._DEFAULT_IO_TIMEOUT_S
+        timeout_s = float(timeout_s)
+        if timeout_s <= 0:
+            raise ValueError("PSU timeout_s must be greater than 0.")
+        return timeout_s
+
+    def _resolve_batch_timeout(
+        self,
+        timeout_s: Optional[float],
+        *,
+        multiplier: float,
+        additive: float = 0.0,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        batch_timeout = (
+            self._resolve_io_timeout(timeout_s) * float(multiplier)
+        ) + float(additive)
+        if minimum is not None:
+            batch_timeout = max(batch_timeout, float(minimum))
+        if maximum is not None:
+            batch_timeout = min(batch_timeout, float(maximum))
+        return batch_timeout
+
+    def _coerce_finite_setpoint(self, value: float, quantity: str) -> float:
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"PSU {quantity} must be a real number, got {value!r}."
+            ) from exc
+        if not math.isfinite(numeric_value):
+            raise ValueError(
+                f"PSU {quantity} must be finite, got {numeric_value!r}."
+            )
+        return numeric_value
+
+    @staticmethod
+    def _call_with_optional_timeout(method, *args, timeout_s: Optional[float] = None):
+        if timeout_s is None:
+            return method(*args)
+        return method(*args, timeout_s=timeout_s)
+
+    def _append_shutdown_error(
+        self,
+        errors: list[tuple[str, BaseException]],
+        step: str,
+        exc: BaseException,
+    ) -> None:
+        self.logger.error(f"PSU shutdown step failed during {step}: {exc}")
+        errors.append((step, exc))
+
+    def _raise_shutdown_errors(self, errors: list[tuple[str, BaseException]]) -> None:
+        if not errors:
+            return
+        details = "; ".join(f"{step}: {exc}" for step, exc in errors)
+        raise RuntimeError(
+            f"PSU shutdown completed with {len(errors)} error(s): {details}"
+        ) from errors[0][1]
 
     def _warn_if_unexpected_product_id(self):
         try:
@@ -171,10 +235,11 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             self.connected = False
             raise
 
-    def disconnect(self) -> bool:
+    def disconnect(self, timeout_s: Optional[float] = None) -> bool:
         """Disconnect from the PSU device."""
         was_connected = self.connected
         self.connected = False
+        timeout_s = self._resolve_io_timeout(timeout_s)
 
         try:
             if self._transport_poisoned:
@@ -191,7 +256,11 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                 return True
 
             self.logger.info(f"Disconnecting PSU device {self.device_id}")
-            status = self._call_locked(super().close_port)
+            status = self._call_locked_with_timeout(
+                super().close_port,
+                timeout_s,
+                "close_port",
+            )
             if status == self.NO_ERR:
                 self._set_port_claimed(False)
                 self.logger.info(
@@ -296,81 +365,225 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             )
         return configs
 
-    def load_config(self, config_number: int) -> None:
+    def load_config(self, config_number: int, timeout_s: Optional[float] = None) -> None:
         """Load and apply one PSU configuration stored in controller NVM."""
         self._require_connected()
         self.logger.info(f"Loading PSU config {config_number}")
-        status = self._call_locked(PSUBase.load_current_config, self, config_number)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.load_current_config,
+            timeout_s,
+            "load_current_config",
+            self,
+            config_number,
+        )
         self._raise_on_status(status, f"load_current_config({config_number})")
 
-    def set_device_enabled(self, enable: bool) -> None:
+    def set_device_enabled(
+        self,
+        enable: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set the PSU device enable flag."""
         self._require_connected()
-        status = self._call_locked(PSUBase.set_device_enable, self, enable)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_device_enable,
+            timeout_s,
+            "set_device_enable",
+            self,
+            enable,
+        )
         self._raise_on_status(status, f"set_device_enable({enable})")
 
-    def get_device_enabled(self) -> bool:
+    def get_device_enabled(self, timeout_s: Optional[float] = None) -> bool:
         """Return the PSU device enable flag."""
         self._require_connected()
-        status, enabled = self._call_locked(PSUBase.get_device_enable, self)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, enabled = self._call_locked_with_timeout(
+            PSUBase.get_device_enable,
+            timeout_s,
+            "get_device_enable",
+            self,
+        )
         self._raise_on_status(status, "get_device_enable")
         return enabled
 
-    def set_output_enabled(self, psu0: bool, psu1: bool) -> None:
+    def set_output_enabled(
+        self,
+        psu0: bool,
+        psu1: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set the two PSU channel enable flags."""
         self._require_connected()
-        status = self._call_locked(PSUBase.set_psu_enable, self, psu0, psu1)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_psu_enable,
+            timeout_s,
+            "set_psu_enable",
+            self,
+            psu0,
+            psu1,
+        )
         self._raise_on_status(status, f"set_psu_enable({psu0}, {psu1})")
 
-    def get_output_enabled(self) -> tuple[bool, bool]:
+    def get_output_enabled(self, timeout_s: Optional[float] = None) -> tuple[bool, bool]:
         """Return the two PSU channel enable flags."""
         self._require_connected()
-        return self._call_locked(self._get_output_enabled_unlocked)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            self._get_output_enabled_unlocked,
+            timeout_s,
+            "get_output_enabled",
+        )
 
-    def set_channel_voltage(self, channel: int, voltage_v: float) -> None:
+    def set_interlock_enabled(
+        self,
+        connector_output: bool,
+        connector_bnc: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Set interlock enable flags for the output and BNC connectors."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_interlock_enable,
+            timeout_s,
+            "set_interlock_enable",
+            self,
+            connector_output,
+            connector_bnc,
+        )
+        self._raise_on_status(
+            status,
+            f"set_interlock_enable({connector_output}, {connector_bnc})",
+        )
+
+    def get_interlock_enabled(
+        self,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[bool, bool]:
+        """Return interlock enable flags for the output and BNC connectors."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, connector_output, connector_bnc = self._call_locked_with_timeout(
+            PSUBase.get_interlock_enable,
+            timeout_s,
+            "get_interlock_enable",
+            self,
+        )
+        self._raise_on_status(status, "get_interlock_enable")
+        return connector_output, connector_bnc
+
+    def set_channel_voltage(
+        self,
+        channel: int,
+        voltage_v: float,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set one PSU channel output voltage in volts."""
         self._require_connected()
-        status = self._call_locked(
-            PSUBase.set_psu_output_voltage, self, channel, voltage_v
+        voltage_v = self._coerce_finite_setpoint(voltage_v, "voltage")
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_psu_output_voltage,
+            timeout_s,
+            f"set_psu_output_voltage[{channel}]",
+            self,
+            channel,
+            voltage_v,
         )
         self._raise_on_status(status, f"set_psu_output_voltage({channel}, {voltage_v})")
 
-    def get_channel_voltage(self, channel: int) -> float:
+    def get_channel_voltage(
+        self,
+        channel: int,
+        timeout_s: Optional[float] = None,
+    ) -> float:
         """Return one PSU channel output voltage in volts."""
         self._require_connected()
-        status, voltage = self._call_locked(PSUBase.get_psu_output_voltage, self, channel)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, voltage = self._call_locked_with_timeout(
+            PSUBase.get_psu_output_voltage,
+            timeout_s,
+            f"get_psu_output_voltage[{channel}]",
+            self,
+            channel,
+        )
         self._raise_on_status(status, f"get_psu_output_voltage({channel})")
         return voltage
 
-    def get_channel_voltage_limits(self, channel: int) -> tuple[float, float]:
+    def get_channel_voltage_limits(
+        self,
+        channel: int,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[float, float]:
         """Return the requested and limit voltages for one channel."""
         self._require_connected()
-        status, setpoint, limit = self._call_locked(
-            PSUBase.get_psu_set_output_voltage, self, channel
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, setpoint, limit = self._call_locked_with_timeout(
+            PSUBase.get_psu_set_output_voltage,
+            timeout_s,
+            f"get_psu_set_output_voltage[{channel}]",
+            self,
+            channel,
         )
         self._raise_on_status(status, f"get_psu_set_output_voltage({channel})")
         return setpoint, limit
 
-    def set_channel_current(self, channel: int, current_a: float) -> None:
+    def set_channel_current(
+        self,
+        channel: int,
+        current_a: float,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set one PSU channel output current in amperes."""
         self._require_connected()
-        status = self._call_locked(
-            PSUBase.set_psu_output_current, self, channel, current_a
+        current_a = self._coerce_finite_setpoint(current_a, "current")
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_psu_output_current,
+            timeout_s,
+            f"set_psu_output_current[{channel}]",
+            self,
+            channel,
+            current_a,
         )
         self._raise_on_status(status, f"set_psu_output_current({channel}, {current_a})")
 
-    def get_channel_current(self, channel: int) -> float:
+    def get_channel_current(
+        self,
+        channel: int,
+        timeout_s: Optional[float] = None,
+    ) -> float:
         """Return one PSU channel output current in amperes."""
         self._require_connected()
-        status, current = self._call_locked(PSUBase.get_psu_output_current, self, channel)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, current = self._call_locked_with_timeout(
+            PSUBase.get_psu_output_current,
+            timeout_s,
+            f"get_psu_output_current[{channel}]",
+            self,
+            channel,
+        )
         self._raise_on_status(status, f"get_psu_output_current({channel})")
         return current
 
-    def get_channel_current_limits(self, channel: int) -> tuple[float, float]:
+    def get_channel_current_limits(
+        self,
+        channel: int,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[float, float]:
         """Return the requested and limit currents for one channel."""
         self._require_connected()
-        status, setpoint, limit = self._call_locked(
-            PSUBase.get_psu_set_output_current, self, channel
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, setpoint, limit = self._call_locked_with_timeout(
+            PSUBase.get_psu_set_output_current,
+            timeout_s,
+            f"get_psu_set_output_current[{channel}]",
+            self,
+            channel,
         )
         self._raise_on_status(status, f"get_psu_set_output_current({channel})")
         return setpoint, limit
@@ -396,10 +609,20 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             },
         }
 
-    def get_product_info(self) -> dict:
+    def get_product_info(self, timeout_s: Optional[float] = None) -> dict:
         """Return stable product, firmware and hardware metadata."""
         self._require_connected()
-        return self._call_locked(self._get_product_info_unlocked)
+        return self._call_locked_with_timeout(
+            self._get_product_info_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=2.0,
+                additive=5.0,
+                minimum=10.0,
+                maximum=20.0,
+            ),
+            "get_product_info",
+        )
 
     def _collect_housekeeping_unlocked(self) -> dict:
         main_status, main_state_hex, main_state_name = PSUBase.get_main_state(self)
@@ -518,17 +741,52 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             "channels": channels,
         }
 
-    def collect_housekeeping(self) -> dict:
+    def collect_housekeeping(self, timeout_s: Optional[float] = None) -> dict:
         """Return a structured runtime snapshot suitable for monitoring."""
         self._require_connected()
-        return self._call_locked(self._collect_housekeeping_unlocked)
+        return self._call_locked_with_timeout(
+            self._collect_housekeeping_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=3.0,
+                additive=10.0,
+                minimum=20.0,
+                maximum=60.0,
+            ),
+            "collect_housekeeping",
+        )
 
-    def _zero_output_setpoints(self) -> None:
+    def _zero_output_setpoints(
+        self,
+        timeout_s: Optional[float] = None,
+    ) -> list[tuple[str, BaseException]]:
         """Drive both channel current and voltage setpoints to zero."""
+        errors: list[tuple[str, BaseException]] = []
         for channel in range(self.PSU_NUM):
-            self.set_channel_current(channel, 0.0)
+            try:
+                self._call_with_optional_timeout(
+                    self.set_channel_current,
+                    channel,
+                    0.0,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(
+                    errors, f"set_channel_current({channel}, 0.0)", exc
+                )
         for channel in range(self.PSU_NUM):
-            self.set_channel_voltage(channel, 0.0)
+            try:
+                self._call_with_optional_timeout(
+                    self.set_channel_voltage,
+                    channel,
+                    0.0,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(
+                    errors, f"set_channel_voltage({channel}, 0.0)", exc
+                )
+        return errors
 
     def shutdown(
         self,
@@ -536,8 +794,10 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         standby_config: int | None = None,
         disable_outputs: bool = True,
         disable_device: bool = True,
+        timeout_s: Optional[float] = None,
     ) -> bool:
         """Disable the PSU or load an explicit standby config, then disconnect."""
+        errors: list[tuple[str, BaseException]] = []
         if standby_config is not None and (disable_outputs or disable_device):
             raise ValueError(
                 "standby_config cannot be combined with disable_outputs or "
@@ -546,14 +806,53 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             )
 
         if self.connected and standby_config is not None:
-            self.load_config(standby_config)
+            try:
+                self._call_with_optional_timeout(
+                    self.load_config,
+                    standby_config,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(
+                    errors, f"load_config({standby_config})", exc
+                )
         if self.connected and (disable_outputs or disable_device):
-            self._zero_output_setpoints()
+            errors.extend(self._zero_output_setpoints(timeout_s=timeout_s))
         if self.connected and disable_outputs:
-            self.set_output_enabled(False, False)
+            try:
+                self._call_with_optional_timeout(
+                    self.set_output_enabled,
+                    False,
+                    False,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(
+                    errors, "set_output_enabled(False, False)", exc
+                )
         if self.connected and disable_device:
-            self.set_device_enabled(False)
-        return self.disconnect()
+            try:
+                self._call_with_optional_timeout(
+                    self.set_device_enabled,
+                    False,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(errors, "set_device_enabled(False)", exc)
+
+        disconnected = self._call_with_optional_timeout(
+            self.disconnect,
+            timeout_s=timeout_s,
+        )
+        if not disconnected:
+            self._append_shutdown_error(
+                errors,
+                "disconnect()",
+                RuntimeError("PSU disconnect failed during shutdown."),
+            )
+
+        self._raise_shutdown_errors(errors)
+        return disconnected
 
 
 class PSU(ProcessIsolatedClientMixin):

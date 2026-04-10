@@ -344,6 +344,25 @@ class PSUBase:
             self.port, self.WIN_BOOL(int(bool(enable)))
         )
 
+    def get_interlock_enable(self):
+        """Get the interlock enable state for output and BNC connectors."""
+        connector_output = self.WIN_BOOL()
+        connector_bnc = self.WIN_BOOL()
+        status = self.psu_dll.COM_HVPSU2D_GetInterlockEnable(
+            self.port,
+            ctypes.byref(connector_output),
+            ctypes.byref(connector_bnc),
+        )
+        return status, bool(connector_output.value), bool(connector_bnc.value)
+
+    def set_interlock_enable(self, connector_output: bool, connector_bnc: bool) -> int:
+        """Set the interlock enable state for output and BNC connectors."""
+        return self.psu_dll.COM_HVPSU2D_SetInterlockEnable(
+            self.port,
+            self.WIN_BOOL(int(bool(connector_output))),
+            self.WIN_BOOL(int(bool(connector_bnc))),
+        )
+
     def get_psu_enable(self):
         """Get the channel enable flags."""
         psu0 = self.WIN_BOOL()

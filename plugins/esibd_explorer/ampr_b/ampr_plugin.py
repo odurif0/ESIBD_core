@@ -109,6 +109,16 @@ def _compact_status_text(value: Any, default: str = "n/a") -> str:
     return f"{parts[0]} +{len(parts) - 1}"
 
 
+def _action_label(action: Any) -> str:
+    """Extract a stable label from QAction-like objects and test doubles."""
+    for attr_name in ("toolTip", "text", "objectName"):
+        attr = getattr(action, attr_name, None)
+        value = attr() if callable(attr) else attr
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _channel_key_from_item(item: dict[str, Any]) -> tuple[int, int]:
     """Return the physical AMPR output addressed by one channel item."""
     return (
@@ -980,9 +990,47 @@ class AMPRDevice(Device):
                 if callable(blocker):
                     blocker(False)
 
+    def _display_communication_actions(self) -> tuple[Any | None, Any | None]:
+        """Return the Live Display init/close actions when available."""
+        live_display = getattr(self, "liveDisplay", None)
+        if live_display is None:
+            return None, None
+
+        close_action = getattr(live_display, "closeCommunicationAction", None)
+        init_action = getattr(live_display, "initCommunicationAction", None)
+        if close_action is not None and init_action is not None:
+            return close_action, init_action
+
+        title_bar = getattr(live_display, "titleBar", None)
+        get_actions = getattr(title_bar, "actions", None)
+        if not callable(get_actions):
+            return close_action, init_action
+
+        close_label = f"Close {self.name} communication."
+        init_label = f"Initialize {self.name} communication."
+        for action in get_actions():
+            label = _action_label(action)
+            if close_action is None and label == close_label:
+                close_action = action
+                setattr(live_display, "closeCommunicationAction", action)
+            elif init_action is None and label == init_label:
+                init_action = action
+                setattr(live_display, "initCommunicationAction", action)
+        return close_action, init_action
+
+    def _sync_display_communication_controls(self) -> None:
+        """Enable display-side communication actions only when applicable."""
+        close_action, init_action = self._display_communication_actions()
+        controller = getattr(self, "controller", None)
+        initializing = bool(getattr(controller, "initializing", False))
+        initialized = bool(getattr(controller, "initialized", False))
+        self._set_action_enabled(close_action, initialized and not initializing)
+        self._set_action_enabled(init_action, (not initialized) and (not initializing))
+
     def _sync_acquisition_controls(self) -> None:
         """Disable manual acquisition controls until the AMPR is actually ready."""
         ready, _reason = self._acquisition_readiness()
+        self._sync_display_communication_controls()
         self._set_action_enabled(getattr(self, "recordingAction", None), ready)
         self._set_action_enabled(
             getattr(getattr(self, "liveDisplay", None), "recordingAction", None),

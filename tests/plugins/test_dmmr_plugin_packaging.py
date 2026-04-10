@@ -222,13 +222,34 @@ def test_dmmr_recording_action_reflects_device_readiness():
         def blockSignals(self, blocked):
             self.blocks.append(blocked)
 
+    class FakeDisplayAction(FakeAction):
+        def __init__(self, tooltip):
+            super().__init__()
+            self._tooltip = tooltip
+
+        def toolTip(self):
+            return self._tooltip
+
+    class FakeTitleBar:
+        def __init__(self, actions):
+            self._actions = actions
+
+        def actions(self):
+            return list(self._actions)
+
     device = object.__new__(module.DMMRDevice)
     device.recording = False
     device.recordingAction = FakeAction()
+    display_close = FakeDisplayAction("Close DMMR communication.")
+    display_init = FakeDisplayAction("Initialize DMMR communication.")
+    device.liveDisplay = types.SimpleNamespace(
+        recordingAction=FakeAction(),
+        titleBar=FakeTitleBar([display_close, display_init]),
+    )
     device.controller = types.SimpleNamespace(
         device=object(),
         initializing=False,
-        initialized=True,
+        initialized=False,
         transitioning=False,
         main_state="ST_STBY",
     )
@@ -236,10 +257,17 @@ def test_dmmr_recording_action_reflects_device_readiness():
 
     module.DMMRDevice._sync_acquisition_controls(device)
     assert device.recordingAction.enabled is False
+    assert device.liveDisplay.recordingAction.enabled is False
+    assert display_close.enabled is False
+    assert display_init.enabled is True
 
+    device.controller.initialized = True
     device.controller.main_state = "ST_ON"
     module.DMMRDevice._sync_acquisition_controls(device)
     assert device.recordingAction.enabled is True
+    assert device.liveDisplay.recordingAction.enabled is True
+    assert display_close.enabled is True
+    assert display_init.enabled is False
 
 
 def test_dmmr_toggle_recording_rejects_unready_device():

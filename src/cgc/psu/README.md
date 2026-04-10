@@ -41,6 +41,7 @@ entry point when you need a manual workflow.
 - Uses the vendor `COM-HVPSU2D.dll`
 - Lists and loads stored user configurations
 - Enables or disables the device and both PSU outputs
+- Controls the interlock enable state for output and BNC connectors
 - Sets and reads output voltages and currents
 - Exposes `get_product_info()` for product, firmware and hardware metadata
 - Exposes `collect_housekeeping()` for structured monitoring data
@@ -115,6 +116,8 @@ Enable and outputs:
 
 - `get_device_enable()`
 - `set_device_enable(enable)`
+- `get_interlock_enable()`
+- `set_interlock_enable(connector_output, connector_bnc)`
 - `get_psu_enable()`
 - `set_psu_enable(psu0, psu1)`
 - `has_psu_full_range()`
