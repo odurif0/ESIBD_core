@@ -91,6 +91,35 @@ def _compact_status_text(value: Any, default: str = "n/a") -> str:
     return f"{parts[0]} +{len(parts) - 1}"
 
 
+def _format_si_current(value_amps: Any) -> tuple[str, str]:
+    """Format a current stored in amps using a readable SI prefix."""
+    value = _coerce_float(value_amps, np.nan)
+    if _is_nan(value):
+        return ("NaN", "NaN")
+
+    abs_value = abs(value)
+    if abs_value == 0:
+        scaled_value, unit = 0.0, "A"
+    elif abs_value >= 1.0:
+        scaled_value, unit = value, "A"
+    elif abs_value >= 1e-3:
+        scaled_value, unit = value * 1e3, "mA"
+    elif abs_value >= 1e-6:
+        scaled_value, unit = value * 1e6, "uA"
+    elif abs_value >= 1e-9:
+        scaled_value, unit = value * 1e9, "nA"
+    elif abs_value >= 1e-12:
+        scaled_value, unit = value * 1e12, "pA"
+    else:
+        scaled_value, unit = value * 1e15, "fA"
+
+    if scaled_value == 0:
+        number_text = "0"
+    else:
+        number_text = f"{scaled_value:.3f}".rstrip("0").rstrip(".")
+    return (f"{number_text} {unit}", f"{value:.6e} A")
+
+
 def _module_key_from_item(item: dict[str, Any]) -> int:
     """Return the physical DMMR module addressed by one channel item."""
     return _coerce_int(item.get(_DMMR_MODULE_KEY), 0)
@@ -1004,7 +1033,8 @@ class DMMRChannel(Channel):
         self.module: int
 
         channel = super().getDefaultChannel()
-        channel[self.VALUE][Parameter.HEADER] = "Current (A)"
+        channel[self.VALUE][Parameter.HEADER] = "Reference (A)"
+        channel[self.VALUE][_PARAMETER_ADVANCED_KEY] = True
         channel[self.VALUE][_PARAMETER_TOOLTIP_KEY] = (
             "Reference field only. The DMMR plugin is read-only; live current is "
             "shown through channel monitors."
@@ -1017,6 +1047,13 @@ class DMMRChannel(Channel):
         channel[self.DISPLAY][Parameter.HEADER] = "Display"
         channel[self.DISPLAY][_PARAMETER_EVENT_KEY] = self.displayChanged
         channel[self.ACTIVE][_PARAMETER_ADVANCED_KEY] = True
+        monitor_name = getattr(self, "MONITOR", "Monitor")
+        if monitor_name in channel:
+            channel[monitor_name][Parameter.HEADER] = "Current"
+            channel[monitor_name][_PARAMETER_TOOLTIP_KEY] = (
+                "Measured DMMR module current. Values are stored in amps and "
+                "displayed with automatic SI prefixes."
+            )
         channel[self.MODULE] = parameterDict(
             value="0",
             parameterType=PARAMETERTYPE.LABEL,
@@ -1079,12 +1116,47 @@ class DMMRChannel(Channel):
         if not self.enabled:
             self.monitor = np.nan
 
+    def monitorChanged(self) -> None:
+        super().monitorChanged()
+        self._sync_monitor_widget()
+
     def displayChanged(self) -> None:
         super().updateDisplay()
 
     def module_address(self) -> int:
         """Return the configured DMMR module address as an integer."""
         return _coerce_int(self.module, 0)
+
+    def _sync_monitor_widget(self) -> None:
+        """Render the live current with automatic SI prefixes in the monitor field."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+
+        monitor_name = getattr(self, "MONITOR", "Monitor")
+        parameter = getter(monitor_name)
+        if parameter is None:
+            return
+
+        widget = getattr(parameter, "getWidget", lambda: None)()
+        if widget is None:
+            return
+
+        formatted_text, raw_text = _format_si_current(getattr(self, "monitor", np.nan))
+        line_edit = getattr(widget, "lineEdit", lambda: None)()
+        if line_edit is not None and hasattr(line_edit, "setText"):
+            line_edit.setText(formatted_text)
+        elif hasattr(widget, "setText"):
+            widget.setText(formatted_text)
+
+        tooltip_base = str(getattr(parameter, "toolTip", "") or "").strip()
+        tooltip = f"{formatted_text} ({raw_text})"
+        if tooltip_base:
+            tooltip = f"{tooltip_base}\n{tooltip}"
+        if hasattr(widget, "setToolTip"):
+            widget.setToolTip(tooltip)
+        if line_edit is not None and hasattr(line_edit, "setToolTip"):
+            line_edit.setToolTip(tooltip)
 
 
 class DMMRController(DeviceController):
@@ -1216,7 +1288,12 @@ class DMMRController(DeviceController):
                         timeout_s=float(self.controllerParent.poll_timeout_s),
                     )
             except TimeoutError:
-                return
+                self.errorCount += 1
+                self.print(
+                    f"Timed out while reading DMMR module {module}; keeping partial results.",
+                    flag=PRINT.ERROR,
+                )
+                break
             except Exception as exc:  # noqa: BLE001
                 self.errorCount += 1
                 self.print(
@@ -1529,10 +1606,10 @@ class DMMRController(DeviceController):
                 release()
             return
 
-        with self.lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
-            if not lock_acquired:
-                raise TimeoutError(timeout_message)
-            yield
+        raise TypeError(
+            "DMMR controller lock must provide either acquire_timeout() or "
+            "acquire()/release()."
+        )
 
     def _begin_transition(self, target_on: bool) -> bool:
         """Mark a global DMMR ON/OFF transition as active."""

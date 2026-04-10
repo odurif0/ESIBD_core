@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 PLUGIN_PATH = (
@@ -450,6 +451,88 @@ def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
     )
     assert device.calls == [(3, 2.5)]
     assert controller.values == {3: 3.2e-12}
+
+
+def test_controller_read_numbers_keeps_partial_results_on_timeout():
+    module = _load_module()
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def __init__(self):
+            self.calls = []
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def get_module_current(self, module, timeout_s=None):
+            self.calls.append((module, timeout_s))
+            if module == 2:
+                raise TimeoutError("module read timed out")
+            return self.NO_ERR, module * 1e-12, module + 10
+
+    class FakeChannel:
+        def __init__(self, module):
+            self._module = module
+            self.real = True
+            self.enabled = True
+
+        def module_address(self):
+            return self._module
+
+    logs = []
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        isOn=lambda: True,
+        getChannels=lambda: [FakeChannel(1), FakeChannel(2), FakeChannel(3)],
+        getConfiguredModules=lambda: [1, 2, 3],
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.detected_module_ids = [1, 2, 3]
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    controller.readNumbers()
+
+    assert controller.device.calls == [(1, 2.5), (2, 2.5)]
+    assert controller.values[1] == 1e-12
+    assert np.isnan(controller.values[2])
+    assert np.isnan(controller.values[3])
+    assert controller.errorCount == 1
+    assert logs == [
+        (
+            "Timed out while reading DMMR module 2; keeping partial results.",
+            module.PRINT.ERROR,
+        )
+    ]
+
+
+def test_controller_lock_section_rejects_unsupported_lock_type():
+    module = _load_module()
+
+    controller = module.DMMRController(types.SimpleNamespace())
+    controller.lock = object()
+
+    with pytest.raises(TypeError, match="must provide either acquire_timeout"):
+        with controller._controller_lock_section("boom"):
+            pass
 
 
 def test_controller_formats_open_port_timeout_with_operator_hint():

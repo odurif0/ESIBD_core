@@ -316,6 +316,107 @@ def test_dmmr_channel_keeps_active_parameter_for_core_init():
     assert channel.displayedParameters[-1] == "Module"
 
 
+def test_dmmr_channel_marks_reference_as_advanced_only():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    channel = object.__new__(module.DMMRChannel)
+    defaults = module.DMMRChannel.getDefaultChannel(channel)
+
+    assert defaults["Value"][module.Parameter.HEADER] == "Reference (A)"
+    assert defaults["Value"][module.Parameter.ADVANCED] is True
+
+
+def test_dmmr_channel_renames_monitor_header_to_current():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    channel = object.__new__(module.DMMRChannel)
+    original_get_default = getattr(module.Channel, "getDefaultChannel", None)
+    module.Channel.getDefaultChannel = lambda self: {
+        "Value": {module.Parameter.HEADER: "Value"},
+        "Monitor": {module.Parameter.HEADER: "Monitor"},
+        "Enabled": {},
+        "Display": {},
+        "Active": {},
+    }
+    try:
+        defaults = module.DMMRChannel.getDefaultChannel(channel)
+    finally:
+        if original_get_default is None:
+            delattr(module.Channel, "getDefaultChannel")
+        else:
+            module.Channel.getDefaultChannel = original_get_default
+
+    assert defaults["Monitor"][module.Parameter.HEADER] == "Current"
+
+
+def test_dmmr_formats_currents_with_si_prefixes():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    assert module._format_si_current(0.0) == ("0 A", "0.000000e+00 A")
+    assert module._format_si_current(2.3e-12) == ("2.3 pA", "2.300000e-12 A")
+    assert module._format_si_current(7.1e-9) == ("7.1 nA", "7.100000e-09 A")
+    assert module._format_si_current(4.2e-6) == ("4.2 uA", "4.200000e-06 A")
+    assert module._format_si_current(5.5e-3) == ("5.5 mA", "5.500000e-03 A")
+    assert module._format_si_current(1.25) == ("1.25 A", "1.250000e+00 A")
+
+
+def test_dmmr_sync_monitor_widget_uses_formatted_current_and_tooltip():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    class FakeLineEdit:
+        def __init__(self):
+            self.text = None
+            self.tooltip = None
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltip = tooltip
+
+    class FakeWidget:
+        def __init__(self):
+            self.tooltip = None
+            self._line_edit = FakeLineEdit()
+
+        def lineEdit(self):
+            return self._line_edit
+
+        def setToolTip(self, tooltip):
+            self.tooltip = tooltip
+
+    class FakeParameter:
+        def __init__(self, widget):
+            self.widget = widget
+            self.toolTip = "Measured DMMR module current."
+
+        def getWidget(self):
+            return self.widget
+
+    widget = FakeWidget()
+    channel = object.__new__(module.DMMRChannel)
+    channel.monitor = 2.3e-12
+    channel.getParameterByName = lambda name: {"Monitor": FakeParameter(widget)}[name]
+
+    module.DMMRChannel._sync_monitor_widget(channel)
+
+    assert widget.lineEdit().text == "2.3 pA"
+    assert "2.3 pA (2.300000e-12 A)" in widget.tooltip
+    assert widget.lineEdit().tooltip == widget.tooltip
+
+
 def test_dmmr_status_badge_shows_off_when_ui_is_off():
     _clear_test_modules()
     _install_esibd_stubs()
