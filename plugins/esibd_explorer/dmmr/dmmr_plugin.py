@@ -1237,6 +1237,13 @@ class DMMRController(DeviceController):
                 if channel.real
             }
 
+    @staticmethod
+    def _is_optional_status(device: Any, status: int) -> bool:
+        return int(status) in {
+            int(getattr(device, "ERR_COMMAND_RECEIVE", -10)),
+            int(getattr(device, "ERR_DATA_RECEIVE", -11)),
+        }
+
     def _measurement_modules(self) -> list[int]:
         configured_modules_getter = getattr(self.controllerParent, "getConfiguredModules", None)
         configured_modules = (
@@ -1353,16 +1360,6 @@ class DMMRController(DeviceController):
                     device = self.device
                     if device is None:
                         return
-                    ready_flags_getter = getattr(device, "get_module_ready_flags", None)
-                    if callable(ready_flags_getter):
-                        ready_status, ready_flags = ready_flags_getter(
-                            module,
-                            timeout_s=float(self.controllerParent.poll_timeout_s),
-                        )
-                        if ready_status == getattr(device, "NO_ERR", ready_status):
-                            ready_mask = int(getattr(device, "MEAS_CUR_RDY", 1))
-                            if not (int(ready_flags) & ready_mask):
-                                continue
                     status, measured_current, _meas_range = device.get_module_current(
                         module,
                         timeout_s=float(self.controllerParent.poll_timeout_s),
@@ -1454,6 +1451,15 @@ class DMMRController(DeviceController):
                                 True,
                                 timeout_s=float(self.controllerParent.connect_timeout_s),
                             )
+                            if auto_range_status == device.NO_ERR:
+                                continue
+                            if self._is_optional_status(device, auto_range_status):
+                                self.print(
+                                    "DMMR module auto-range command is unavailable on this controller; "
+                                    f"continuing without it for module {module}.",
+                                    flag=PRINT.WARNING,
+                                )
+                                continue
                             if auto_range_status != device.NO_ERR:
                                 raise RuntimeError(
                                     f"set_module_auto_range({module}, True) failed: "

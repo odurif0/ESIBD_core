@@ -257,7 +257,7 @@ def test_controller_read_numbers_polls_module_currents():
     assert controller.voltage_state_summary == "VS_3V3_OK, VS_5V0_OK, VS_12V_OK"
 
 
-def test_controller_read_numbers_skips_modules_without_ready_current_frame():
+def test_controller_read_numbers_does_not_block_on_zero_ready_flags():
     module = _load_module()
 
     class FakeDevice:
@@ -280,7 +280,7 @@ def test_controller_read_numbers_skips_modules_without_ready_current_frame():
             return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
 
         def get_module_ready_flags(self, module, timeout_s=None):
-            return self.NO_ERR, self.MEAS_CUR_RDY if module == 2 else 0
+            return self.NO_ERR, 0
 
         def get_module_current(self, module, timeout_s=None):
             self.current_calls.append((module, timeout_s))
@@ -315,9 +315,9 @@ def test_controller_read_numbers_skips_modules_without_ready_current_frame():
 
     controller.readNumbers()
 
-    assert np.isnan(controller.values[1])
+    assert controller.values[1] == 1e-12
     assert controller.values[2] == 2e-12
-    assert controller.device.current_calls == [(2, 2.5)]
+    assert controller.device.current_calls == [(1, 2.5), (2, 2.5)]
 
 
 def test_controller_toggle_on_enables_measurement():
@@ -434,6 +434,77 @@ def test_controller_toggle_on_enables_module_auto_range_for_active_modules():
         ("set_automatic_current", True, 7.0),
     ]
     assert controller.acquiring is True
+
+
+def test_controller_toggle_on_tolerates_optional_auto_range_failure():
+    module = _load_module()
+    calls = []
+    logs = []
+
+    class FakeDevice:
+        NO_ERR = 0
+        ERR_COMMAND_RECEIVE = -10
+
+        def set_enable(self, enabled, timeout_s=None):
+            calls.append(("set_enable", enabled, timeout_s))
+            return self.NO_ERR
+
+        def set_module_auto_range(self, module, enabled, timeout_s=None):
+            calls.append(("set_module_auto_range", module, enabled, timeout_s))
+            return self.ERR_COMMAND_RECEIVE
+
+        def set_automatic_current(self, enabled, timeout_s=None):
+            calls.append(("set_automatic_current", enabled, timeout_s))
+            return self.NO_ERR
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def format_status(self, status):
+            return str(status)
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.0,
+        isOn=lambda: True,
+        getConfiguredModules=lambda: [3],
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.detected_module_ids = [3]
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    controller.toggleOn()
+
+    assert calls == [
+        ("set_enable", True, 7.0),
+        ("set_module_auto_range", 3, True, 7.0),
+        ("set_automatic_current", True, 7.0),
+    ]
+    assert controller.acquiring is True
+    assert logs == [
+        (
+            "DMMR module auto-range command is unavailable on this controller; continuing without it for module 3.",
+            module.PRINT.WARNING,
+        ),
+        ("DMMR acquisition enabled.", None),
+    ]
 
 
 def test_controller_toggle_off_syncs_status_back_to_gui():
