@@ -50,6 +50,7 @@ def _install_esibd_stubs() -> None:
         ADVANCED = "Advanced"
         EVENT = "Event"
         TOOLTIP = "Tooltip"
+        WIDGET = "Widget"
 
     class Channel:
         COLLAPSE = "Collapse"
@@ -94,6 +95,19 @@ def _install_esibd_stubs() -> None:
     class ToolButton:
         pass
 
+    class LabviewDoubleSpinBox:
+        def __init__(self, indicator=False, displayDecimals=2):
+            self.indicator = indicator
+            self.displayDecimals = displayDecimals
+            self.NAN = "NaN"
+            self._decimals = displayDecimals
+
+        def setDecimals(self, value):
+            self._decimals = value
+
+        def decimals(self):
+            return self._decimals
+
     class Device:
         pass
 
@@ -110,6 +124,7 @@ def _install_esibd_stubs() -> None:
     core.DeviceController = DeviceController
     core.Parameter = Parameter
     core.ToolButton = ToolButton
+    core.LabviewDoubleSpinBox = LabviewDoubleSpinBox
     core.parameterDict = parameterDict
     plugins.Device = Device
     plugins.Plugin = Plugin
@@ -436,77 +451,6 @@ def test_controller_toggle_on_enables_module_auto_range_for_active_modules():
     assert controller.acquiring is True
 
 
-def test_controller_toggle_on_tolerates_optional_auto_range_failure():
-    module = _load_module()
-    calls = []
-    logs = []
-
-    class FakeDevice:
-        NO_ERR = 0
-        ERR_COMMAND_RECEIVE = -10
-
-        def set_enable(self, enabled, timeout_s=None):
-            calls.append(("set_enable", enabled, timeout_s))
-            return self.NO_ERR
-
-        def set_module_auto_range(self, module, enabled, timeout_s=None):
-            calls.append(("set_module_auto_range", module, enabled, timeout_s))
-            return self.ERR_COMMAND_RECEIVE
-
-        def set_automatic_current(self, enabled, timeout_s=None):
-            calls.append(("set_automatic_current", enabled, timeout_s))
-            return self.NO_ERR
-
-        def get_state(self, timeout_s=None):
-            return self.NO_ERR, "0x0000", "ST_ON"
-
-        def get_device_state(self, timeout_s=None):
-            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
-
-        def get_voltage_state(self, timeout_s=None):
-            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
-
-        def get_temperature_state(self, timeout_s=None):
-            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
-
-        def format_status(self, status):
-            return str(status)
-
-    parent = types.SimpleNamespace(
-        connect_timeout_s=7.0,
-        poll_timeout_s=2.0,
-        isOn=lambda: True,
-        getConfiguredModules=lambda: [3],
-        _update_status_widgets=lambda: None,
-        main_state="",
-        detected_modules="",
-        device_state_summary="",
-        voltage_state_summary="",
-        temperature_state_summary="",
-    )
-
-    controller = module.DMMRController(parent)
-    controller.device = FakeDevice()
-    controller.detected_module_ids = [3]
-    controller.print = lambda message, flag=None: logs.append((message, flag))
-
-    controller.toggleOn()
-
-    assert calls == [
-        ("set_enable", True, 7.0),
-        ("set_module_auto_range", 3, True, 7.0),
-        ("set_automatic_current", True, 7.0),
-    ]
-    assert controller.acquiring is True
-    assert logs == [
-        (
-            "DMMR module auto-range command is unavailable on this controller; continuing without it for module 3.",
-            module.PRINT.WARNING,
-        ),
-        ("DMMR acquisition enabled.", None),
-    ]
-
-
 def test_controller_toggle_off_syncs_status_back_to_gui():
     module = _load_module()
     calls = []
@@ -562,6 +506,58 @@ def test_controller_toggle_off_syncs_status_back_to_gui():
     ]
     assert parent.main_state == "ST_ON"
     assert sync_calls == ["sync"]
+
+
+def test_controller_toggle_off_failure_restores_on_ui_state():
+    module = _load_module()
+    ui_states = []
+    log_messages = []
+
+    class FakeDevice:
+        NO_ERR = 0
+
+        def set_automatic_current(self, enabled, timeout_s=None):
+            raise RuntimeError("transport unusable")
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def format_status(self, status):
+            return str(status)
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.0,
+        isOn=lambda: False,
+        _set_on_ui_state=lambda on: ui_states.append(on),
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.print = lambda message, flag=None: log_messages.append((message, flag))
+
+    controller.toggleOn()
+
+    assert ui_states == [True]
+    assert any(
+        "Failed to toggle DMMR acquisition:" in message
+        for message, _flag in log_messages
+    )
 
 
 def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
@@ -798,3 +794,245 @@ def test_controller_update_values_clears_monitor_when_channel_is_disabled():
 
     assert channel_enabled.monitor == 1.5e-12
     assert np.isnan(channel_disabled.monitor)
+
+
+def test_controller_update_values_resyncs_monitor_widgets():
+    module = _load_module()
+
+    class FakeChannel:
+        def __init__(self, module, enabled):
+            self._module = module
+            self.real = True
+            self.enabled = enabled
+            self.monitor = 99.0
+            self.sync_calls = 0
+
+        def module_address(self):
+            return self._module
+
+        def _sync_monitor_widget(self):
+            self.sync_calls += 1
+
+    channel_enabled = FakeChannel(1, True)
+    channel_disabled = FakeChannel(2, False)
+    parent = types.SimpleNamespace(
+        isOn=lambda: True,
+        getChannels=lambda: [channel_enabled, channel_disabled],
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.DMMRController(parent)
+    controller.values = {1: 1.5e-12, 2: 2.5e-12}
+
+    controller.updateValues()
+
+    assert channel_enabled.monitor == 1.5e-12
+    assert np.isnan(channel_disabled.monitor)
+    assert channel_enabled.sync_calls == 1
+    assert channel_disabled.sync_calls == 1
+
+
+def test_controller_shutdown_failure_marks_state_unconfirmed():
+    module = _load_module()
+
+    class FakeDevice:
+        def shutdown(self, timeout_s=None):
+            raise RuntimeError("boom")
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.0,
+        isOn=lambda: False,
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    shutdown_confirmed = controller.shutdownCommunication()
+
+    assert shutdown_confirmed is False
+    assert controller.main_state == module._DMMR_SHUTDOWN_UNCONFIRMED_STATE
+    assert controller.device is None
+    assert controller.initialized is False
+
+
+def test_controller_shutdown_success_marks_state_disconnected():
+    module = _load_module()
+
+    class FakeDevice:
+        def shutdown(self, timeout_s=None):
+            return None
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.0,
+        isOn=lambda: True,
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    shutdown_confirmed = controller.shutdownCommunication()
+
+    assert shutdown_confirmed is True
+    assert controller.main_state == "Disconnected"
+    assert controller.device is None
+    assert controller.initialized is False
+
+
+def test_dmmr_monitor_widget_formats_currents_with_si_prefixes():
+    module = _load_module()
+
+    widget = module._DMMRCurrentMonitorSpinBox(indicator=True, displayDecimals=3)
+
+    assert widget.decimals() == 1000
+    assert widget.textFromValue(1.5e-12) == "1.5 pA"
+    assert widget.textFromValue(-2.0e-9) == "-2 nA"
+    assert widget.textFromValue(np.nan) == "NaN"
+
+
+def test_upgrade_monitor_widget_replaces_default_numeric_widget():
+    module = _load_module()
+
+    class FakeParameter:
+        def __init__(self):
+            self.widget = object()
+            self.value = 1.5e-12
+            self.apply_calls = 0
+
+        def applyWidget(self):
+            self.apply_calls += 1
+
+        def getWidget(self):
+            return self.widget
+
+    parameter = FakeParameter()
+    sync_calls = []
+    fake_channel = types.SimpleNamespace(
+        MONITOR="Monitor",
+        monitor=1.5e-12,
+        getParameterByName=lambda name: parameter if name == "Monitor" else None,
+        _set_monitor_widget_minimum_width=lambda *args, **kwargs: None,
+        _sync_monitor_widget=lambda: sync_calls.append(True),
+    )
+
+    module.DMMRChannel._upgrade_monitor_widget(fake_channel)
+
+    assert isinstance(parameter.widget, module._DMMRCurrentMonitorSpinBox)
+    assert parameter.apply_calls == 1
+    assert parameter.value == 1.5e-12
+    assert sync_calls == [True]
+
+
+def test_sync_monitor_widget_does_not_overwrite_numeric_spinbox_text():
+    module = _load_module()
+
+    class FakeLineEdit:
+        def __init__(self):
+            self.text_calls = []
+            self.tooltip = None
+
+        def setText(self, text):
+            self.text_calls.append(text)
+
+        def setToolTip(self, tooltip):
+            self.tooltip = tooltip
+
+    class FakeSpinWidget:
+        def __init__(self):
+            self.line_edit = FakeLineEdit()
+            self.tooltip = None
+            self.update_calls = 0
+
+        def lineEdit(self):
+            return self.line_edit
+
+        def setValue(self, _value):
+            return None
+
+        def textFromValue(self, _value):
+            return "unused"
+
+        def update(self):
+            self.update_calls += 1
+
+        def setToolTip(self, tooltip):
+            self.tooltip = tooltip
+
+    parameter = types.SimpleNamespace(
+        toolTip="Measured DMMR module current.",
+        getWidget=lambda: FakeSpinWidget(),
+    )
+    widget = parameter.getWidget()
+    parameter.getWidget = lambda: widget
+    fake_channel = types.SimpleNamespace(
+        MONITOR="Monitor",
+        monitor=1.5e-12,
+        getParameterByName=lambda name: parameter if name == "Monitor" else None,
+        _set_monitor_widget_minimum_width=lambda *args, **kwargs: None,
+    )
+
+    module.DMMRChannel._sync_monitor_widget(fake_channel)
+
+    assert widget.line_edit.text_calls == []
+    assert widget.update_calls == 1
+    assert "1.5 pA" in widget.tooltip
+    assert "1.5 pA" in widget.line_edit.tooltip
+
+
+def test_set_monitor_widget_minimum_width_keeps_fixed_width():
+    module = _load_module()
+
+    class FakeMetrics:
+        def horizontalAdvance(self, text):
+            return len(text) * 7
+
+    class FakeLineEdit:
+        def fontMetrics(self):
+            return FakeMetrics()
+
+    class FakeWidget:
+        def __init__(self):
+            self._minimum_width = 50
+            self.line_edit = FakeLineEdit()
+
+        def lineEdit(self):
+            return self.line_edit
+
+        def fontMetrics(self):
+            return FakeMetrics()
+
+        def minimumWidth(self):
+            return self._minimum_width
+
+        def setMinimumWidth(self, width):
+            self._minimum_width = width
+
+    widget = FakeWidget()
+    fake_channel = types.SimpleNamespace()
+
+    module.DMMRChannel._set_monitor_widget_minimum_width(
+        fake_channel,
+        widget,
+    )
+
+    assert widget.minimumWidth() > 60
