@@ -95,6 +95,11 @@ def test_dmmr_rejects_unknown_init_kwargs():
         ({"com": 0}, ValueError, "com"),
         ({"baudrate": 0}, ValueError, "baudrate"),
         ({"hk_interval_s": 0}, ValueError, "hk_interval_s"),
+        (
+            {"process_backend": "inline"},
+            TypeError,
+            "process_backend must be a boolean",
+        ),
         ({"hk_interval": 2.5}, TypeError, "Unexpected DMMR init kwargs: hk_interval"),
     ],
 )
@@ -140,7 +145,7 @@ def test_dmmr_uses_process_backend_when_supported(monkeypatch):
     monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
     monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
 
-    dmmr = DMMR("dmmr_process", com=8)
+    dmmr = DMMR("dmmr_process", com=8, process_backend=True)
 
     assert dmmr._backend_mode == "process"
     assert created["controller_path"] == "cgc.dmmr.dmmr:_DMMRController"
@@ -152,6 +157,55 @@ def test_dmmr_uses_process_backend_when_supported(monkeypatch):
     dmmr.close()
 
     assert dmmr._backend.closed is True
+
+
+def test_dmmr_supports_explicit_inline_backend(monkeypatch):
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - should stay unused
+            created["proxy_called"] = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["controller_kwargs"] = kwargs
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(DMMR, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    dmmr = DMMR("dmmr_inline", com=8, process_backend=False)
+
+    assert dmmr._backend_mode == "inline"
+    assert created["controller_kwargs"]["device_id"] == "dmmr_inline"
+    assert "proxy_called" not in created
+    assert (
+        dmmr._process_backend_disabled_reason
+        == "DMMR process isolation disabled by caller; using inline controller."
+    )
+
+
+def test_dmmr_defaults_to_inline_backend(monkeypatch):
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - should stay unused
+            created["proxy_called"] = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["controller_kwargs"] = kwargs
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(DMMR, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    dmmr = DMMR("dmmr_default_inline", com=8)
+
+    assert dmmr._backend_mode == "inline"
+    assert created["controller_kwargs"]["device_id"] == "dmmr_default_inline"
+    assert "proxy_called" not in created
+    assert dmmr._process_backend_disabled_reason == ""
 
 
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):

@@ -1345,7 +1345,7 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
 
 
 class DMMR(ProcessIsolatedClientMixin):
-    """Public DMMR client with process isolation on Windows."""
+    """Public DMMR client with optional process isolation on Windows."""
 
     _INSTRUMENT_NAME = "DMMR"
     _PROCESS_CONTROLLER_CLASS = _DMMRController
@@ -1362,6 +1362,7 @@ class DMMR(ProcessIsolatedClientMixin):
         device_id: str,
         com: int,
         baudrate: int = 230400,
+        process_backend: Optional[bool] = None,
         logger: Optional[logging.Logger] = None,
         hk_thread: Optional[threading.Thread] = None,
         thread_lock: Optional[threading.Lock] = None,
@@ -1370,6 +1371,9 @@ class DMMR(ProcessIsolatedClientMixin):
         log_dir: Optional[Path] = None,
         **kwargs,
     ):
+        if process_backend is not None and not isinstance(process_backend, bool):
+            raise TypeError("DMMR process_backend must be a boolean when provided.")
+
         backend_kwargs = {
             "device_id": device_id,
             "com": com,
@@ -1389,6 +1393,12 @@ class DMMR(ProcessIsolatedClientMixin):
                 "hk_thread": hk_thread,
                 "thread_lock": thread_lock,
             },
+            allow_process_backend=bool(process_backend),
+            process_backend_disabled_reason=(
+                "DMMR process isolation disabled by caller; using inline controller."
+                if process_backend is False
+                else ""
+            ),
         )
 
     def _call_backend_method(self, method_name: str, *args, **kwargs):

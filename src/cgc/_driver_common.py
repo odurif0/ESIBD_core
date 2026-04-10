@@ -252,10 +252,12 @@ class ProcessIsolatedClientMixin:
         *,
         backend_kwargs: dict[str, object],
         incompatible_objects: dict[str, object],
+        allow_process_backend: bool = True,
+        process_backend_disabled_reason: str = "",
     ) -> None:
         object.__setattr__(self, "_process_backend_disabled_reason", "")
 
-        if supports_process_backend(*incompatible_objects.values()):
+        if allow_process_backend and supports_process_backend(*incompatible_objects.values()):
             process_kwargs = dict(backend_kwargs)
             if "logger" in process_kwargs:
                 process_kwargs["logger"] = None
@@ -283,7 +285,15 @@ class ProcessIsolatedClientMixin:
                 object.__setattr__(self, "_backend", backend)
                 return
 
-        if RUNTIME_IS_WINDOWS and any(
+        if not allow_process_backend:
+            reason = process_backend_disabled_reason.strip()
+            if reason:
+                object.__setattr__(
+                    self,
+                    "_process_backend_disabled_reason",
+                    reason,
+                )
+        elif RUNTIME_IS_WINDOWS and any(
             value is not None for value in incompatible_objects.values()
         ):
             incompatible = [

@@ -1237,6 +1237,28 @@ class DMMRController(DeviceController):
                 if channel.real
             }
 
+    def _measurement_modules(self) -> list[int]:
+        configured_modules_getter = getattr(self.controllerParent, "getConfiguredModules", None)
+        configured_modules = (
+            {
+                _coerce_int(module, -1)
+                for module in configured_modules_getter()
+                if _coerce_int(module, -1) >= 0
+            }
+            if callable(configured_modules_getter)
+            else set()
+        )
+        detected_modules = {
+            _coerce_int(module, -1)
+            for module in getattr(self, "detected_module_ids", [])
+            if _coerce_int(module, -1) >= 0
+        }
+        if detected_modules:
+            return sorted(configured_modules & detected_modules) if configured_modules else sorted(
+                detected_modules
+            )
+        return sorted(configured_modules)
+
     def runInitialization(self) -> None:
         self.initialized = False
         self._dispose_device()
@@ -1318,9 +1340,7 @@ class DMMRController(DeviceController):
             for channel in self.controllerParent.getChannels()
             if channel.real
         }
-        configured_modules = set(self.controllerParent.getConfiguredModules())
-        detected_modules = set(self.detected_module_ids)
-        poll_modules = sorted(configured_modules & detected_modules) if detected_modules else sorted(configured_modules)
+        poll_modules = self._measurement_modules()
 
         for module in poll_modules:
             try:
@@ -1331,6 +1351,16 @@ class DMMRController(DeviceController):
                     device = self.device
                     if device is None:
                         return
+                    ready_flags_getter = getattr(device, "get_module_ready_flags", None)
+                    if callable(ready_flags_getter):
+                        ready_status, ready_flags = ready_flags_getter(
+                            module,
+                            timeout_s=float(self.controllerParent.poll_timeout_s),
+                        )
+                        if ready_status == getattr(device, "NO_ERR", ready_status):
+                            ready_mask = int(getattr(device, "MEAS_CUR_RDY", 1))
+                            if not (int(ready_flags) & ready_mask):
+                                continue
                     status, measured_current, _meas_range = device.get_module_current(
                         module,
                         timeout_s=float(self.controllerParent.poll_timeout_s),
@@ -1398,6 +1428,7 @@ class DMMRController(DeviceController):
 
         try:
             if self.controllerParent.isOn():
+                measurement_modules = self._measurement_modules()
                 with self._controller_lock_section(
                     "Could not acquire lock to enable DMMR acquisition."
                 ):
@@ -1413,6 +1444,19 @@ class DMMRController(DeviceController):
                         raise RuntimeError(
                             f"set_enable(True) failed: {self._format_status(enable_status, device=device)}"
                         )
+                    set_module_auto_range = getattr(device, "set_module_auto_range", None)
+                    if callable(set_module_auto_range):
+                        for module in measurement_modules:
+                            auto_range_status = set_module_auto_range(
+                                module,
+                                True,
+                                timeout_s=float(self.controllerParent.connect_timeout_s),
+                            )
+                            if auto_range_status != device.NO_ERR:
+                                raise RuntimeError(
+                                    f"set_module_auto_range({module}, True) failed: "
+                                    f"{self._format_status(auto_range_status, device=device)}"
+                                )
                     automatic_status = device.set_automatic_current(
                         True,
                         timeout_s=float(self.controllerParent.connect_timeout_s),
