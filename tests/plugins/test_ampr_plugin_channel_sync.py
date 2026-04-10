@@ -583,7 +583,8 @@ def test_read_numbers_blocks_channel_acquisition_until_st_on():
 
     module.AMPRController.readNumbers(controller)
 
-    assert controller.values == {(2, 3): 123.0}
+    assert list(controller.values) == [(2, 3)]
+    assert np.isnan(controller.values[(2, 3)])
 
 
 def test_read_numbers_reads_voltages_only_once_st_on_is_reached():
@@ -1636,17 +1637,83 @@ def test_update_values_clears_monitor_when_channel_or_device_is_off():
     assert np.isnan(channel_disabled.monitor)
 
 
-def test_read_numbers_keeps_existing_values_when_state_temporarily_leaves_st_on():
+def test_read_numbers_clears_existing_values_when_state_leaves_st_on():
     module = _load_module()
+
+    class FakeChannel:
+        real = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
 
     controller = object.__new__(module.AMPRController)
     controller.device = types.SimpleNamespace()
     controller.initialized = True
     controller.values = {(2, 1): 10.0, (2, 2): 20.0}
     controller.main_state = "ST_ON"
-    controller.controllerParent = types.SimpleNamespace(getChannels=lambda: [])
+    controller.controllerParent = types.SimpleNamespace(getChannels=lambda: [FakeChannel()])
     controller._update_state = lambda: setattr(controller, "main_state", "ST_STBY")
 
     module.AMPRController.readNumbers(controller)
 
-    assert controller.values == {(2, 1): 10.0, (2, 2): 20.0}
+    assert list(controller.values) == [(2, 1)]
+    assert np.isnan(controller.values[(2, 1)])
+
+
+def test_toggle_on_clears_transition_when_device_is_missing():
+    module = _load_module()
+
+    original_toggle_on = getattr(module.DeviceController, "toggleOn", None)
+    module.DeviceController.toggleOn = lambda self: None
+    try:
+        restored_states = []
+        controller = object.__new__(module.AMPRController)
+        controller.device = None
+        controller.transitioning = True
+        controller.transition_target_on = True
+        controller._restore_off_ui_state = lambda: restored_states.append(False)
+
+        module.AMPRController.toggleOn(controller)
+    finally:
+        if original_toggle_on is None:
+            delattr(module.DeviceController, "toggleOn")
+        else:
+            module.DeviceController.toggleOn = original_toggle_on
+
+    assert restored_states == [False]
+    assert controller.transitioning is False
+    assert controller.transition_target_on is None
+
+
+def test_controller_formats_open_port_timeout_with_operator_hint():
+    module = _load_module()
+
+    controller = module.AMPRController(types.SimpleNamespace(com=5))
+
+    message = controller._format_exception(
+        RuntimeError(
+            "AMPR DLL call timed out during 'open_port'. "
+            "The device may be powered off or unresponsive."
+        )
+    )
+
+    assert "RuntimeError:" in message
+    assert "Selected COM5 did not respond." in message
+    assert "configured COM port is correct" in message
+
+
+def test_controller_formats_open_port_error_with_operator_hint():
+    module = _load_module()
+
+    controller = module.AMPRController(types.SimpleNamespace(com=5))
+
+    message = controller._format_exception(
+        RuntimeError("AMPR open_port failed: -2 (Error opening port)")
+    )
+
+    assert "RuntimeError:" in message
+    assert "Windows could not open COM5." in message
+    assert "already in use" in message

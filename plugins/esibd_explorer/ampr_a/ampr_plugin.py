@@ -1056,6 +1056,7 @@ class AMPRDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._update_status_widgets()
 
     def setOn(self, on: "bool | None" = None) -> None:
         """Toggle the AMPR without the generic immediate apply=True jump."""
@@ -1527,6 +1528,7 @@ class AMPRController(DeviceController):
 
         self._update_state()
         if self.main_state != "ST_ON":
+            self.initializeValues(reset=True)
             return
 
         new_values = {
@@ -1634,6 +1636,8 @@ class AMPRController(DeviceController):
         super().toggleOn()
         device = self.device
         if device is None:
+            self._restore_off_ui_state()
+            self._end_transition()
             return
         if getattr(self, "acquiring", False):
             self.stopAcquisition()
@@ -1761,7 +1765,9 @@ class AMPRController(DeviceController):
             self.print("AMPR PSU turned ON. State: ST_ON.")
 
     def closeCommunication(self) -> None:
-        super().closeCommunication()
+        base_close = getattr(super(), "closeCommunication", None)
+        if callable(base_close):
+            base_close()
         self.main_state = "Disconnected"
         self.detected_module_ids = []
         self.detected_modules_text = ""
@@ -1799,21 +1805,7 @@ class AMPRController(DeviceController):
         else:
             self.print("AMPR shutdown sequence completed.")
         finally:
-            base_close = getattr(super(), "closeCommunication", None)
-            if callable(base_close):
-                base_close()
-            self.main_state = "Disconnected"
-            self.detected_module_ids = []
-            self.detected_modules_text = ""
-            if hasattr(self, "controllerParent"):
-                self.controllerParent.module_channel_counts = {}
-                self.controllerParent.module_voltage_limits = {}
-            self.device_state_summary = "n/a"
-            self.interlock_state_summary = "n/a"
-            self.voltage_state_summary = "n/a"
-            self._sync_status_to_gui()
-            self._dispose_device()
-            self.initialized = False
+            self.closeCommunication()
 
     def _refresh_module_scan(self) -> None:
         if self.device is None:
@@ -2277,9 +2269,27 @@ class AMPRController(DeviceController):
             return
         self.print("AMPR startup cleanup disabled the PSU after failure.", flag=PRINT.WARNING)
 
-    @staticmethod
-    def _format_exception(exc: Exception) -> str:
+    def _format_exception(self, exc: Exception) -> str:
         message = str(exc).strip()
+        lower_message = message.lower()
+        controller_parent = getattr(self, "controllerParent", None)
+        com_number = _coerce_int(getattr(controller_parent, "com", None), 0)
+
+        if "timed out during 'open_port'" in lower_message:
+            hint = (
+                f" Selected COM{com_number} did not respond. Check that the AMPR is "
+                "powered, that the configured COM port is correct, and that no other "
+                "application is holding the port."
+            )
+            message = f"{message}{hint}"
+        elif "open_port failed:" in lower_message and "error opening port" in lower_message:
+            hint = (
+                f" Windows could not open COM{com_number}. The port is likely wrong, "
+                "already in use, or stale after a previous connection failure. Close "
+                "other serial tools and replug or power-cycle the AMPR before retrying."
+            )
+            message = f"{message}{hint}"
+
         if message:
             return f"{type(exc).__name__}: {message}"
         return repr(exc)

@@ -610,17 +610,20 @@ def test_set_on_ui_state_uses_thread_safe_action_signals():
             )
 
     sync_calls = []
+    status_calls = []
     device = object.__new__(module.AMPRDevice)
     device.useOnOffLogic = True
     device.onAction = FakeAction()
     device.deviceOnAction = FakeAction()
     device._sync_local_on_action = lambda: sync_calls.append(True)
+    device._update_status_widgets = lambda: status_calls.append(True)
 
     module.AMPRDevice._set_on_ui_state(device, False)
 
     assert device.onAction.signalComm.setValueFromThreadSignal.values == [False]
     assert device.deviceOnAction.signalComm.setValueFromThreadSignal.values == [False]
     assert sync_calls == [True]
+    assert status_calls == [True]
 
 
 def test_channel_events_are_logged_for_user_changes():
