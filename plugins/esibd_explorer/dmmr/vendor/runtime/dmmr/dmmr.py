@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -165,6 +166,35 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
             self._warn_optional_command(action, status)
 
         return None
+
+    def _recover_optional_module_auto_range_status(
+        self,
+        address: int,
+        requested_auto_range: bool,
+        status: int,
+        timeout_s: float,
+    ) -> int:
+        if not self._is_optional_command_failure(status):
+            return status
+
+        verify_timeout_s = max(0.2, min(float(timeout_s), 1.0))
+        for _attempt in range(3):
+            verify_status, _meas_range, auto_range = self._call_locked_with_timeout(
+                DMMRBase.get_module_meas_range,
+                verify_timeout_s,
+                f"verify_set_module_auto_range[{int(address)}]",
+                self,
+                int(address),
+            )
+            if verify_status == self.NO_ERR:
+                if bool(auto_range) == bool(requested_auto_range):
+                    return self.NO_ERR
+                return status
+            if not self._is_optional_command_failure(verify_status):
+                return status
+            time.sleep(0.05)
+
+        return status
 
     @staticmethod
     def _build_module_housekeeping_snapshot(values: tuple[float, ...]) -> dict:
@@ -1214,13 +1244,19 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
     ):
         """Enable or disable automatic range switching for one DMMR module."""
         timeout_s = self._resolve_io_timeout(timeout_s)
-        return self._call_locked_with_timeout(
+        status = self._call_locked_with_timeout(
             DMMRBase.set_module_auto_range,
             timeout_s,
             f"set_module_auto_range[{int(address)}]",
             self,
             int(address),
             bool(auto_range),
+        )
+        return self._recover_optional_module_auto_range_status(
+            int(address),
+            bool(auto_range),
+            status,
+            timeout_s,
         )
 
     def get_module_meas_range(self, address: int, timeout_s: Optional[float] = None):

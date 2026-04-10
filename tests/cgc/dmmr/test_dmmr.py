@@ -1045,6 +1045,54 @@ def test_set_module_auto_range_uses_timeout_safe_wrapper(monkeypatch):
     ]
 
 
+def test_set_module_auto_range_recovers_optional_status_when_readback_matches(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "set_module_auto_range":
+            return backend.ERR_COMMAND_RECEIVE
+        if method.__name__ == "get_module_meas_range":
+            return backend.NO_ERR, 0, True
+        raise AssertionError(method.__name__)
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+    monkeypatch.setattr("cgc.dmmr.dmmr.time.sleep", lambda _delay: None)
+
+    assert backend.set_module_auto_range(3, True, timeout_s=2.0) == backend.NO_ERR
+    assert calls == [
+        ("set_module_auto_range", 2.0, "set_module_auto_range[3]", (backend, 3, True)),
+        ("get_module_meas_range", 1.0, "verify_set_module_auto_range[3]", (backend, 3)),
+    ]
+
+
+def test_set_module_auto_range_returns_optional_status_when_readback_disagrees(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "set_module_auto_range":
+            return backend.ERR_COMMAND_RECEIVE
+        if method.__name__ == "get_module_meas_range":
+            return backend.NO_ERR, 0, False
+        raise AssertionError(method.__name__)
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+    monkeypatch.setattr("cgc.dmmr.dmmr.time.sleep", lambda _delay: None)
+
+    assert backend.set_module_auto_range(3, True, timeout_s=2.0) == backend.ERR_COMMAND_RECEIVE
+    assert calls == [
+        ("set_module_auto_range", 2.0, "set_module_auto_range[3]", (backend, 3, True)),
+        ("get_module_meas_range", 1.0, "verify_set_module_auto_range[3]", (backend, 3)),
+    ]
+
+
 def test_get_module_ready_flags_uses_timeout_safe_wrapper(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")

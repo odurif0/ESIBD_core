@@ -171,7 +171,7 @@ def test_dmmr_plugin_exposes_expected_metadata():
     assert module.DMMRDevice.useOnOffLogic is True
     assert module.DMMRDevice.iconFile == "dmmr.png"
     with Image.open(ICON_PATH) as image:
-        assert image.size == (64, 64)
+        assert image.size == (128, 128)
 
 
 def test_dmmr_plugin_loads_driver_from_private_runtime():
@@ -463,6 +463,52 @@ def test_dmmr_status_badge_shows_off_when_ui_is_off():
     tooltip = module.DMMRDevice._status_tooltip_text(device)
     assert "State: OFF" in tooltip
     assert "Hardware state: ST_ON" in tooltip
+
+
+def test_dmmr_status_badge_keeps_unconfirmed_shutdown_visible_when_ui_is_off():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    device = object.__new__(module.DMMRDevice)
+    device.main_state = module._DMMR_SHUTDOWN_UNCONFIRMED_STATE
+    device.detected_modules = "3"
+    device.device_state_summary = "n/a"
+    device.voltage_state_summary = "n/a"
+    device.temperature_state_summary = "n/a"
+    device.isOn = lambda: False
+
+    assert (
+        module.DMMRDevice._display_main_state(device)
+        == module._DMMR_SHUTDOWN_UNCONFIRMED_STATE
+    )
+
+
+def test_dmmr_device_shutdown_keeps_ui_on_when_shutdown_is_unconfirmed():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    device = object.__new__(module.DMMRDevice)
+    device.useOnOffLogic = True
+    device.onAction = types.SimpleNamespace(state=False)
+    sync_states = []
+    device._sync_local_on_action = lambda: sync_states.append(device.onAction.state)
+    device._update_status_widgets = lambda: None
+    device.stopAcquisition = lambda: None
+    device._sync_acquisition_controls = lambda: None
+    warnings = []
+    device.print = lambda message, flag=None: warnings.append((message, flag))
+    device.controller = types.SimpleNamespace(shutdownCommunication=lambda: False)
+    device.recording = True
+
+    module.DMMRDevice.shutdownCommunication(device)
+
+    assert device.onAction.state is True
+    assert sync_states == [True]
+    assert any("shutdown could not be confirmed" in message for message, _ in warnings)
 
 
 def test_dmmr_channel_keeps_display_widget_default():

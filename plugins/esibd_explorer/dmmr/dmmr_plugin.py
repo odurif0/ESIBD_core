@@ -23,6 +23,15 @@ from esibd.core import (
 )
 from esibd.plugins import Device, Plugin
 
+try:
+    from esibd.core import LabviewDoubleSpinBox
+except ImportError:  # pragma: no cover - exercised by lightweight plugin stubs
+    class LabviewDoubleSpinBox:  # type: ignore[override]
+        """Fallback used by unit-test stubs that do not expose the real widget."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            self.NAN = "NaN"
+
 _BUNDLED_RUNTIME_DIRNAME = "runtime"
 _BUNDLED_RUNTIME_NAMESPACE_PREFIX = "_esibd_bundled_dmmr_runtime"
 _DMMR_DRIVER_CLASS: type[Any] | None = None
@@ -34,6 +43,9 @@ _PARAMETER_TOOLTIP_KEY = getattr(Parameter, "TOOLTIP", "Tooltip")
 _PARAMETER_EVENT_KEY = getattr(Parameter, "EVENT", "Event")
 _DMMR_MODULE_KEY = "Module"
 _DMMR_MIN_ROW_HEIGHT = 28
+_DMMR_COMMUNICATION_LOST_STATE = "Communication lost"
+_DMMR_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
+_DMMR_ATTENTION_STATE_TOKENS = ("error", "unconfirmed", "lost")
 _DMMR_POWER_ON_ICON = "switch-medium_on.png"
 _DMMR_POWER_OFF_ICON = "switch-medium_off.png"
 
@@ -128,6 +140,30 @@ def _format_si_current(value_amps: Any) -> tuple[str, str]:
     else:
         number_text = f"{scaled_value:.3f}".rstrip("0").rstrip(".")
     return (f"{number_text} {unit}", f"{value:.6e} A")
+
+
+def _state_requires_operator_attention(state: Any) -> bool:
+    """Return True when the raw state should stay visible even if the UI toggle is OFF."""
+    normalized = str(state or "").strip().lower()
+    return any(token in normalized for token in _DMMR_ATTENTION_STATE_TOKENS)
+
+
+class _DMMRCurrentMonitorSpinBox(LabviewDoubleSpinBox):
+    """Numeric indicator widget that renders DMMR currents with SI prefixes."""
+
+    def __init__(self, indicator: bool = False, displayDecimals: int = 2) -> None:
+        super().__init__(indicator=indicator, displayDecimals=displayDecimals)
+        set_decimals = getattr(self, "setDecimals", None)
+        if callable(set_decimals):
+            # Preserve picoamp-scale values internally while still rendering a compact SI string.
+            set_decimals(1000)
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802
+        numeric_value = _coerce_float(value, np.nan)
+        if _is_nan(numeric_value) or np.isinf(numeric_value):
+            return getattr(self, "NAN", "NaN")
+        formatted_text, _raw_text = _format_si_current(numeric_value)
+        return formatted_text
 
 
 def _module_key_from_item(item: dict[str, Any]) -> int:
@@ -539,7 +575,12 @@ class DMMRDevice(Device):
         """Return the operator-facing state shown in the toolbar badge."""
         raw_state = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
         is_on = getattr(self, "isOn", None)
-        if raw_state != "Disconnected" and callable(is_on) and not bool(is_on()):
+        if (
+            raw_state != "Disconnected"
+            and not _state_requires_operator_attention(raw_state)
+            and callable(is_on)
+            and not bool(is_on())
+        ):
             return "OFF"
         return raw_state
 
@@ -584,7 +625,11 @@ class DMMRDevice(Device):
             background = "#b7791f"
         elif state == "Disconnected":
             background = "#718096"
-        elif state == "ST_OVERLOAD" or state.startswith("ST_ERR") or "error" in state.lower():
+        elif (
+            state == "ST_OVERLOAD"
+            or state.startswith("ST_ERR")
+            or _state_requires_operator_attention(state)
+        ):
             background = "#c53030"
         else:
             background = "#4a5568"
@@ -664,7 +709,7 @@ class DMMRDevice(Device):
         )
 
     def _update_channel_column_visibility(self) -> None:
-        """Hide framework columns that are not useful for the DMMR UI."""
+        """Hide framework columns and configure the Current column as resizable."""
         if self.tree is None or not self.channels:
             return
 
@@ -672,6 +717,32 @@ class DMMRDevice(Device):
         for hidden_name in (Channel.COLLAPSE, Channel.REAL, Channel.ACTIVE):
             if hidden_name in parameter_names:
                 self.tree.setColumnHidden(parameter_names.index(hidden_name), True)
+
+        # Make the Current column user-resizable with a generous default width.
+        monitor_name = getattr(Channel, "MONITOR", "Monitor")
+        if monitor_name in parameter_names:
+            header = self.tree.header()
+            if header is not None:
+                monitor_index = parameter_names.index(monitor_name)
+                header.setSectionResizeMode(
+                    monitor_index, type(header).ResizeMode.Interactive
+                )
+                # Compute a default width from the monitor widget font.
+                default_width = 200
+                for channel in self.channels[:1]:
+                    param = channel.getParameterByName(monitor_name)
+                    widget = (
+                        getattr(param, "getWidget", lambda: None)()
+                        if param is not None
+                        else None
+                    )
+                    if widget is not None:
+                        fm = getattr(widget, "fontMetrics", None)
+                        metrics = fm() if callable(fm) else None
+                        advance = getattr(metrics, "horizontalAdvance", None)
+                        if callable(advance):
+                            default_width = advance("-123.456 fA   ") + 20
+                header.resizeSection(monitor_index, default_width)
 
     def _sync_channels_from_detected_modules(self, detected_modules: list[int]) -> bool:
         """Synchronize channels from the latest detected DMMR module scan."""
@@ -1012,12 +1083,19 @@ class DMMRDevice(Device):
 
     def shutdownCommunication(self) -> None:
         """Run the full DMMR hardware shutdown sequence from the toolbar action."""
-        if self.useOnOffLogic and hasattr(self, "onAction"):
-            self.onAction.state = False
-            self._sync_local_on_action()
         self.stopAcquisition()
+        shutdown_confirmed = True
         if self.controller:
-            self.controller.shutdownCommunication()
+            shutdown_confirmed = bool(self.controller.shutdownCommunication())
+        if self.useOnOffLogic and hasattr(self, "onAction"):
+            self.onAction.state = False if shutdown_confirmed else True
+            self._sync_local_on_action()
+            self._update_status_widgets()
+        if not shutdown_confirmed:
+            self.print(
+                "DMMR shutdown could not be confirmed; UI remains ON until the hardware state is verified.",
+                flag=PRINT.WARNING,
+            )
         self.recording = False
         self._sync_acquisition_controls()
 
@@ -1120,11 +1198,23 @@ class DMMRChannel(Channel):
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)
+        if callable(getattr(self, "getParameterByName", None)):
+            self._upgrade_monitor_widget()
         self._upgrade_toggle_widget(self.ENABLED, "Read", 52)
         self.scalingChanged()
 
     def scalingChanged(self) -> None:
         super().scalingChanged()
+        monitor_parameter_getter = getattr(self, "getParameterByName", None)
+        if callable(monitor_parameter_getter):
+            monitor_parameter = monitor_parameter_getter(getattr(self, "MONITOR", "Monitor"))
+            monitor_widget = (
+                getattr(monitor_parameter, "getWidget", lambda: None)()
+                if monitor_parameter is not None
+                else None
+            )
+            if monitor_widget is not None:
+                self._set_monitor_widget_minimum_width(monitor_widget)
         if self.rowHeight >= _DMMR_MIN_ROW_HEIGHT:
             return
         self.rowHeight = _DMMR_MIN_ROW_HEIGHT
@@ -1155,6 +1245,41 @@ class DMMRChannel(Channel):
                 parameter.check.setAutoRaise(False)
         parameter.value = initial_value
 
+    def _upgrade_monitor_widget(self) -> None:
+        """Replace the default numeric monitor widget with the SI-aware DMMR monitor."""
+        parameter = self.getParameterByName(getattr(self, "MONITOR", "Monitor"))
+        if parameter is None:
+            return
+
+        widget_getter = getattr(parameter, "getWidget", None)
+        current_widget = widget_getter() if callable(widget_getter) else getattr(parameter, "widget", None)
+        if isinstance(current_widget, _DMMRCurrentMonitorSpinBox):
+            return
+
+        current_value = getattr(self, "monitor", np.nan)
+        parameter.widget = _DMMRCurrentMonitorSpinBox(indicator=True, displayDecimals=3)
+        parameter.applyWidget()
+        self._set_monitor_widget_minimum_width(parameter.widget)
+        parameter.value = current_value
+        self._sync_monitor_widget()
+
+    def _set_monitor_widget_minimum_width(
+        self,
+        widget: Any,
+    ) -> None:
+        """Set a minimum width so the current value stays readable when the column is narrow."""
+        for metrics_owner in (widget, getattr(widget, "lineEdit", lambda: None)()):
+            if metrics_owner is None:
+                continue
+            font_metrics = getattr(metrics_owner, "fontMetrics", None)
+            metrics = font_metrics() if callable(font_metrics) else None
+            advance = getattr(metrics, "horizontalAdvance", None)
+            if callable(advance):
+                minimum = advance("-123.456 fA") + 10
+                if hasattr(widget, "setMinimumWidth"):
+                    widget.setMinimumWidth(minimum)
+                return
+
     def realChanged(self) -> None:
         self.getParameterByName(self.MODULE).setVisible(self.real)
         super().realChanged()
@@ -1170,6 +1295,44 @@ class DMMRChannel(Channel):
 
     def displayChanged(self) -> None:
         super().updateDisplay()
+
+    def updateColor(self):
+        """Apply curve color only to the Display cell; keep other cells neutral."""
+        from PyQt6.QtGui import QBrush
+        from PyQt6.QtWidgets import QComboBox
+
+        color = super().updateColor()
+        if color is None:
+            return color
+
+        display_name = getattr(self, "DISPLAY", "Display")
+        display_param = self.getParameterByName(display_name)
+        display_index = (
+            self.parameters.index(display_param)
+            if display_param in self.parameters
+            else -1
+        )
+
+        neutral = QBrush()
+        color_brush = QBrush(color)
+        for i in range(len(self.parameters) + 1):
+            if i == display_index:
+                self.setBackground(i, color_brush)
+            else:
+                self.setBackground(i, neutral)
+
+        for parameter in self.parameters:
+            if parameter == display_param:
+                continue
+            widget = parameter.getWidget()
+            if not widget:
+                continue
+            if hasattr(widget, "container"):
+                widget.container.setStyleSheet("")
+            if not isinstance(widget, QComboBox):
+                widget.setStyleSheet("")
+
+        return color
 
     def module_address(self) -> int:
         """Return the configured DMMR module address as an integer."""
@@ -1192,10 +1355,15 @@ class DMMRChannel(Channel):
 
         formatted_text, raw_text = _format_si_current(getattr(self, "monitor", np.nan))
         line_edit = getattr(widget, "lineEdit", lambda: None)()
-        if line_edit is not None and hasattr(line_edit, "setText"):
+        is_numeric_widget = callable(getattr(widget, "setValue", None)) and callable(
+            getattr(widget, "textFromValue", None)
+        )
+        if not is_numeric_widget and line_edit is not None and hasattr(line_edit, "setText"):
             line_edit.setText(formatted_text)
-        elif hasattr(widget, "setText"):
+        elif not is_numeric_widget and hasattr(widget, "setText"):
             widget.setText(formatted_text)
+        elif hasattr(widget, "update"):
+            widget.update()
 
         tooltip_base = str(getattr(parameter, "toolTip", "") or "").strip()
         tooltip = f"{formatted_text} ({raw_text})"
@@ -1224,6 +1392,7 @@ class DMMRController(DeviceController):
         self.initialized = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
+        self._closing = False
 
     def initializeValues(self, reset: bool = False) -> None:
         if getattr(self, "values", None) is None or reset:
@@ -1236,13 +1405,6 @@ class DMMRController(DeviceController):
                 for channel in get_channels()
                 if channel.real
             }
-
-    @staticmethod
-    def _is_optional_status(device: Any, status: int) -> bool:
-        return int(status) in {
-            int(getattr(device, "ERR_COMMAND_RECEIVE", -10)),
-            int(getattr(device, "ERR_DATA_RECEIVE", -11)),
-        }
 
     def _measurement_modules(self) -> list[int]:
         configured_modules_getter = getattr(self.controllerParent, "getConfiguredModules", None)
@@ -1408,14 +1570,18 @@ class DMMRController(DeviceController):
         for channel in self.controllerParent.getChannels():
             if channel.enabled and channel.real and device_is_on:
                 channel.monitor = self.values.get(channel.module_address(), np.nan)
-                continue
-            channel.monitor = np.nan
+            else:
+                channel.monitor = np.nan
+            sync_monitor = getattr(channel, "_sync_monitor_widget", None)
+            if callable(sync_monitor):
+                sync_monitor()
 
     def toggleOn(self) -> None:
         base_toggle_on = getattr(super(), "toggleOn", None)
         if callable(base_toggle_on):
             base_toggle_on()
 
+        target_on = bool(self.controllerParent.isOn())
         device = self.device
         if device is None:
             self._end_transition()
@@ -1426,7 +1592,7 @@ class DMMRController(DeviceController):
             self.acquiring = False
 
         try:
-            if self.controllerParent.isOn():
+            if target_on:
                 measurement_modules = self._measurement_modules()
                 with self._controller_lock_section(
                     "Could not acquire lock to enable DMMR acquisition."
@@ -1451,15 +1617,6 @@ class DMMRController(DeviceController):
                                 True,
                                 timeout_s=float(self.controllerParent.connect_timeout_s),
                             )
-                            if auto_range_status == device.NO_ERR:
-                                continue
-                            if self._is_optional_status(device, auto_range_status):
-                                self.print(
-                                    "DMMR module auto-range command is unavailable on this controller; "
-                                    f"continuing without it for module {module}.",
-                                    flag=PRINT.WARNING,
-                                )
-                                continue
                             if auto_range_status != device.NO_ERR:
                                 raise RuntimeError(
                                     f"set_module_auto_range({module}, True) failed: "
@@ -1507,7 +1664,10 @@ class DMMRController(DeviceController):
                 self.print("DMMR acquisition disabled.")
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
-            self._restore_off_ui_state()
+            if target_on:
+                self._restore_off_ui_state()
+            else:
+                self._restore_on_ui_state()
             self._update_state()
             self.print(
                 f"Failed to toggle DMMR acquisition: {self._format_exception(exc)}"
@@ -1518,31 +1678,54 @@ class DMMRController(DeviceController):
             self._end_transition()
             self._sync_status_to_gui()
 
-    def closeCommunication(self) -> None:
-        base_close = getattr(super(), "closeCommunication", None)
-        if callable(base_close):
-            base_close()
-        self.main_state = "Disconnected"
-        self.detected_module_ids = []
-        self.detected_modules_text = ""
-        self.device_state_summary = "n/a"
-        self.voltage_state_summary = "n/a"
-        self.temperature_state_summary = "n/a"
-        self._sync_status_to_gui()
-        self._dispose_device()
-        self.initialized = False
+    def closeCommunication(self, *, final_state: str | None = None) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        try:
+            # Signal the acquisition loop to stop early so it releases the
+            # controller lock without waiting for a contested acquire_timeout.
+            self.acquiring = False
 
-    def shutdownCommunication(self) -> None:
+            # Best-effort attempt to disable the DMMR hardware so the
+            # physical LED reflects the disconnected state.  Failures are
+            # expected and silently ignored when the link is already broken.
+            self._attempt_device_disable()
+
+            base_close = getattr(super(), "closeCommunication", None)
+            if callable(base_close):
+                base_close()
+            if final_state is None:
+                is_on = getattr(self.controllerParent, "isOn", None)
+                final_state = (
+                    _DMMR_COMMUNICATION_LOST_STATE
+                    if callable(is_on) and bool(is_on())
+                    else "Disconnected"
+                )
+            self.main_state = final_state
+            self.detected_module_ids = []
+            self.detected_modules_text = ""
+            self.device_state_summary = "n/a"
+            self.voltage_state_summary = "n/a"
+            self.temperature_state_summary = "n/a"
+            self._sync_status_to_gui()
+            self._dispose_device()
+            self.initialized = False
+        finally:
+            self._closing = False
+
+    def shutdownCommunication(self) -> bool:
         """Run the DMMR shutdown sequence before releasing communication resources."""
         device = self.device
         if device is None:
             self.closeCommunication()
-            return
+            return True
 
         if getattr(self, "acquiring", False):
             self.stopAcquisition()
             self.acquiring = False
         self.print("Starting DMMR shutdown sequence.")
+        shutdown_confirmed = False
         try:
             device.shutdown(timeout_s=float(self.controllerParent.connect_timeout_s))
         except Exception as exc:  # noqa: BLE001
@@ -1554,9 +1737,17 @@ class DMMRController(DeviceController):
                 flag=PRINT.ERROR,
             )
         else:
+            shutdown_confirmed = True
             self.print("DMMR shutdown sequence completed.")
         finally:
-            self.closeCommunication()
+            self.closeCommunication(
+                final_state=(
+                    "Disconnected"
+                    if shutdown_confirmed
+                    else _DMMR_SHUTDOWN_UNCONFIRMED_STATE
+                )
+            )
+        return shutdown_confirmed
 
     def _update_state(self) -> None:
         if self.device is None:
@@ -1618,6 +1809,22 @@ class DMMRController(DeviceController):
             with contextlib.suppress(Exception):
                 device.close()
 
+    def _attempt_device_disable(self) -> None:
+        """Best-effort attempt to disable the DMMR hardware before closing.
+
+        Sends ``set_enable(False)`` to turn off modules so the firmware
+        changes the physical LED away from the green ST_ON indicator.
+        Failures are silently ignored because the serial link is typically
+        already degraded when this method is called.
+        """
+        device = self.device
+        if device is None:
+            return
+        try:
+            device.set_enable(False, timeout_s=1.0)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _format_status(self, status: int, device: Any | None = None) -> str:
         device = self.device if device is None else device
         if device is None:
@@ -1667,6 +1874,18 @@ class DMMRController(DeviceController):
             return
         if hasattr(self.controllerParent, "onAction"):
             self.controllerParent.onAction.state = False
+        sync_local = getattr(self.controllerParent, "_sync_local_on_action", None)
+        if callable(sync_local):
+            sync_local()
+
+    def _restore_on_ui_state(self) -> None:
+        """Restore toolbar ON/OFF widgets back to ON after a failed shutdown."""
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(True)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = True
         sync_local = getattr(self.controllerParent, "_sync_local_on_action", None)
         if callable(sync_local):
             sync_local()
