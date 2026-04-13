@@ -20,9 +20,9 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
     High-level CGC AMX driver.
 
     The preferred workflow is:
-    1. connect
-    2. load a known user configuration
-    3. adjust frequency, duty cycle or delays only
+    1. initialize with a known standby and/or operating configuration
+    2. adjust frequency, duty cycle or delays only
+    3. shutdown when the sequence is complete
     """
 
     _INSTRUMENT_NAME = "AMX"
@@ -164,6 +164,86 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             )
         except Exception:
             self.connected = False
+            raise
+
+    def _cleanup_initialize_failure(self) -> None:
+        """Best-effort cleanup after a failed AMX initialize() sequence."""
+        if self._transport_poisoned:
+            self.disconnect()
+            return
+
+        try:
+            self.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "AMX initialize cleanup failed after startup error: "
+                f"{exc}"
+            )
+
+    def initialize(
+        self,
+        timeout_s: float = 5.0,
+        *,
+        standby_config: Optional[int] = None,
+        operating_config: Optional[int] = None,
+        require_standby_device_disabled: bool = True,
+    ) -> dict:
+        """
+        Run the routine AMX startup sequence.
+
+        initialize() always establishes the transport with connect(). When a
+        validated standby configuration is available, it can be loaded first
+        and checked to confirm that the AMX device-enable flag stays cleared
+        before the operating configuration is applied.
+        """
+        if standby_config is None and operating_config is None:
+            raise ValueError(
+                "initialize() requires standby_config, operating_config, or both."
+            )
+
+        was_connected = self.connected
+        self.logger.info(
+            f"Initializing AMX device {self.device_id}"
+            + (
+                f" with standby config {standby_config}"
+                if standby_config is not None
+                else ""
+            )
+            + (
+                f" and operating config {operating_config}"
+                if operating_config is not None
+                else ""
+            )
+        )
+
+        initialization_state = {}
+        try:
+            self.connect(timeout_s=timeout_s)
+
+            if standby_config is not None:
+                self.load_config(standby_config)
+                device_enabled = self.get_device_enabled()
+                initialization_state.update(
+                    {
+                        "standby_config": int(standby_config),
+                        "device_enabled": device_enabled,
+                    }
+                )
+
+                if require_standby_device_disabled and device_enabled:
+                    raise RuntimeError(
+                        "AMX standby configuration left the device enabled. "
+                        "Refusing to continue initialization."
+                    )
+
+            if operating_config is not None:
+                self.load_config(operating_config)
+                initialization_state["operating_config"] = int(operating_config)
+
+            return initialization_state
+        except Exception:
+            if was_connected or self.connected or self._transport_poisoned:
+                self._cleanup_initialize_failure()
             raise
 
     def disconnect(self) -> bool:
@@ -581,6 +661,10 @@ class AMX(ProcessIsolatedClientMixin):
     _INSTRUMENT_NAME = "AMX"
     _PROCESS_CONTROLLER_CLASS = _AMXController
     _PROCESS_CONTROLLER_PATH = "cgc.amx.amx:_AMXController"
+    _PROCESS_TIMEOUT_RULES = {
+        "connect": (4.0, 5.0, 15.0),
+        "initialize": (8.0, 5.0, 30.0),
+    }
     _active_connections_lock = _AMXController._active_connections_lock
     _active_connections = _AMXController._active_connections
 

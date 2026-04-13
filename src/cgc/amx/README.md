@@ -7,25 +7,32 @@ Python driver for the CGC `AMX-CTRL-4ED` power switch unit.
 This driver follows the vendor recommendation:
 
 1. connect to the device
-2. load a known user configuration first
-3. keep that configuration as the reproducible operating mode
-4. adjust only frequency, duty cycle or delays at runtime
+2. if available, load a validated standby configuration first
+3. confirm that the device stays disabled in that standby state
+4. load the operating configuration
+5. adjust only frequency, duty cycle or delays at runtime
 
 ## Recommended API
 
 For normal application code:
 
 - construct the driver with `AMX(..., com=..., port=...)`
-- call `connect()`
-- then call `load_config(config_number)`
+- prefer `initialize(standby_config=..., operating_config=...)` when you have a known safe disabled AMX config
+- or use `initialize(operating_config=...)` when you only want a routine connect-and-load sequence
+- keep `connect()` and `load_config(...)` for step-by-step control
 - use the high-level frequency, pulser and switch helpers
-- use `get_product_info()` for stable metadata
-- use `collect_housekeeping()` for a structured runtime snapshot
+- reserve `get_product_info()` and `collect_housekeeping()` for metadata, troubleshooting, or maintenance checks
 - finish with `shutdown()`
 
 `load_config(config_number)` applies the configuration stored in the controller
 NVM. Depending on how that CGC configuration was saved, it may also apply
 device enable and active timing or switching settings.
+
+`initialize()` always establishes the transport with `connect()`. If
+`standby_config` is provided, it loads that configuration first, reads back the
+device enable state, and by default refuses to continue if that standby config
+leaves the AMX enabled. `operating_config` remains optional because the driver
+does not assume a universal standby slot number or content for every AMX.
 
 Do not treat `open_port()` as the normal entry point. It is a low-level DLL
 primitive exposed by `amx_base.py`. `connect()` remains the safe transport
@@ -71,9 +78,16 @@ process boundaries.
 ```python
 from cgc.amx import AMX
 
+STANDBY_CONFIG = None  # Optional: replace with a validated disabled config.
+OPERATING_CONFIG = 40
+
 amx = AMX("amx_main", com=8, port=0)
-amx.connect()
-amx.load_config(40)
+startup_kwargs = {"operating_config": OPERATING_CONFIG}
+if STANDBY_CONFIG is not None:
+    startup_kwargs["standby_config"] = STANDBY_CONFIG
+
+startup_state = amx.initialize(**startup_kwargs)
+print(startup_state)
 try:
     amx.set_frequency_hz(2_000.0)
     amx.set_pulser_duty_cycle(0, 0.5)
