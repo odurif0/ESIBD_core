@@ -63,6 +63,8 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         self.com = int(com)
         self.port_num = int(port)
         self.baudrate = int(baudrate)
+        if self.baudrate <= 0:
+            raise ValueError("baudrate must be > 0")
         self.connected = False
         self._dll_port_claimed = False
         self._transport_poisoned = False
@@ -153,10 +155,20 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             f"PSU shutdown completed with {len(errors)} error(s): {details}"
         ) from errors[0][1]
 
-    def _warn_if_unexpected_product_id(self):
+    def _warn_if_unexpected_product_id(self, timeout_s: Optional[float] = None):
         try:
-            status, product_id = self._call_locked(PSUBase.get_product_id, self)
+            if timeout_s is None:
+                status, product_id = self._call_locked(PSUBase.get_product_id, self)
+            else:
+                status, product_id = self._call_locked_with_timeout(
+                    PSUBase.get_product_id,
+                    self._resolve_io_timeout(timeout_s),
+                    "get_product_id",
+                    self,
+                )
         except Exception as exc:
+            if self._transport_poisoned:
+                raise
             self.logger.debug(f"Skipping PSU identity probe after connect: {exc}")
             return
 
@@ -183,6 +195,7 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                 )
                 return True
 
+            timeout_s = self._resolve_io_timeout(timeout_s)
             self._warn_on_other_process_ports()
             self.logger.info(
                 f"Connecting to PSU device {self.device_id} "
@@ -207,7 +220,7 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             )
             if baud_status == self.NO_ERR:
                 self.connected = True
-                self._warn_if_unexpected_product_id()
+                self._warn_if_unexpected_product_id(timeout_s=timeout_s)
                 self.logger.info(
                     f"Successfully connected to PSU device {self.device_id} "
                     f"(baud rate: {actual_baud})"
@@ -307,7 +320,6 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
     def disconnect(self, timeout_s: Optional[float] = None) -> bool:
         """Disconnect from the PSU device."""
         was_connected = self.connected
-        self.connected = False
         timeout_s = self._resolve_io_timeout(timeout_s)
 
         try:
@@ -331,6 +343,7 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                 "close_port",
             )
             if status == self.NO_ERR:
+                self.connected = False
                 self._set_port_claimed(False)
                 self.logger.info(
                     f"Successfully disconnected PSU device {self.device_id}"
@@ -412,16 +425,16 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         self._raise_on_status(status, "get_config_list")
         return [], []
 
-    def list_configs(self, include_empty: bool = False) -> list[dict]:
-        """Return PSU configurations with flags and names."""
-        self._require_connected()
-        active_list, valid_list = self._call_locked(self._get_config_flags_list_unlocked)
+    def _list_configs_unlocked(self, include_empty: bool = False) -> list[dict]:
+        """Collect config metadata while the caller holds self.thread_lock."""
+        assert self.thread_lock.locked(), "caller must hold self.thread_lock"
+        active_list, valid_list = self._get_config_flags_list_unlocked()
 
         configs = []
         for index, (active, valid) in enumerate(zip(active_list, valid_list)):
             if not include_empty and not (active or valid):
                 continue
-            name_status, name = self._call_locked(PSUBase.get_config_name, self, index)
+            name_status, name = PSUBase.get_config_name(self, index)
             self._raise_on_status(name_status, f"get_config_name({index})")
             configs.append(
                 {
@@ -432,6 +445,26 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                 }
             )
         return configs
+
+    def list_configs(
+        self,
+        include_empty: bool = False,
+        timeout_s: Optional[float] = None,
+    ) -> list[dict]:
+        """Return PSU configurations with flags and names."""
+        self._require_connected()
+        return self._call_locked_with_timeout(
+            self._list_configs_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=2.0,
+                additive=5.0,
+                minimum=10.0,
+                maximum=30.0,
+            ),
+            "list_configs",
+            include_empty,
+        )
 
     def load_config(self, config_number: int, timeout_s: Optional[float] = None) -> None:
         """Load and apply one PSU configuration stored in controller NVM."""

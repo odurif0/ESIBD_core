@@ -34,6 +34,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         2: "pulser_2",
         3: "pulser_3",
     }
+    _DEFAULT_IO_TIMEOUT_S = 5.0
     _EXPECTED_PRODUCT_TOKENS = ("AMX", "AMX-CTRL")
 
     def __init__(
@@ -56,6 +57,8 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         self.com = int(com)
         self.port_num = int(port)
         self.baudrate = int(baudrate)
+        if self.baudrate <= 0:
+            raise ValueError("baudrate must be > 0")
         self.connected = False
         self._dll_port_claimed = False
         self._transport_poisoned = False
@@ -84,10 +87,68 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         if status != self.NO_ERR:
             raise RuntimeError(f"AMX {action} failed: {self.format_status(status)}")
 
-    def _warn_if_unexpected_product_id(self):
+    def _resolve_io_timeout(self, timeout_s: Optional[float] = None) -> float:
+        if timeout_s is None:
+            return self._DEFAULT_IO_TIMEOUT_S
+        timeout_s = float(timeout_s)
+        if timeout_s <= 0:
+            raise ValueError("AMX timeout_s must be greater than 0.")
+        return timeout_s
+
+    def _resolve_batch_timeout(
+        self,
+        timeout_s: Optional[float],
+        *,
+        multiplier: float,
+        additive: float = 0.0,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        batch_timeout = (
+            self._resolve_io_timeout(timeout_s) * float(multiplier)
+        ) + float(additive)
+        if minimum is not None:
+            batch_timeout = max(batch_timeout, float(minimum))
+        if maximum is not None:
+            batch_timeout = min(batch_timeout, float(maximum))
+        return batch_timeout
+
+    @staticmethod
+    def _call_with_optional_timeout(method, *args, timeout_s: Optional[float] = None):
+        if timeout_s is None:
+            return method(*args)
+        return method(*args, timeout_s=timeout_s)
+
+    @staticmethod
+    def _append_shutdown_error(
+        errors: list[tuple[str, BaseException]],
+        step: str,
+        exc: BaseException,
+    ) -> None:
+        errors.append((step, exc))
+
+    def _raise_shutdown_errors(self, errors: list[tuple[str, BaseException]]) -> None:
+        if not errors:
+            return
+        details = "; ".join(f"{step}: {exc}" for step, exc in errors)
+        raise RuntimeError(
+            f"AMX shutdown completed with {len(errors)} error(s): {details}"
+        ) from errors[0][1]
+
+    def _warn_if_unexpected_product_id(self, timeout_s: Optional[float] = None):
         try:
-            status, product_id = self._call_locked(AMXBase.get_product_id, self)
+            if timeout_s is None:
+                status, product_id = self._call_locked(AMXBase.get_product_id, self)
+            else:
+                status, product_id = self._call_locked_with_timeout(
+                    AMXBase.get_product_id,
+                    self._resolve_io_timeout(timeout_s),
+                    "get_product_id",
+                    self,
+                )
         except Exception as exc:
+            if self._transport_poisoned:
+                raise
             self.logger.debug(f"Skipping AMX identity probe after connect: {exc}")
             return
 
@@ -114,6 +175,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 )
                 return True
 
+            timeout_s = self._resolve_io_timeout(timeout_s)
             self._warn_on_other_process_ports()
             self.logger.info(
                 f"Connecting to AMX device {self.device_id} "
@@ -138,7 +200,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             )
             if baud_status == self.NO_ERR:
                 self.connected = True
-                self._warn_if_unexpected_product_id()
+                self._warn_if_unexpected_product_id(timeout_s=timeout_s)
                 self.logger.info(
                     f"Successfully connected to AMX device {self.device_id} "
                     f"(baud rate: {actual_baud})"
@@ -165,14 +227,14 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             self.connected = False
             raise
 
-    def _cleanup_initialize_failure(self) -> None:
+    def _cleanup_initialize_failure(self, timeout_s: float) -> None:
         """Best-effort cleanup after a failed AMX initialize() sequence."""
         if self._transport_poisoned:
-            self.disconnect()
+            self.disconnect(timeout_s=timeout_s)
             return
 
         try:
-            self.shutdown()
+            self.shutdown(timeout_s=timeout_s)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(
                 "AMX initialize cleanup failed after startup error: "
@@ -200,6 +262,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 "initialize() requires standby_config, operating_config, or both."
             )
 
+        timeout_s = self._resolve_io_timeout(timeout_s)
         was_connected = self.connected
         self.logger.info(
             f"Initializing AMX device {self.device_id}"
@@ -220,8 +283,8 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             self.connect(timeout_s=timeout_s)
 
             if standby_config is not None:
-                self.load_config(standby_config)
-                device_enabled = self.get_device_enabled()
+                self.load_config(standby_config, timeout_s=timeout_s)
+                device_enabled = self.get_device_enabled(timeout_s=timeout_s)
                 initialization_state.update(
                     {
                         "standby_config": int(standby_config),
@@ -236,19 +299,19 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                     )
 
             if operating_config is not None:
-                self.load_config(operating_config)
+                self.load_config(operating_config, timeout_s=timeout_s)
                 initialization_state["operating_config"] = int(operating_config)
 
             return initialization_state
         except Exception:
             if was_connected or self.connected or self._transport_poisoned:
-                self._cleanup_initialize_failure()
+                self._cleanup_initialize_failure(timeout_s)
             raise
 
-    def disconnect(self) -> bool:
+    def disconnect(self, timeout_s: Optional[float] = None) -> bool:
         """Disconnect from the AMX device."""
         was_connected = self.connected
-        self.connected = False
+        timeout_s = self._resolve_io_timeout(timeout_s)
 
         try:
             if self._transport_poisoned:
@@ -265,8 +328,13 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 return True
 
             self.logger.info(f"Disconnecting AMX device {self.device_id}")
-            status = self._call_locked(super().close_port)
+            status = self._call_locked_with_timeout(
+                super().close_port,
+                timeout_s,
+                "close_port",
+            )
             if status == self.NO_ERR:
+                self.connected = False
                 self._set_port_claimed(False)
                 self.logger.info(
                     f"Successfully disconnected AMX device {self.device_id}"
@@ -295,17 +363,17 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             "transport_poisoned": self._transport_poisoned,
         }
 
-    def list_configs(self, include_empty: bool = False) -> list[dict]:
-        """Return AMX configurations with flags and names."""
-        self._require_connected()
-        status, active_list, valid_list = self._call_locked(AMXBase.get_config_list, self)
+    def _list_configs_unlocked(self, include_empty: bool = False) -> list[dict]:
+        """Collect config metadata while the caller holds self.thread_lock."""
+        assert self.thread_lock.locked(), "caller must hold self.thread_lock"
+        status, active_list, valid_list = AMXBase.get_config_list(self)
         self._raise_on_status(status, "get_config_list")
 
         configs = []
         for index, (active, valid) in enumerate(zip(active_list, valid_list)):
             if not include_empty and not (active or valid):
                 continue
-            name_status, name = self._call_locked(AMXBase.get_config_name, self, index)
+            name_status, name = AMXBase.get_config_name(self, index)
             self._raise_on_status(name_status, f"get_config_name({index})")
             configs.append(
                 {
@@ -317,34 +385,92 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             )
         return configs
 
-    def load_config(self, config_number: int) -> None:
+    def list_configs(
+        self,
+        include_empty: bool = False,
+        timeout_s: Optional[float] = None,
+    ) -> list[dict]:
+        """Return AMX configurations with flags and names."""
+        self._require_connected()
+        return self._call_locked_with_timeout(
+            self._list_configs_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=2.0,
+                additive=5.0,
+                minimum=10.0,
+                maximum=30.0,
+            ),
+            "list_configs",
+            include_empty,
+        )
+
+    def load_config(self, config_number: int, timeout_s: Optional[float] = None) -> None:
         """Load and apply one AMX configuration stored in controller NVM."""
         self._require_connected()
         self.logger.info(f"Loading AMX config {config_number}")
-        status = self._call_locked(AMXBase.load_current_config, self, config_number)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.load_current_config,
+            timeout_s,
+            "load_current_config",
+            self,
+            config_number,
+        )
         self._raise_on_status(status, f"load_current_config({config_number})")
 
-    def set_device_enabled(self, enable: bool) -> None:
+    def set_device_enabled(
+        self,
+        enable: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set the AMX device enable flag."""
         self._require_connected()
-        status = self._call_locked(AMXBase.set_device_enable, self, enable)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.set_device_enable,
+            timeout_s,
+            "set_device_enable",
+            self,
+            enable,
+        )
         self._raise_on_status(status, f"set_device_enable({enable})")
 
-    def get_device_enabled(self) -> bool:
+    def get_device_enabled(self, timeout_s: Optional[float] = None) -> bool:
         """Return the AMX device enable flag."""
         self._require_connected()
-        status, enabled = self._call_locked(AMXBase.get_device_enable, self)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, enabled = self._call_locked_with_timeout(
+            AMXBase.get_device_enable,
+            timeout_s,
+            "get_device_enable",
+            self,
+        )
         self._raise_on_status(status, "get_device_enable")
         return enabled
 
-    def get_frequency_hz(self) -> float:
+    def get_frequency_hz(self, timeout_s: Optional[float] = None) -> float:
         """Return the oscillator frequency in hertz."""
         self._require_connected()
-        status, period = self._call_locked(AMXBase.get_oscillator_period, self)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, period = self._call_locked_with_timeout(
+            AMXBase.get_oscillator_period,
+            timeout_s,
+            "get_oscillator_period",
+            self,
+        )
         self._raise_on_status(status, "get_oscillator_period")
         return self.CLOCK / (period + self.OSC_OFFSET)
 
-    def set_frequency_hz(self, frequency_hz: float) -> None:
+    def get_frequency_khz(self, timeout_s: Optional[float] = None) -> float:
+        """Return the oscillator frequency in kilohertz."""
+        return self.get_frequency_hz(timeout_s=timeout_s) / 1000.0
+
+    def set_frequency_hz(
+        self,
+        frequency_hz: float,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set the oscillator frequency in hertz."""
         if frequency_hz <= 0:
             raise ValueError("frequency_hz must be > 0")
@@ -355,84 +481,174 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 f"oscillator period register: {period}"
             )
         self._require_connected()
-        status = self._call_locked(AMXBase.set_oscillator_period, self, period)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.set_oscillator_period,
+            timeout_s,
+            "set_oscillator_period",
+            self,
+            period,
+        )
         self._raise_on_status(status, f"set_oscillator_period({period})")
 
-    def set_frequency_khz(self, frequency_khz: float) -> None:
+    def set_frequency_khz(
+        self,
+        frequency_khz: float,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set the oscillator frequency in kilohertz."""
-        self.set_frequency_hz(float(frequency_khz) * 1000.0)
+        self.set_frequency_hz(float(frequency_khz) * 1000.0, timeout_s=timeout_s)
 
-    def get_pulser_delay_ticks(self, pulser_no: int) -> int:
+    def get_pulser_delay_ticks(
+        self,
+        pulser_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> int:
         """Return one pulser delay register."""
         self._require_connected()
-        status, delay = self._call_locked(AMXBase.get_pulser_delay, self, pulser_no)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, delay = self._call_locked_with_timeout(
+            AMXBase.get_pulser_delay,
+            timeout_s,
+            f"get_pulser_delay[{pulser_no}]",
+            self,
+            pulser_no,
+        )
         self._raise_on_status(status, f"get_pulser_delay({pulser_no})")
         return delay
 
-    def set_pulser_delay_ticks(self, pulser_no: int, delay: int) -> None:
+    def set_pulser_delay_ticks(
+        self,
+        pulser_no: int,
+        delay: int,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set one pulser delay register."""
         if int(delay) < 0:
             raise ValueError("delay must be >= 0")
         self._require_connected()
-        status = self._call_locked(AMXBase.set_pulser_delay, self, pulser_no, delay)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.set_pulser_delay,
+            timeout_s,
+            f"set_pulser_delay[{pulser_no}]",
+            self,
+            pulser_no,
+            delay,
+        )
         self._raise_on_status(status, f"set_pulser_delay({pulser_no}, {delay})")
 
-    def get_pulser_delay_seconds(self, pulser_no: int) -> float:
+    def get_pulser_delay_seconds(
+        self,
+        pulser_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> float:
         """Return one pulser delay in seconds."""
-        delay = self.get_pulser_delay_ticks(pulser_no)
+        delay = self.get_pulser_delay_ticks(pulser_no, timeout_s=timeout_s)
         return (delay + self.PULSER_DELAY_OFFSET) / self.CLOCK
 
-    def set_pulser_width_ticks(self, pulser_no: int, width: int) -> None:
+    def set_pulser_width_ticks(
+        self,
+        pulser_no: int,
+        width: int,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set one pulser width register."""
         if int(width) < 0:
             raise ValueError("width must be >= 0")
         self._require_connected()
-        status = self._call_locked(AMXBase.set_pulser_width, self, pulser_no, width)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.set_pulser_width,
+            timeout_s,
+            f"set_pulser_width[{pulser_no}]",
+            self,
+            pulser_no,
+            width,
+        )
         self._raise_on_status(status, f"set_pulser_width({pulser_no}, {width})")
 
-    def get_pulser_width_ticks(self, pulser_no: int) -> int:
+    def get_pulser_width_ticks(
+        self,
+        pulser_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> int:
         """Return one pulser width register."""
         self._require_connected()
-        status, width = self._call_locked(AMXBase.get_pulser_width, self, pulser_no)
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, width = self._call_locked_with_timeout(
+            AMXBase.get_pulser_width,
+            timeout_s,
+            f"get_pulser_width[{pulser_no}]",
+            self,
+            pulser_no,
+        )
         self._raise_on_status(status, f"get_pulser_width({pulser_no})")
         return width
 
-    def get_pulser_width_seconds(self, pulser_no: int) -> float:
+    def get_pulser_width_seconds(
+        self,
+        pulser_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> float:
         """Return one pulser width in seconds."""
-        width = self.get_pulser_width_ticks(pulser_no)
+        width = self.get_pulser_width_ticks(pulser_no, timeout_s=timeout_s)
         return (width + self.PULSER_WIDTH_OFFSET) / self.CLOCK
 
-    def set_pulser_duty_cycle(self, pulser_no: int, duty_cycle: float) -> None:
-        """Set one pulser duty cycle using the current oscillator period."""
-        if not 0 < duty_cycle <= 1:
-            raise ValueError("duty_cycle must satisfy 0 < duty_cycle <= 1")
+    def _set_pulser_duty_cycle_unlocked(self, pulser_no: int, duty_cycle: float) -> None:
+        """Compute and set pulser width while holding self.thread_lock."""
+        assert self.thread_lock.locked(), "caller must hold self.thread_lock"
 
-        self._require_connected()
-        status, period = self._call_locked(AMXBase.get_oscillator_period, self)
+        status, period = AMXBase.get_oscillator_period(self)
         self._raise_on_status(status, "get_oscillator_period")
 
         total_ticks = period + self.OSC_OFFSET
-        width_register = round(total_ticks * float(duty_cycle) - self.PULSER_WIDTH_OFFSET)
+        width_register = round(total_ticks * duty_cycle - self.PULSER_WIDTH_OFFSET)
         if width_register < 0:
             raise ValueError(
                 f"duty_cycle={duty_cycle} produces an invalid width register: "
                 f"{width_register}"
             )
 
-        status = self._call_locked(
-            AMXBase.set_pulser_width, self, pulser_no, width_register
-        )
+        status = AMXBase.set_pulser_width(self, pulser_no, width_register)
         self._raise_on_status(
             status, f"set_pulser_width({pulser_no}, {width_register})"
         )
 
+    def set_pulser_duty_cycle(
+        self,
+        pulser_no: int,
+        duty_cycle: float,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Set one pulser duty cycle using the current oscillator period."""
+        if not 0 < duty_cycle <= 1:
+            raise ValueError("duty_cycle must satisfy 0 < duty_cycle <= 1")
+
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        self._call_locked_with_timeout(
+            self._set_pulser_duty_cycle_unlocked,
+            timeout_s,
+            f"set_pulser_duty_cycle[{pulser_no}]",
+            pulser_no,
+            float(duty_cycle),
+        )
+
     def set_switch_trigger_delay(
-        self, switch_no: int, rise_delay: int, fall_delay: int
+        self,
+        switch_no: int,
+        rise_delay: int,
+        fall_delay: int,
+        timeout_s: Optional[float] = None,
     ) -> None:
         """Set one switch coarse trigger rise/fall delays."""
         self._require_connected()
-        status = self._call_locked(
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
             AMXBase.set_switch_trigger_delay,
+            timeout_s,
+            f"set_switch_trigger_delay[{switch_no}]",
             self,
             switch_no,
             rise_delay,
@@ -443,30 +659,59 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             f"set_switch_trigger_delay({switch_no}, {rise_delay}, {fall_delay})",
         )
 
-    def get_switch_trigger_delay(self, switch_no: int) -> tuple[int, int]:
+    def get_switch_trigger_delay(
+        self,
+        switch_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[int, int]:
         """Return one switch coarse trigger rise/fall delays."""
         self._require_connected()
-        status, rise_delay, fall_delay = self._call_locked(
-            AMXBase.get_switch_trigger_delay, self, switch_no
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, rise_delay, fall_delay = self._call_locked_with_timeout(
+            AMXBase.get_switch_trigger_delay,
+            timeout_s,
+            f"get_switch_trigger_delay[{switch_no}]",
+            self,
+            switch_no,
         )
         self._raise_on_status(status, f"get_switch_trigger_delay({switch_no})")
         return rise_delay, fall_delay
 
-    def set_switch_enable_delay(self, switch_no: int, delay: int) -> None:
+    def set_switch_enable_delay(
+        self,
+        switch_no: int,
+        delay: int,
+        timeout_s: Optional[float] = None,
+    ) -> None:
         """Set one switch coarse enable delay."""
         self._require_connected()
-        status = self._call_locked(
-            AMXBase.set_switch_enable_delay, self, switch_no, delay
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            AMXBase.set_switch_enable_delay,
+            timeout_s,
+            f"set_switch_enable_delay[{switch_no}]",
+            self,
+            switch_no,
+            delay,
         )
         self._raise_on_status(
             status, f"set_switch_enable_delay({switch_no}, {delay})"
         )
 
-    def get_switch_enable_delay(self, switch_no: int) -> int:
+    def get_switch_enable_delay(
+        self,
+        switch_no: int,
+        timeout_s: Optional[float] = None,
+    ) -> int:
         """Return one switch coarse enable delay."""
         self._require_connected()
-        status, delay = self._call_locked(
-            AMXBase.get_switch_enable_delay, self, switch_no
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status, delay = self._call_locked_with_timeout(
+            AMXBase.get_switch_enable_delay,
+            timeout_s,
+            f"get_switch_enable_delay[{switch_no}]",
+            self,
+            switch_no,
         )
         self._raise_on_status(status, f"get_switch_enable_delay({switch_no})")
         return delay
@@ -497,10 +742,20 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             },
         }
 
-    def get_product_info(self) -> dict:
+    def get_product_info(self, timeout_s: Optional[float] = None) -> dict:
         """Return stable product, firmware and hardware metadata."""
         self._require_connected()
-        return self._call_locked(self._get_product_info_unlocked)
+        return self._call_locked_with_timeout(
+            self._get_product_info_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=2.0,
+                additive=5.0,
+                minimum=10.0,
+                maximum=20.0,
+            ),
+            "get_product_info",
+        )
 
     def _collect_housekeeping_unlocked(self) -> dict:
         main_status, main_state_hex, main_state_name = AMXBase.get_main_state(self)
@@ -628,18 +883,30 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             "switches": switches,
         }
 
-    def collect_housekeeping(self) -> dict:
+    def collect_housekeeping(self, timeout_s: Optional[float] = None) -> dict:
         """Return a structured runtime snapshot suitable for monitoring."""
         self._require_connected()
-        return self._call_locked(self._collect_housekeeping_unlocked)
+        return self._call_locked_with_timeout(
+            self._collect_housekeeping_unlocked,
+            self._resolve_batch_timeout(
+                timeout_s,
+                multiplier=3.0,
+                additive=10.0,
+                minimum=20.0,
+                maximum=60.0,
+            ),
+            "collect_housekeeping",
+        )
 
     def shutdown(
         self,
         *,
         standby_config: int | None = None,
         disable_device: bool = True,
+        timeout_s: Optional[float] = None,
     ) -> bool:
         """Disable the AMX or load an explicit standby config, then disconnect."""
+        errors: list[tuple[str, BaseException]] = []
         if standby_config is not None and disable_device:
             raise ValueError(
                 "standby_config cannot be combined with disable_device. Either "
@@ -648,10 +915,39 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             )
 
         if self.connected and standby_config is not None:
-            self.load_config(standby_config)
+            try:
+                self._call_with_optional_timeout(
+                    self.load_config,
+                    standby_config,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(
+                    errors, f"load_config({standby_config})", exc
+                )
         if self.connected and disable_device:
-            self.set_device_enabled(False)
-        return self.disconnect()
+            try:
+                self._call_with_optional_timeout(
+                    self.set_device_enabled,
+                    False,
+                    timeout_s=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._append_shutdown_error(errors, "set_device_enabled(False)", exc)
+
+        disconnected = self._call_with_optional_timeout(
+            self.disconnect,
+            timeout_s=timeout_s,
+        )
+        if not disconnected:
+            self._append_shutdown_error(
+                errors,
+                "disconnect()",
+                RuntimeError("AMX disconnect failed during shutdown."),
+            )
+
+        self._raise_shutdown_errors(errors)
+        return disconnected
 
 
 class AMX(ProcessIsolatedClientMixin):
