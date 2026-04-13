@@ -48,6 +48,19 @@ def test_amx_base_raises_clear_error_when_dll_fails(monkeypatch):
         AMXBase(com=8, error_codes_path=ERROR_CODES_PATH)
 
 
+def test_amx_base_dll_error_mentions_64bit_python_for_x64_bundle(monkeypatch):
+    monkeypatch.setattr("cgc.amx.amx_base.sys.platform", "win32")
+    monkeypatch.setattr("cgc.amx.amx_base._python_is_64bit", lambda: False)
+
+    def raise_os_error(_path):
+        raise OSError("bad image format")
+
+    monkeypatch.setattr("cgc.amx.amx_base.ctypes.WinDLL", raise_os_error, raising=False)
+
+    with pytest.raises(AMXDllLoadError, match="64-bit Python"):
+        AMXBase(com=8, error_codes_path=ERROR_CODES_PATH)
+
+
 def test_amx_base_get_device_enable_uses_windows_bool(monkeypatch):
     monkeypatch.setattr("cgc.amx.amx_base.sys.platform", "win32")
     dll = Mock()
@@ -66,9 +79,31 @@ def test_amx_base_get_device_enable_uses_windows_bool(monkeypatch):
     assert base.get_device_enable() == (AMXBase.NO_ERR, True)
 
 
+def test_amx_base_decodes_config_name_with_replacement(monkeypatch):
+    monkeypatch.setattr("cgc.amx.amx_base.sys.platform", "win32")
+    dll = Mock()
+
+    def fake_get_config_name(_port, _config_number, name):
+        name.value = b"amx-\xffcfg"
+        return AMXBase.NO_ERR
+
+    dll.COM_HVAMX4ED_GetConfigName.side_effect = fake_get_config_name
+    monkeypatch.setattr("cgc.amx.amx_base.ctypes.WinDLL", lambda _path: dll, raising=False)
+
+    base = AMXBase(com=8, error_codes_path=ERROR_CODES_PATH)
+
+    assert base.get_config_name(0) == (AMXBase.NO_ERR, "amx-\ufffdcfg")
+
+
 def test_amx_rejects_unknown_init_kwargs():
     with pytest.raises(TypeError, match="Unexpected AMX init kwargs: unexpected"):
         AMX("amx_test", com=8, unexpected=True)
+
+
+@pytest.mark.parametrize("baudrate", [0, -1])
+def test_amx_rejects_non_positive_baudrate(baudrate):
+    with pytest.raises(ValueError, match="baudrate must be > 0"):
+        AMX("amx_test", com=8, baudrate=baudrate)
 
 
 def test_amx_external_logger_prefixes_device_id(monkeypatch, caplog):
@@ -185,6 +220,55 @@ def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch
     assert "HV-PSU-CTRL-2D" in caplog.text
 
 
+def test_connect_identity_probe_uses_timeout_safe_wrapper(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "open_port":
+            return backend.NO_ERR
+        if method.__name__ == "set_baud_rate":
+            return backend.NO_ERR, backend.baudrate
+        if method.__name__ == "get_product_id":
+            return backend.NO_ERR, "AMX-CTRL-4ED"
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.connect(timeout_s=2.5) is True
+
+    assert calls == [
+        ("open_port", 2.5, "open_port", (backend.com, backend.port_num)),
+        ("set_baud_rate", 2.5, "set_baud_rate", (backend.baudrate,)),
+        ("get_product_id", 2.5, "get_product_id", (backend,)),
+    ]
+
+
+def test_connect_fails_when_identity_probe_times_out(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        if method.__name__ == "open_port":
+            return backend.NO_ERR
+        if method.__name__ == "set_baud_rate":
+            return backend.NO_ERR, backend.baudrate
+        if method.__name__ == "get_product_id":
+            backend._poison_transport(step_name)
+            raise RuntimeError("timed out during get_product_id")
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    with pytest.raises(RuntimeError, match="timed out during get_product_id"):
+        backend.connect(timeout_s=2.0)
+
+    assert backend.connected is False
+    assert backend._transport_poisoned is True
+
+
 def test_set_frequency_hz_translates_to_oscillator_period(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     amx.connected = True
@@ -197,6 +281,23 @@ def test_set_frequency_hz_translates_to_oscillator_period(monkeypatch):
     assert called_period == expected_period
     assert called_self.device_id == amx.device_id
     assert called_self.com == amx.com
+
+
+def test_get_frequency_khz_returns_scaled_frequency(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    amx.connected = True
+    monkeypatch.setattr(
+        AMXBase,
+        "get_oscillator_period",
+        Mock(
+            return_value=(
+                AMXBase.NO_ERR,
+                round((AMXBase.CLOCK / 2_000.0) - AMXBase.OSC_OFFSET),
+            )
+        ),
+    )
+
+    assert amx.get_frequency_khz() == pytest.approx(2.0)
 
 
 def test_set_pulser_duty_cycle_uses_current_oscillator_period(monkeypatch):
@@ -213,6 +314,34 @@ def test_set_pulser_duty_cycle_uses_current_oscillator_period(monkeypatch):
     assert (called_pulser, called_width) == (0, 49998)
     assert called_self.device_id == amx.device_id
     assert called_self.com == amx.com
+
+
+def test_set_pulser_duty_cycle_runs_in_single_locked_section(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    amx.connected = True
+    calls = []
+    monkeypatch.setattr(
+        AMXBase, "get_oscillator_period", lambda self: (self.NO_ERR, 99998)
+    )
+    monkeypatch.setattr(AMXBase, "set_pulser_width", Mock(return_value=AMXBase.NO_ERR))
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        with amx.thread_lock:
+            return method(*args, **kwargs)
+
+    monkeypatch.setattr(amx, "_call_locked_with_timeout", fake_locked_timeout)
+
+    amx.set_pulser_duty_cycle(1, 0.25, timeout_s=2.5)
+
+    assert calls == [
+        ("_set_pulser_duty_cycle_unlocked", 2.5, "set_pulser_duty_cycle[1]", (1, 0.25))
+    ]
+    called_self, called_pulser, called_width = AMXBase.set_pulser_width.call_args.args
+    assert called_self.device_id == amx.device_id
+    assert called_self.com == amx.com
+    assert called_pulser == 1
+    assert called_width == 24998
 
 
 def test_load_config_calls_vendor_wrapper(monkeypatch):
@@ -245,12 +374,14 @@ def test_initialize_runs_standby_then_operating_sequence_and_returns_state(monke
     monkeypatch.setattr(
         backend,
         "load_config",
-        lambda config_number: calls.append(("load_config", config_number)),
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
     )
     monkeypatch.setattr(
         backend,
         "get_device_enabled",
-        lambda: calls.append(("get_device_enabled",)) or False,
+        lambda timeout_s=None: calls.append(("get_device_enabled", timeout_s)) or False,
     )
 
     result = backend.initialize(
@@ -266,9 +397,9 @@ def test_initialize_runs_standby_then_operating_sequence_and_returns_state(monke
     }
     assert calls == [
         ("connect", 2.5),
-        ("load_config", 3),
-        ("get_device_enabled",),
-        ("load_config", 40),
+        ("load_config", 3, 2.5),
+        ("get_device_enabled", 2.5),
+        ("load_config", 40, 2.5),
     ]
 
 
@@ -286,7 +417,9 @@ def test_initialize_can_load_only_an_operating_config(monkeypatch):
     monkeypatch.setattr(
         backend,
         "load_config",
-        lambda config_number: calls.append(("load_config", config_number)),
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
     )
     monkeypatch.setattr(
         backend,
@@ -301,7 +434,7 @@ def test_initialize_can_load_only_an_operating_config(monkeypatch):
     }
     assert calls == [
         ("connect", 2.0),
-        ("load_config", 40),
+        ("load_config", 40, 2.0),
     ]
 
 
@@ -314,15 +447,15 @@ def test_initialize_rejects_standby_config_when_device_stays_enabled(monkeypatch
         return True
 
     monkeypatch.setattr(backend, "connect", fake_connect)
-    monkeypatch.setattr(backend, "load_config", lambda config_number: None)
-    monkeypatch.setattr(backend, "get_device_enabled", lambda: True)
+    monkeypatch.setattr(backend, "load_config", lambda config_number, timeout_s=None: None)
+    monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: True)
     shutdown = Mock(return_value=True)
     monkeypatch.setattr(backend, "shutdown", shutdown)
 
     with pytest.raises(RuntimeError, match="left the device enabled"):
         backend.initialize(timeout_s=2.0, standby_config=1)
 
-    shutdown.assert_called_once_with()
+    shutdown.assert_called_once_with(timeout_s=2.0)
 
 
 def test_initialize_uses_disconnect_cleanup_when_transport_is_poisoned(monkeypatch):
@@ -334,9 +467,9 @@ def test_initialize_uses_disconnect_cleanup_when_transport_is_poisoned(monkeypat
         return True
 
     monkeypatch.setattr(backend, "connect", fake_connect)
-    monkeypatch.setattr(backend, "load_config", lambda config_number: None)
+    monkeypatch.setattr(backend, "load_config", lambda config_number, timeout_s=None: None)
 
-    def fake_get_device_enabled():
+    def fake_get_device_enabled(timeout_s=None):
         backend._transport_poisoned = True
         raise RuntimeError("poisoned")
 
@@ -349,7 +482,7 @@ def test_initialize_uses_disconnect_cleanup_when_transport_is_poisoned(monkeypat
     with pytest.raises(RuntimeError, match="poisoned"):
         backend.initialize(timeout_s=2.0, standby_config=1)
 
-    disconnect.assert_called_once_with()
+    disconnect.assert_called_once_with(timeout_s=2.0)
 
 
 def test_shutdown_disables_device_by_default_and_propagates_errors(monkeypatch):
@@ -360,11 +493,11 @@ def test_shutdown_disables_device_by_default_and_propagates_errors(monkeypatch):
     )
     monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
 
-    with pytest.raises(RuntimeError, match="boom"):
+    with pytest.raises(RuntimeError, match="set_device_enabled\\(False\\): boom"):
         amx.shutdown()
 
     amx.set_device_enabled.assert_called_once_with(False)
-    amx.disconnect.assert_not_called()
+    amx.disconnect.assert_called_once()
 
 
 def test_shutdown_rejects_standby_config_when_disable_device_is_enabled(monkeypatch):
@@ -394,6 +527,149 @@ def test_shutdown_can_load_explicit_standby_config_without_disable_step(monkeypa
     amx.disconnect.assert_called_once()
 
 
+def test_amx_critical_operations_use_timeout_safe_wrapper(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "load_current_config":
+            return backend.NO_ERR
+        if method.__name__ == "set_device_enable":
+            return backend.NO_ERR
+        if method.__name__ == "get_device_enable":
+            return backend.NO_ERR, True
+        if method.__name__ == "set_oscillator_period":
+            return backend.NO_ERR
+        if method.__name__ == "get_oscillator_period":
+            return backend.NO_ERR, 99998
+        if method.__name__ == "set_pulser_delay":
+            return backend.NO_ERR
+        if method.__name__ == "get_pulser_delay":
+            return backend.NO_ERR, 100
+        if method.__name__ == "set_pulser_width":
+            return backend.NO_ERR
+        if method.__name__ == "get_pulser_width":
+            return backend.NO_ERR, 200
+        if method.__name__ == "set_switch_trigger_delay":
+            return backend.NO_ERR
+        if method.__name__ == "get_switch_trigger_delay":
+            return backend.NO_ERR, 3, 4
+        if method.__name__ == "set_switch_enable_delay":
+            return backend.NO_ERR
+        if method.__name__ == "get_switch_enable_delay":
+            return backend.NO_ERR, 5
+        if method.__name__ == "close_port":
+            return backend.NO_ERR
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    backend.load_config(40, timeout_s=2.0)
+    backend.set_device_enabled(True, timeout_s=2.1)
+    assert backend.get_device_enabled(timeout_s=2.2) is True
+    backend.set_frequency_hz(2_000.0, timeout_s=2.3)
+    assert backend.get_frequency_hz(timeout_s=2.4) == 1000.0
+    backend.set_pulser_delay_ticks(0, 7, timeout_s=2.5)
+    assert backend.get_pulser_delay_ticks(0, timeout_s=2.6) == 100
+    backend.set_pulser_width_ticks(0, 8, timeout_s=2.7)
+    assert backend.get_pulser_width_ticks(0, timeout_s=2.8) == 200
+    backend.set_switch_trigger_delay(0, 1, 2, timeout_s=2.9)
+    assert backend.get_switch_trigger_delay(0, timeout_s=3.0) == (3, 4)
+    backend.set_switch_enable_delay(0, 6, timeout_s=3.1)
+    assert backend.get_switch_enable_delay(0, timeout_s=3.2) == 5
+    assert backend.disconnect(timeout_s=3.3) is True
+    assert backend.connected is False
+
+    assert calls == [
+        ("load_current_config", 2.0, "load_current_config", (backend, 40)),
+        ("set_device_enable", 2.1, "set_device_enable", (backend, True)),
+        ("get_device_enable", 2.2, "get_device_enable", (backend,)),
+        ("set_oscillator_period", 2.3, "set_oscillator_period", (backend, 49998)),
+        ("get_oscillator_period", 2.4, "get_oscillator_period", (backend,)),
+        ("set_pulser_delay", 2.5, "set_pulser_delay[0]", (backend, 0, 7)),
+        ("get_pulser_delay", 2.6, "get_pulser_delay[0]", (backend, 0)),
+        ("set_pulser_width", 2.7, "set_pulser_width[0]", (backend, 0, 8)),
+        ("get_pulser_width", 2.8, "get_pulser_width[0]", (backend, 0)),
+        ("set_switch_trigger_delay", 2.9, "set_switch_trigger_delay[0]", (backend, 0, 1, 2)),
+        ("get_switch_trigger_delay", 3.0, "get_switch_trigger_delay[0]", (backend, 0)),
+        ("set_switch_enable_delay", 3.1, "set_switch_enable_delay[0]", (backend, 0, 6)),
+        ("get_switch_enable_delay", 3.2, "get_switch_enable_delay[0]", (backend, 0)),
+        ("close_port", 3.3, "close_port", ()),
+    ]
+
+
+def test_amx_batch_operations_use_timeout_safe_wrapper(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "_list_configs_unlocked":
+            return [{"index": 0, "name": "cfg0", "active": True, "valid": True}]
+        if method.__name__ == "_get_product_info_unlocked":
+            return {"product_no": 404}
+        if method.__name__ == "_collect_housekeeping_unlocked":
+            return {"device_enabled": True}
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.list_configs(timeout_s=3.0) == [
+        {"index": 0, "name": "cfg0", "active": True, "valid": True}
+    ]
+    assert backend.get_product_info(timeout_s=3.0) == {"product_no": 404}
+    assert backend.collect_housekeeping(timeout_s=3.0) == {"device_enabled": True}
+
+    assert calls == [
+        ("_list_configs_unlocked", 11.0, "list_configs", (False,)),
+        ("_get_product_info_unlocked", 11.0, "get_product_info", ()),
+        ("_collect_housekeeping_unlocked", 20.0, "collect_housekeeping", ()),
+    ]
+
+
+def test_amx_shutdown_forwards_explicit_timeout_to_each_best_effort_step(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    backend.connected = True
+    calls = []
+
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_device_enabled",
+        lambda enabled, timeout_s=None: calls.append(("device", enabled, timeout_s)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "disconnect",
+        lambda timeout_s=None: calls.append(("disconnect", timeout_s)) or True,
+    )
+
+    assert backend.shutdown(standby_config=5, disable_device=False, timeout_s=7.0) is True
+    assert calls == [
+        ("load_config", 5, 7.0),
+        ("disconnect", 7.0),
+    ]
+
+    calls.clear()
+    assert backend.shutdown(timeout_s=8.0) is True
+    assert calls == [
+        ("device", False, 8.0),
+        ("disconnect", 8.0),
+    ]
+
+
 def test_failed_disconnect_keeps_dll_port_claim_warning(monkeypatch, caplog):
     amx_a, dll_a = make_amx(monkeypatch, device_id="amx_a", com=8, port=0)
     amx_b, dll_b = make_amx(monkeypatch, device_id="amx_b", com=9, port=0)
@@ -410,7 +686,7 @@ def test_failed_disconnect_keeps_dll_port_claim_warning(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         amx_b.connect()
 
-    assert amx_a.connected is False
+    assert amx_a.connected is True
     assert amx_a._dll_port_claimed is True
     assert "same DLL port" in caplog.text
 

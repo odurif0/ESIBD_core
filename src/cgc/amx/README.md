@@ -69,6 +69,21 @@ notebooks. Advanced injected objects such as an external `logger` or
 `thread_lock` fall back to inline mode because they cannot be shared across
 process boundaries.
 
+## Timeout Recovery
+
+When an inline DLL call exceeds its timeout, the controller transport is marked
+unusable immediately.
+
+- `_transport_poisoned` becomes `True`
+- all later driver calls fail immediately and tell you to recreate the instance
+- the internal lock is intentionally not released, so the timed-out transport
+  cannot be reused unsafely
+- the blocked daemon thread may continue running in the background
+
+Recovery is explicit: create a new `AMX(...)` instance. On Windows process
+isolation, the blocked DLL call is confined to the worker process, which is
+terminated after an RPC timeout.
+
 ## Notebook
 
 - Manual notebook: [`docs/notebooks/cgc/amx_wrapper.ipynb`](../../../docs/notebooks/cgc/amx_wrapper.ipynb)

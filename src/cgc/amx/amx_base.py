@@ -17,6 +17,23 @@ class AMXDllLoadError(RuntimeError):
     """Raised when the vendor AMX DLL cannot be loaded."""
 
 
+def _python_is_64bit() -> bool:
+    return ctypes.sizeof(ctypes.c_void_p) >= 8
+
+
+def _format_dll_load_hint(dll_path: Path) -> str:
+    if dll_path.parent.name.lower() == "x64" and not _python_is_64bit():
+        return (
+            " The bundled DLL is 64-bit, but this Python interpreter is 32-bit. "
+            "Use 64-bit Python on Windows or pass a compatible 32-bit dll_path."
+        )
+    return ""
+
+
+def _decode_vendor_text(value: bytes) -> str:
+    return value.decode(errors="replace")
+
+
 class AMXBase:
     """Low-level CGC AMX driver backed by the vendor DLL."""
 
@@ -125,7 +142,8 @@ class AMXBase:
             self.amx_dll = ctypes.WinDLL(str(self.amx_dll_path))
         except OSError as exc:
             raise AMXDllLoadError(
-                f"Unable to load CGC AMX DLL from '{self.amx_dll_path}'."
+                f"Unable to load CGC AMX DLL from '{self.amx_dll_path}': {exc}."
+                f"{_format_dll_load_hint(self.amx_dll_path)}"
             ) from exc
 
         err_path = Path(error_codes_path) if error_codes_path is not None else (
@@ -477,7 +495,7 @@ class AMXBase:
         config_number = self._validate_config_number(config_number)
         name = ctypes.create_string_buffer(self.CONFIG_NAME_SIZE)
         status = self.amx_dll.COM_HVAMX4ED_GetConfigName(self.port, config_number, name)
-        return status, name.value.decode()
+        return status, _decode_vendor_text(name.value)
 
     def get_config_flags(self, config_number: int):
         """Get the active/valid flags for one configuration."""
@@ -555,13 +573,13 @@ class AMXBase:
         """Get the firmware date string."""
         date_string = ctypes.create_string_buffer(self.FW_DATE_SIZE)
         status = self.amx_dll.COM_HVAMX4ED_GetFWDate(self.port, date_string)
-        return status, date_string.value.decode()
+        return status, _decode_vendor_text(date_string.value)
 
     def get_product_id(self):
         """Get the product identification string."""
         identification = ctypes.create_string_buffer(self.PRODUCT_ID_SIZE)
         status = self.amx_dll.COM_HVAMX4ED_GetProductID(self.port, identification)
-        return status, identification.value.decode()
+        return status, _decode_vendor_text(identification.value)
 
     def get_product_no(self):
         """Get the product number."""

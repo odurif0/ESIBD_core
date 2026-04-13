@@ -48,6 +48,19 @@ def test_psu_base_raises_clear_error_when_dll_fails(monkeypatch):
         PSUBase(com=6, error_codes_path=ERROR_CODES_PATH)
 
 
+def test_psu_base_dll_error_mentions_64bit_python_for_x64_bundle(monkeypatch):
+    monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
+    monkeypatch.setattr("cgc.psu.psu_base._python_is_64bit", lambda: False)
+
+    def raise_os_error(_path):
+        raise OSError("bad image format")
+
+    monkeypatch.setattr("cgc.psu.psu_base.ctypes.WinDLL", raise_os_error, raising=False)
+
+    with pytest.raises(PSUDllLoadError, match="64-bit Python"):
+        PSUBase(com=6, error_codes_path=ERROR_CODES_PATH)
+
+
 def test_psu_base_get_psu_enable_uses_windows_bool(monkeypatch):
     monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
     dll = Mock()
@@ -68,9 +81,31 @@ def test_psu_base_get_psu_enable_uses_windows_bool(monkeypatch):
     assert base.get_psu_enable() == (PSUBase.NO_ERR, True, False)
 
 
+def test_psu_base_decodes_config_name_with_replacement(monkeypatch):
+    monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
+    dll = Mock()
+
+    def fake_get_config_name(_port, _config_number, name):
+        name.value = b"psu-\xffcfg"
+        return PSUBase.NO_ERR
+
+    dll.COM_HVPSU2D_GetConfigName.side_effect = fake_get_config_name
+    monkeypatch.setattr("cgc.psu.psu_base.ctypes.WinDLL", lambda _path: dll, raising=False)
+
+    base = PSUBase(com=6, error_codes_path=ERROR_CODES_PATH)
+
+    assert base.get_config_name(0) == (PSUBase.NO_ERR, "psu-\ufffdcfg")
+
+
 def test_psu_rejects_unknown_init_kwargs():
     with pytest.raises(TypeError, match="Unexpected PSU init kwargs: unexpected"):
         PSU("psu_test", com=6, unexpected=True)
+
+
+@pytest.mark.parametrize("baudrate", [0, -1])
+def test_psu_rejects_non_positive_baudrate(baudrate):
+    with pytest.raises(ValueError, match="baudrate must be > 0"):
+        PSU("psu_test", com=6, baudrate=baudrate)
 
 
 def test_psu_external_logger_prefixes_device_id(monkeypatch, caplog):
@@ -185,6 +220,32 @@ def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch
 
     assert "does not look like a PSU controller" in caplog.text
     assert "HV-AMX-CTRL-4ED" in caplog.text
+
+
+def test_connect_identity_probe_uses_timeout_safe_wrapper(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "open_port":
+            return backend.NO_ERR
+        if method.__name__ == "set_baud_rate":
+            return backend.NO_ERR, backend.baudrate
+        if method.__name__ == "get_product_id":
+            return backend.NO_ERR, "PSU-CTRL-2D"
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.connect(timeout_s=2.5) is True
+
+    assert calls == [
+        ("open_port", 2.5, "open_port", (backend.com, backend.port_num)),
+        ("set_baud_rate", 2.5, "set_baud_rate", (backend.baudrate,)),
+        ("get_product_id", 2.5, "get_product_id", (backend,)),
+    ]
 
 
 def test_load_config_calls_vendor_wrapper(monkeypatch):
@@ -484,7 +545,7 @@ def test_failed_disconnect_keeps_dll_port_claim_warning(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         psu_b.connect()
 
-    assert psu_a.connected is False
+    assert psu_a.connected is True
     assert psu_a._dll_port_claimed is True
     assert "same DLL port" in caplog.text
 
@@ -534,6 +595,28 @@ def test_list_configs_falls_back_to_per_config_flags(monkeypatch):
     assert configs == [
         {"index": 0, "name": "standby", "active": True, "valid": True},
         {"index": 2, "name": "test", "active": False, "valid": True},
+    ]
+
+
+def test_list_configs_uses_timeout_safe_wrapper(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    calls = []
+
+    def fake_locked_timeout(method, timeout_s, step_name, *args, **kwargs):
+        calls.append((method.__name__, timeout_s, step_name, args))
+        if method.__name__ == "_list_configs_unlocked":
+            return [{"index": 0, "name": "standby", "active": True, "valid": True}]
+        raise AssertionError(f"Unexpected method: {method.__name__}")
+
+    monkeypatch.setattr(backend, "_call_locked_with_timeout", fake_locked_timeout)
+
+    assert backend.list_configs(timeout_s=3.0) == [
+        {"index": 0, "name": "standby", "active": True, "valid": True}
+    ]
+    assert calls == [
+        ("_list_configs_unlocked", 11.0, "list_configs", (False,)),
     ]
 
 
@@ -805,6 +888,7 @@ def test_psu_critical_operations_use_timeout_safe_wrapper(monkeypatch):
     backend.set_output_enabled(True, False, timeout_s=6.0)
     backend.set_device_enabled(True, timeout_s=7.0)
     assert backend.disconnect(timeout_s=8.0) is True
+    assert backend.connected is False
 
     assert calls == [
         ("set_psu_output_voltage", 3.0, "set_psu_output_voltage[0]", (backend, 0, 25.0)),
