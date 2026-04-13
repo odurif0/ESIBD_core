@@ -235,6 +235,76 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             self.connected = False
             raise
 
+    def _cleanup_initialize_failure(self, timeout_s: float) -> None:
+        """Best-effort cleanup after a failed PSU initialize() sequence."""
+        if self._transport_poisoned:
+            self.disconnect(timeout_s=timeout_s)
+            return
+
+        try:
+            self.shutdown(timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(
+                "PSU initialize cleanup failed after startup error: "
+                f"{exc}"
+            )
+
+    def initialize(
+        self,
+        timeout_s: float = 5.0,
+        *,
+        standby_config: int = 1,
+        operating_config: Optional[int] = None,
+        require_standby_outputs_disabled: bool = True,
+    ) -> dict:
+        """
+        Run the routine PSU startup sequence.
+
+        The sequence connects to the controller, loads a standby configuration,
+        reads back the device and output enable state, and optionally loads an
+        operating configuration. By default, initialize() refuses to continue if
+        the standby configuration leaves either HV output enabled.
+        """
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        was_connected = self.connected
+        self.logger.info(
+            f"Initializing PSU device {self.device_id} with standby config "
+            f"{standby_config}"
+            + (
+                f" and operating config {operating_config}"
+                if operating_config is not None
+                else ""
+            )
+        )
+
+        try:
+            self.connect(timeout_s=timeout_s)
+            self.load_config(standby_config, timeout_s=timeout_s)
+
+            device_enabled = self.get_device_enabled(timeout_s=timeout_s)
+            output_enabled = self.get_output_enabled(timeout_s=timeout_s)
+            initialization_state = {
+                "standby_config": int(standby_config),
+                "device_enabled": device_enabled,
+                "output_enabled": output_enabled,
+            }
+
+            if require_standby_outputs_disabled and output_enabled != (False, False):
+                raise RuntimeError(
+                    "PSU standby configuration left outputs enabled: "
+                    f"{output_enabled}. Refusing to continue initialization."
+                )
+
+            if operating_config is not None:
+                self.load_config(operating_config, timeout_s=timeout_s)
+                initialization_state["operating_config"] = int(operating_config)
+
+            return initialization_state
+        except Exception:
+            if was_connected or self.connected or self._transport_poisoned:
+                self._cleanup_initialize_failure(timeout_s)
+            raise
+
     def disconnect(self, timeout_s: Optional[float] = None) -> bool:
         """Disconnect from the PSU device."""
         was_connected = self.connected
@@ -861,6 +931,10 @@ class PSU(ProcessIsolatedClientMixin):
     _INSTRUMENT_NAME = "PSU"
     _PROCESS_CONTROLLER_CLASS = _PSUController
     _PROCESS_CONTROLLER_PATH = "cgc.psu.psu:_PSUController"
+    _PROCESS_TIMEOUT_RULES = {
+        "connect": (4.0, 5.0, 15.0),
+        "initialize": (8.0, 5.0, 30.0),
+    }
     _active_connections_lock = _PSUController._active_connections_lock
     _active_connections = _PSUController._active_connections
 

@@ -7,8 +7,10 @@ Python driver for the CGC `PSU-CTRL-2D` unit.
 This driver follows a configuration-first workflow:
 
 1. connect to the device
-2. load a known user configuration
-3. optionally adjust voltages or current limits
+2. load a known standby configuration
+3. verify the standby state with targeted enable-state checks
+4. optionally load the operating configuration
+5. optionally adjust voltages or current limits
 
 This matches the vendor recommendation for reproducible operation.
 
@@ -17,8 +19,9 @@ This matches the vendor recommendation for reproducible operation.
 For normal application code:
 
 - construct the driver with `PSU(..., com=..., port=...)`
-- call `connect()`
-- then call `load_config(config_number)`
+- prefer `initialize(standby_config=..., operating_config=...)` for the routine startup sequence
+- or call `connect()` and `load_config(...)` manually when you need step-by-step control
+- reserve `get_product_info()` and `collect_housekeeping()` for metadata, deeper diagnostics, or maintenance checks
 - use the high-level getters and setters
 - use `get_product_info()` for stable metadata
 - use `collect_housekeeping()` for a structured runtime snapshot
@@ -27,6 +30,11 @@ For normal application code:
 `load_config(config_number)` applies the configuration stored in the
 controller NVM. Depending on how that CGC configuration was saved, it may also
 apply device enable, PSU enable, range and output setpoints.
+
+`initialize()` connects to the controller, loads the standby configuration,
+checks the device and output enable state, and optionally loads an operating
+configuration. By default it refuses to continue if the standby configuration
+leaves either HV output enabled.
 
 `shutdown()` drives both channel current and voltage setpoints to `0` before
 disabling the outputs and the device.
@@ -74,9 +82,14 @@ process boundaries.
 ```python
 from cgc.psu import PSU
 
+OPERATING_CONFIG = 2  # Example only: replace with your saved operating config.
+
 psu = PSU("psu_main", com=6, port=0)
-psu.connect()
-psu.load_config(19)
+startup_state = psu.initialize(
+    standby_config=1,
+    operating_config=OPERATING_CONFIG,
+)
+print(startup_state)
 try:
     psu.set_channel_voltage(0, 25.0)
     psu.set_channel_current(0, 0.5)

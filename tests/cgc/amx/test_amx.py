@@ -223,6 +223,135 @@ def test_load_config_calls_vendor_wrapper(monkeypatch):
     amx.load_config(40)
 
 
+def test_initialize_requires_at_least_one_config(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+
+    with pytest.raises(ValueError, match="requires standby_config, operating_config, or both"):
+        backend.initialize()
+
+
+def test_initialize_runs_standby_then_operating_sequence_and_returns_state(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number: calls.append(("load_config", config_number)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "get_device_enabled",
+        lambda: calls.append(("get_device_enabled",)) or False,
+    )
+
+    result = backend.initialize(
+        timeout_s=2.5,
+        standby_config=3,
+        operating_config=40,
+    )
+
+    assert result == {
+        "standby_config": 3,
+        "device_enabled": False,
+        "operating_config": 40,
+    }
+    assert calls == [
+        ("connect", 2.5),
+        ("load_config", 3),
+        ("get_device_enabled",),
+        ("load_config", 40),
+    ]
+
+
+def test_initialize_can_load_only_an_operating_config(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number: calls.append(("load_config", config_number)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "get_device_enabled",
+        Mock(side_effect=AssertionError("standby check should not run")),
+    )
+
+    result = backend.initialize(timeout_s=2.0, operating_config=40)
+
+    assert result == {
+        "operating_config": 40,
+    }
+    assert calls == [
+        ("connect", 2.0),
+        ("load_config", 40),
+    ]
+
+
+def test_initialize_rejects_standby_config_when_device_stays_enabled(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "load_config", lambda config_number: None)
+    monkeypatch.setattr(backend, "get_device_enabled", lambda: True)
+    shutdown = Mock(return_value=True)
+    monkeypatch.setattr(backend, "shutdown", shutdown)
+
+    with pytest.raises(RuntimeError, match="left the device enabled"):
+        backend.initialize(timeout_s=2.0, standby_config=1)
+
+    shutdown.assert_called_once_with()
+
+
+def test_initialize_uses_disconnect_cleanup_when_transport_is_poisoned(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "load_config", lambda config_number: None)
+
+    def fake_get_device_enabled():
+        backend._transport_poisoned = True
+        raise RuntimeError("poisoned")
+
+    monkeypatch.setattr(backend, "get_device_enabled", fake_get_device_enabled)
+    disconnect = Mock(return_value=False)
+    shutdown = Mock(side_effect=AssertionError("shutdown should not be called"))
+    monkeypatch.setattr(backend, "disconnect", disconnect)
+    monkeypatch.setattr(backend, "shutdown", shutdown)
+
+    with pytest.raises(RuntimeError, match="poisoned"):
+        backend.initialize(timeout_s=2.0, standby_config=1)
+
+    disconnect.assert_called_once_with()
+
+
 def test_shutdown_disables_device_by_default_and_propagates_errors(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     amx.connected = True

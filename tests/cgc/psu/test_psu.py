@@ -195,6 +195,147 @@ def test_load_config_calls_vendor_wrapper(monkeypatch):
     psu.load_config(19)
 
 
+def test_initialize_runs_routine_sequence_and_returns_standby_state(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "get_device_enabled",
+        lambda timeout_s=None: calls.append(("get_device_enabled", timeout_s)) or False,
+    )
+    monkeypatch.setattr(
+        backend,
+        "get_output_enabled",
+        lambda timeout_s=None: calls.append(("get_output_enabled", timeout_s))
+        or (False, False),
+    )
+
+    result = backend.initialize(
+        timeout_s=2.5,
+        standby_config=1,
+        operating_config=7,
+    )
+
+    assert result == {
+        "standby_config": 1,
+        "device_enabled": False,
+        "output_enabled": (False, False),
+        "operating_config": 7,
+    }
+    assert calls == [
+        ("connect", 2.5),
+        ("load_config", 1, 2.5),
+        ("get_device_enabled", 2.5),
+        ("get_output_enabled", 2.5),
+        ("load_config", 7, 2.5),
+    ]
+
+
+def test_initialize_can_stop_after_standby_checks(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: True)
+    monkeypatch.setattr(
+        backend, "get_output_enabled", lambda timeout_s=None: (False, False)
+    )
+
+    result = backend.initialize(timeout_s=2.0, standby_config=3)
+
+    assert result == {
+        "standby_config": 3,
+        "device_enabled": True,
+        "output_enabled": (False, False),
+    }
+    assert calls == [
+        ("connect", 2.0),
+        ("load_config", 3, 2.0),
+    ]
+
+
+def test_initialize_rejects_standby_configs_that_leave_outputs_enabled(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "load_config", lambda config_number, timeout_s=None: None)
+    monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: True)
+    monkeypatch.setattr(
+        backend, "get_output_enabled", lambda timeout_s=None: (True, False)
+    )
+    shutdown = Mock(return_value=True)
+    monkeypatch.setattr(backend, "shutdown", shutdown)
+
+    with pytest.raises(RuntimeError, match="left outputs enabled"):
+        backend.initialize(timeout_s=2.0, standby_config=1)
+
+    shutdown.assert_called_once_with(timeout_s=2.0)
+
+
+def test_initialize_uses_disconnect_cleanup_when_transport_is_poisoned(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "load_config", lambda config_number, timeout_s=None: None)
+    monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: False)
+
+    def fake_get_output_enabled(timeout_s=None):
+        backend._poison_transport("get_output_enabled")
+        raise RuntimeError("timed out during get_output_enabled")
+
+    monkeypatch.setattr(backend, "get_output_enabled", fake_get_output_enabled)
+    disconnect = Mock(return_value=False)
+    monkeypatch.setattr(backend, "disconnect", disconnect)
+    monkeypatch.setattr(
+        backend,
+        "shutdown",
+        Mock(side_effect=AssertionError("shutdown should not be used when poisoned")),
+    )
+
+    with pytest.raises(RuntimeError, match="timed out during get_output_enabled"):
+        backend.initialize(timeout_s=2.0, standby_config=1)
+
+    disconnect.assert_called_once_with(timeout_s=2.0)
+
+
 def test_shutdown_disables_outputs_and_device_by_default_and_propagates_errors(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     psu.connected = True
