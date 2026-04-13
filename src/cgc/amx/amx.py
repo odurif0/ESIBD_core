@@ -132,12 +132,12 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                     f"AMX open_port failed: {self.format_status(status)}"
                 )
 
-            self.connected = True
             self._set_port_claimed(True)
             baud_status, actual_baud = self._call_locked_with_timeout(
                 set_baud_rate, timeout_s, "set_baud_rate", self.baudrate
             )
             if baud_status == self.NO_ERR:
+                self.connected = True
                 self._warn_if_unexpected_product_id()
                 self.logger.info(
                     f"Successfully connected to AMX device {self.device_id} "
@@ -158,7 +158,6 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 )
             else:
                 self._set_port_claimed(False)
-            self.connected = False
             raise RuntimeError(
                 f"AMX set_baud_rate failed: {self.format_status(baud_status)}"
             )
