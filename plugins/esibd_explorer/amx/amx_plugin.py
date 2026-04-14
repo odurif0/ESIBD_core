@@ -1,0 +1,1237 @@
+"""Drive AMX timing from ESIBD Explorer and monitor pulser readbacks."""
+
+from __future__ import annotations
+
+import contextlib
+import importlib
+import importlib.util
+import sys
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+
+from esibd.core import (
+    PARAMETERTYPE,
+    PLUGINTYPE,
+    PRINT,
+    Channel,
+    DeviceController,
+    Parameter,
+    ToolButton,
+    parameterDict,
+)
+from esibd.plugins import Device, Plugin
+
+_BUNDLED_RUNTIME_DIRNAME = "runtime"
+_BUNDLED_RUNTIME_NAMESPACE_PREFIX = "_esibd_bundled_amx_runtime"
+_AMX_DRIVER_CLASS: type[Any] | None = None
+_CHANNEL_NAME_KEY = getattr(Parameter, "NAME", getattr(Channel, "NAME", "Name"))
+_CHANNEL_ENABLED_KEY = getattr(Channel, "ENABLED", "Enabled")
+_CHANNEL_REAL_KEY = getattr(Channel, "REAL", "Real")
+_PARAMETER_MIN_KEY = getattr(Parameter, "MIN", "Min")
+_PARAMETER_MAX_KEY = getattr(Parameter, "MAX", "Max")
+_PARAMETER_ADVANCED_KEY = getattr(Parameter, "ADVANCED", "Advanced")
+_PARAMETER_TOOLTIP_KEY = getattr(Parameter, "TOOLTIP", "Tooltip")
+_PARAMETER_EVENT_KEY = getattr(Parameter, "EVENT", "Event")
+_AMX_PULSER_KEY = "Pulser"
+_AMX_PULSER_IDS = (0, 1, 2, 3)
+_AMX_POWER_ON_ICON = "switch-medium_on.png"
+_AMX_POWER_OFF_ICON = "switch-medium_off.png"
+_AMX_PULSER_ON_LABEL = "Pulse ON"
+_AMX_PULSER_OFF_LABEL = "Pulse OFF"
+
+
+def _is_nan(value: Any) -> bool:
+    try:
+        return bool(np.isnan(value))
+    except TypeError:
+        return False
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+    return bool(value)
+
+
+def _channel_key_from_item(item: dict[str, Any]) -> int:
+    return _coerce_int(item.get(_AMX_PULSER_KEY), 0)
+
+
+def _generic_channel_name(device_name: str, pulser: int) -> str:
+    return f"{device_name}_P{pulser}"
+
+
+def _build_generic_channel_item(
+    device_name: str,
+    pulser: int,
+    default_item: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    item = dict(default_item or {})
+    item[_CHANNEL_NAME_KEY] = _generic_channel_name(device_name, pulser)
+    item[_AMX_PULSER_KEY] = str(pulser)
+    item[_CHANNEL_REAL_KEY] = True
+    item[_CHANNEL_ENABLED_KEY] = False
+    return item
+
+
+def _looks_like_bootstrap_items(
+    items: list[dict[str, Any]],
+    device_name: str,
+    default_item: dict[str, Any] | None = None,
+) -> bool:
+    if not items:
+        return False
+
+    expected_names = [f"{device_name}{index}" for index in range(1, len(items) + 1)]
+    item_names = [str(item.get(_CHANNEL_NAME_KEY, "")) for item in items]
+    if item_names != expected_names:
+        return False
+
+    if default_item is None:
+        return all(_channel_key_from_item(item) == 0 for item in items)
+
+    for item in items:
+        for key, default_value in default_item.items():
+            if key == _CHANNEL_NAME_KEY:
+                continue
+            item_value = item.get(key, default_value)
+            if key == _AMX_PULSER_KEY:
+                if _coerce_int(item_value, _coerce_int(default_value, 0)) != _coerce_int(
+                    default_value,
+                    0,
+                ):
+                    return False
+                continue
+            if isinstance(default_value, bool):
+                if _coerce_bool(item_value, default=default_value) != default_value:
+                    return False
+                continue
+            if _is_nan(default_value):
+                if not _is_nan(item_value):
+                    return False
+                continue
+            if isinstance(default_value, int) and not isinstance(default_value, bool):
+                if _coerce_int(item_value, default_value) != default_value:
+                    return False
+                continue
+            if isinstance(default_value, float):
+                if _coerce_float(item_value, default_value) != default_value:
+                    return False
+                continue
+            if item_value != default_value:
+                return False
+    return True
+
+
+def _strip_legacy_bootstrap_residue(
+    items: list[dict[str, Any]],
+    device_name: str,
+    default_item: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[tuple[str, PRINT | None]]]:
+    if not items or default_item is None:
+        return items, []
+
+    default_key = _channel_key_from_item(default_item)
+    residue_indices: list[int] = []
+    residue_count = 0
+    indexed_names = {
+        str(item.get(_CHANNEL_NAME_KEY, "")): index
+        for index, item in enumerate(items)
+    }
+
+    while True:
+        residue_count += 1
+        index = indexed_names.get(f"{device_name}{residue_count}")
+        if index is None:
+            residue_count -= 1
+            break
+        residue_indices.append(index)
+
+    if residue_count < 2 or residue_count == len(items):
+        return items, []
+
+    residue_items = [items[index] for index in residue_indices]
+    if any(_channel_key_from_item(item) != default_key for item in residue_items):
+        return items, []
+
+    cleaned_items = [
+        item for index, item in enumerate(items) if index not in set(residue_indices)
+    ]
+    if not cleaned_items:
+        return items, []
+
+    return cleaned_items, [
+        (
+            f"Removed legacy AMX bootstrap channels: "
+            f"{device_name}1..{device_name}{residue_count}",
+            None,
+        )
+    ]
+
+
+def _plan_channel_sync(
+    current_items: list[dict[str, Any]],
+    device_name: str,
+    default_item: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[tuple[str, PRINT | None]]]:
+    if _looks_like_bootstrap_items(current_items, device_name, default_item=default_item):
+        return [
+            _build_generic_channel_item(device_name, pulser, default_item=default_item)
+            for pulser in _AMX_PULSER_IDS
+        ], [("AMX bootstrap config replaced with fixed pulser channels.", None)]
+
+    current_items, cleanup_logs = _strip_legacy_bootstrap_residue(
+        current_items,
+        device_name=device_name,
+        default_item=default_item,
+    )
+
+    target_ids = set(_AMX_PULSER_IDS)
+    kept_keys: set[int] = set()
+    added_pulsers: list[int] = []
+    virtualized_pulsers: list[int] = []
+    reactivated_pulsers: list[int] = []
+    duplicate_entries: list[tuple[str, int]] = []
+    synced_items: list[dict[str, Any]] = []
+
+    for item in current_items:
+        synced_item = dict(item)
+        pulser = _channel_key_from_item(synced_item)
+        if pulser in kept_keys:
+            duplicate_entries.append(
+                (str(synced_item.get(_CHANNEL_NAME_KEY, "")), pulser)
+            )
+            synced_item[_CHANNEL_REAL_KEY] = False
+            synced_items.append(synced_item)
+            continue
+
+        kept_keys.add(pulser)
+        if pulser in target_ids:
+            if not _coerce_bool(synced_item.get(_CHANNEL_REAL_KEY), default=True):
+                reactivated_pulsers.append(pulser)
+            synced_item[_CHANNEL_REAL_KEY] = True
+        else:
+            if _coerce_bool(synced_item.get(_CHANNEL_REAL_KEY), default=True):
+                virtualized_pulsers.append(pulser)
+            synced_item[_CHANNEL_REAL_KEY] = False
+        synced_items.append(synced_item)
+
+    for pulser in _AMX_PULSER_IDS:
+        if pulser in kept_keys:
+            continue
+        synced_items.append(
+            _build_generic_channel_item(
+                device_name,
+                pulser,
+                default_item=default_item,
+            )
+        )
+        added_pulsers.append(pulser)
+
+    log_entries: list[tuple[str, PRINT | None]] = list(cleanup_logs)
+    if added_pulsers:
+        log_entries.append(
+            (
+                "Added generic AMX pulser channels: "
+                + ", ".join(f"P{pulser}" for pulser in added_pulsers),
+                None,
+            )
+        )
+    if virtualized_pulsers:
+        log_entries.append(
+            (
+                "Marked AMX pulser channels virtual because they do not exist on hardware: "
+                + ", ".join(f"P{pulser}" for pulser in virtualized_pulsers),
+                None,
+            )
+        )
+    if reactivated_pulsers:
+        log_entries.append(
+            (
+                "Reactivated AMX pulser channels: "
+                + ", ".join(f"P{pulser}" for pulser in reactivated_pulsers),
+                None,
+            )
+        )
+    for channel_name, pulser in duplicate_entries:
+        log_entries.append(
+            (
+                f"Duplicate AMX mapping detected for P{pulser}: {channel_name}",
+                PRINT.WARNING,
+            )
+        )
+    return synced_items, log_entries
+
+
+def _bundled_runtime_module_name(plugin_dir: Path | None = None) -> str:
+    resolved_plugin_dir = Path(__file__).resolve().parent if plugin_dir is None else plugin_dir
+    plugin_key = resolved_plugin_dir.name.replace("-", "_")
+    return f"{_BUNDLED_RUNTIME_NAMESPACE_PREFIX}_{plugin_key}"
+
+
+def _load_private_runtime_package(module_name: str, package_dir: Path) -> None:
+    if module_name in sys.modules:
+        return
+
+    init_file = package_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_file,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ModuleNotFoundError(
+            f"Could not create an import spec for bundled AMX runtime at {package_dir}."
+        )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+
+
+def _get_amx_driver_class() -> type[Any]:
+    global _AMX_DRIVER_CLASS
+
+    if _AMX_DRIVER_CLASS is not None:
+        return _AMX_DRIVER_CLASS
+
+    plugin_dir = Path(__file__).resolve().parent
+    bundled_runtime_dir = plugin_dir / "vendor" / _BUNDLED_RUNTIME_DIRNAME
+    bundled_runtime_init = bundled_runtime_dir / "__init__.py"
+    if not bundled_runtime_init.exists():
+        raise ModuleNotFoundError(
+            "Bundled AMX runtime not found in vendor/runtime; "
+            "plugin installation is incomplete."
+        )
+
+    runtime_module_name = _bundled_runtime_module_name(plugin_dir)
+    _load_private_runtime_package(runtime_module_name, bundled_runtime_dir)
+    module = importlib.import_module(f"{runtime_module_name}.amx")
+    _AMX_DRIVER_CLASS = cast(type[Any], module.AMX)
+    return _AMX_DRIVER_CLASS
+
+
+def providePlugins() -> "list[type[Plugin]]":
+    return [AMXDevice]
+
+
+class AMXDevice(Device):
+    """Drive AMX oscillator and pulser timing from ESIBD Explorer."""
+
+    documentation = (
+        "Drives AMX frequency and pulser timing while monitoring pulser readbacks."
+    )
+
+    name = "AMX"
+    version = "0.1.0"
+    supportedVersion = "0.8"
+    pluginType = PLUGINTYPE.INPUTDEVICE
+    unit = "%"
+    useMonitors = True
+    useOnOffLogic = True
+    iconFile = "amx.png"
+    channels: "list[AMXChannel]"
+
+    COM = "COM"
+    BAUDRATE = "Baud rate"
+    CONNECT_TIMEOUT = "Connect timeout (s)"
+    STARTUP_TIMEOUT = "Startup timeout (s)"
+    POLL_TIMEOUT = "Poll timeout (s)"
+    STANDBY_CONFIG = "Standby config"
+    OPERATING_CONFIG = "Operating config"
+    SHUTDOWN_CONFIG = "Shutdown config"
+    FREQUENCY_KHZ = "Frequency (kHz)"
+    STATE = "State"
+    DEVICE_ENABLED = "Device enabled"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.channelType = AMXChannel
+
+    def initGUI(self) -> None:
+        super().initGUI()
+        self.controller = AMXController(controllerParent=self)
+
+    def getChannels(self) -> "list[AMXChannel]":
+        return cast("list[AMXChannel]", super().getChannels())
+
+    com: int
+    baudrate: int
+    connect_timeout_s: float
+    startup_timeout_s: float
+    poll_timeout_s: float
+    standby_config: int
+    operating_config: int
+    shutdown_config: int
+    frequency_khz: float
+    main_state: str
+    device_enabled_state: str
+
+    def _current_channel_items(self) -> list[dict[str, Any]]:
+        return [channel.asDict() for channel in self.getChannels()]
+
+    def _default_channel_item(self) -> dict[str, Any]:
+        return self.channelType(channelParent=self, tree=None).asDict()
+
+    def _apply_channel_items(self, items: list[dict[str, Any]]) -> None:
+        update_channel_config = getattr(self, "updateChannelConfig", None)
+        export_config = getattr(self, "exportConfiguration", None)
+        custom_config_file = getattr(self, "customConfigFile", None)
+        config_name = getattr(self, "confINI", None)
+        if not callable(update_channel_config) or not callable(custom_config_file):
+            return
+
+        config_file = custom_config_file(config_name)
+        self.loading = True
+        try:
+            update_channel_config(items, config_file)
+        finally:
+            self.loading = False
+        if callable(export_config):
+            export_config(useDefaultFile=True)
+
+    def _sync_channels(self) -> bool:
+        current_items = self._current_channel_items()
+        target_items, log_entries = _plan_channel_sync(
+            current_items=current_items,
+            device_name=self.name,
+            default_item=self._default_channel_item(),
+        )
+        if target_items == current_items:
+            return False
+        self._apply_channel_items(target_items)
+        for message, flag in log_entries:
+            if flag is None:
+                self.print(message)
+            else:
+                self.print(message, flag=flag)
+        return True
+
+    def getDefaultSettings(self) -> dict[str, dict]:
+        settings = super().getDefaultSettings()
+        settings[f"{self.name}/{self.COM}"] = parameterDict(
+            value=1,
+            minimum=1,
+            maximum=255,
+            toolTip="Windows COM port number used by the AMX controller.",
+            parameterType=PARAMETERTYPE.INT,
+            attr="com",
+        )
+        settings[f"{self.name}/{self.BAUDRATE}"] = parameterDict(
+            value=230400,
+            minimum=1,
+            maximum=1_000_000,
+            toolTip="Baud rate passed to cgc.amx.AMX.",
+            parameterType=PARAMETERTYPE.INT,
+            attr="baudrate",
+        )
+        settings[f"{self.name}/{self.CONNECT_TIMEOUT}"] = parameterDict(
+            value=5.0,
+            minimum=1.0,
+            maximum=60.0,
+            toolTip="Timeout in seconds used to connect and validate the AMX transport.",
+            parameterType=PARAMETERTYPE.FLOAT,
+            attr="connect_timeout_s",
+        )
+        settings[f"{self.name}/{self.STARTUP_TIMEOUT}"] = parameterDict(
+            value=10.0,
+            minimum=1.0,
+            maximum=120.0,
+            toolTip="Timeout in seconds used for AMX startup and shutdown sequences.",
+            parameterType=PARAMETERTYPE.FLOAT,
+            attr="startup_timeout_s",
+        )
+        settings[f"{self.name}/{self.POLL_TIMEOUT}"] = parameterDict(
+            value=5.0,
+            minimum=0.5,
+            maximum=30.0,
+            toolTip="Timeout in seconds used to poll AMX housekeeping.",
+            parameterType=PARAMETERTYPE.FLOAT,
+            attr="poll_timeout_s",
+        )
+        settings[f"{self.name}/{self.STANDBY_CONFIG}"] = parameterDict(
+            value=-1,
+            minimum=-1,
+            maximum=255,
+            toolTip="Optional standby config index. Use -1 to skip standby loading.",
+            parameterType=PARAMETERTYPE.INT,
+            attr="standby_config",
+        )
+        settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
+            value=40,
+            minimum=-1,
+            maximum=255,
+            toolTip="Optional operating config index. Use -1 to skip config loading.",
+            parameterType=PARAMETERTYPE.INT,
+            attr="operating_config",
+        )
+        settings[f"{self.name}/{self.SHUTDOWN_CONFIG}"] = parameterDict(
+            value=-1,
+            minimum=-1,
+            maximum=255,
+            toolTip="Optional shutdown config index. Use -1 to use software shutdown.",
+            parameterType=PARAMETERTYPE.INT,
+            attr="shutdown_config",
+        )
+        settings[f"{self.name}/{self.FREQUENCY_KHZ}"] = parameterDict(
+            value=2.0,
+            minimum=0.001,
+            maximum=10000.0,
+            toolTip="Oscillator frequency applied in kilohertz after startup.",
+            parameterType=PARAMETERTYPE.FLOAT,
+            attr="frequency_khz",
+            event=self.frequencyChanged,
+        )
+        settings[f"{self.name}/{self.STATE}"] = parameterDict(
+            value="Disconnected",
+            toolTip="Latest AMX controller state reported by the driver.",
+            parameterType=PARAMETERTYPE.LABEL,
+            attr="main_state",
+            indicator=True,
+            internal=True,
+            restore=False,
+        )
+        settings[f"{self.name}/{self.DEVICE_ENABLED}"] = parameterDict(
+            value="OFF",
+            toolTip="Latest AMX device-enable state.",
+            parameterType=PARAMETERTYPE.LABEL,
+            attr="device_enabled_state",
+            indicator=True,
+            internal=True,
+            advanced=True,
+            restore=False,
+        )
+        settings[f"{self.name}/Interval"][Parameter.VALUE] = 1000
+        settings[f"{self.name}/{self.MAXDATAPOINTS}"][Parameter.VALUE] = 100000
+        return settings
+
+    def frequencyChanged(self) -> None:
+        controller = getattr(self, "controller", None)
+        if (
+            controller is None
+            or getattr(self, "loading", False)
+            or not getattr(controller, "initialized", False)
+            or not getattr(self, "isOn", lambda: False)()
+        ):
+            return
+        apply_global = getattr(controller, "applyGlobalSettings", None)
+        if callable(apply_global):
+            apply_global()
+
+    def _set_on_ui_state(self, on: bool) -> None:
+        if hasattr(self, "onAction"):
+            self.onAction.state = bool(on)
+
+    def closeCommunication(self) -> None:
+        controller = getattr(self, "controller", None)
+        if controller and getattr(controller, "initialized", False):
+            self.shutdownCommunication()
+            return
+        if hasattr(self, "onAction"):
+            self.onAction.state = False
+        if controller:
+            controller.closeCommunication()
+
+    def shutdownCommunication(self) -> None:
+        if hasattr(self, "onAction"):
+            self.onAction.state = False
+        controller = getattr(self, "controller", None)
+        if controller:
+            controller.shutdownCommunication()
+
+    def setOn(self, on: "bool | None" = None) -> None:
+        controller = getattr(self, "controller", None)
+        current_state = self.isOn() if hasattr(self, "isOn") else False
+        if controller and (
+            getattr(controller, "initializing", False)
+            or getattr(controller, "transitioning", False)
+        ):
+            if hasattr(self, "onAction"):
+                self.onAction.state = current_state
+            self.print(
+                f"{self.name} ON/OFF transition already in progress; ignoring additional request.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        if on is not None and hasattr(self, "onAction"):
+            self.onAction.state = bool(on)
+        if getattr(self, "loading", False):
+            return
+
+        if controller and getattr(controller, "initialized", False):
+            begin_transition = getattr(controller, "_begin_transition", None)
+            can_start = not callable(begin_transition) or begin_transition(self.isOn())
+            if can_start:
+                toggle_thread = getattr(controller, "toggleOnFromThread", None)
+                if callable(toggle_thread):
+                    toggle_thread(parallel=True)
+                else:
+                    controller.toggleOn()
+
+
+class AMXChannel(Channel):
+    """AMX pulser channel definition."""
+
+    ID = "Pulser"
+    DELAY_TICKS = "Delay ticks"
+    WIDTH_TICKS = "Width ticks"
+    BURST = "Burst"
+    channelParent: AMXDevice
+
+    def getDefaultChannel(self) -> dict[str, dict]:
+        self.id: int
+        self.delay_ticks: int
+        self.width_ticks: str
+        self.burst: str
+
+        channel = super().getDefaultChannel()
+        channel[self.VALUE][Parameter.HEADER] = "Duty (%)"
+        channel[self.VALUE][_PARAMETER_MIN_KEY] = 0.0
+        channel[self.VALUE][_PARAMETER_MAX_KEY] = 100.0
+        channel[self.VALUE][_PARAMETER_EVENT_KEY] = self.valueChanged
+        channel[self.ENABLED][_PARAMETER_ADVANCED_KEY] = False
+        channel[self.ENABLED][Parameter.HEADER] = "Apply"
+        channel[self.ENABLED][_PARAMETER_TOOLTIP_KEY] = (
+            "Apply this pulser timing to the AMX when the device is ON."
+        )
+        channel[self.ACTIVE][Parameter.HEADER] = "Manual"
+        channel[self.DISPLAY][Parameter.HEADER] = "Display"
+        channel[self.DISPLAY][_PARAMETER_EVENT_KEY] = self.displayChanged
+        channel[self.SCALING][Parameter.VALUE] = "large"
+        monitor_name = getattr(self, "MONITOR", "Monitor")
+        if monitor_name in channel:
+            channel[monitor_name][Parameter.HEADER] = "Duty mon"
+        channel[self.ID] = parameterDict(
+            value="0",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=False,
+            indicator=True,
+            header="Pulser",
+            attr="id",
+        )
+        channel[self.DELAY_TICKS] = parameterDict(
+            value=0,
+            minimum=0,
+            maximum=2147483647,  # int32 max; QSpinBox cannot handle values beyond this range
+            toolTip="Pulser delay register in raw AMX ticks.",
+            parameterType=PARAMETERTYPE.INT,
+            advanced=False,
+            header="Delay",
+            attr="delay_ticks",
+            event=self.delayChanged,
+        )
+        channel[self.WIDTH_TICKS] = parameterDict(
+            value="n/a",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=False,
+            indicator=True,
+            header="Width",
+            attr="width_ticks",
+        )
+        channel[self.BURST] = parameterDict(
+            value="n/a",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=True,
+            indicator=True,
+            header="Burst",
+            attr="burst",
+        )
+        return channel
+
+    def setDisplayedParameters(self) -> None:
+        super().setDisplayedParameters()
+        if self.OPTIMIZE in getattr(self, "displayedParameters", []):
+            self.displayedParameters.remove(self.OPTIMIZE)
+        self.displayedParameters.extend([self.ID, self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST])
+
+    def initGUI(self, item: dict) -> None:
+        super().initGUI(item)
+        self._upgrade_toggle_widget(self.ENABLED, _AMX_PULSER_ON_LABEL, 76)
+        self._sync_enabled_toggle_widget()
+
+    def _upgrade_toggle_widget(
+        self,
+        parameter_name: str,
+        label: str,
+        minimum_width: int,
+    ) -> None:
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        parameter = getter(parameter_name)
+        if parameter is None:
+            return
+
+        initial_value = bool(getattr(parameter, "value", False))
+        parameter.widget = ToolButton()
+        parameter.applyWidget()
+        if getattr(parameter, "check", None):
+            parameter.check.setMinimumWidth(minimum_width)
+            parameter.check.setText(label)
+            parameter.check.setCheckable(True)
+            if hasattr(parameter.check, "setAutoRaise"):
+                parameter.check.setAutoRaise(False)
+        parameter.value = initial_value
+
+    def _enabled_toggle_label(self) -> str:
+        return _AMX_PULSER_ON_LABEL if bool(getattr(self, "enabled", False)) else _AMX_PULSER_OFF_LABEL
+
+    def _sync_enabled_toggle_widget(self) -> None:
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        parameter = getter(getattr(self, "ENABLED", "Enabled"))
+        widget = getattr(parameter, "check", None) if parameter is not None else None
+        if widget is not None and hasattr(widget, "setText"):
+            widget.setText(self._enabled_toggle_label())
+
+    def pulser_number(self) -> int:
+        return _coerce_int(self.id, 0)
+
+    def _set_parameter_value_without_events(self, parameter_name: str, value: Any) -> bool:
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return False
+        parameter = getter(parameter_name)
+        if parameter is None:
+            return False
+        current_value = getattr(parameter, "value", None)
+        if current_value == value:
+            return False
+        setter = getattr(parameter, "setValueWithoutEvents", None)
+        if callable(setter):
+            setter(value)
+        else:
+            parameter.value = value
+        return True
+
+    def displayChanged(self) -> None:
+        update_display = getattr(super(), "updateDisplay", None)
+        if callable(update_display):
+            update_display()
+
+    def realChanged(self) -> None:
+        getter = getattr(self, "getParameterByName", None)
+        if callable(getter):
+            for parameter_name in (self.ID, self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST):
+                parameter = getter(parameter_name)
+                if parameter is not None and hasattr(parameter, "setVisible"):
+                    parameter.setVisible(self.real)
+        real_changed = getattr(super(), "realChanged", None)
+        if callable(real_changed):
+            real_changed()
+
+    def valueChanged(self) -> None:
+        base_handler = getattr(super(), "valueChanged", None)
+        if callable(base_handler):
+            base_handler()
+        apply_value = getattr(self, "applyValue", None)
+        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
+            apply_value(apply=True)
+
+    def delayChanged(self) -> None:
+        apply_value = getattr(self, "applyValue", None)
+        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
+            apply_value(apply=True)
+
+    def enabledChanged(self) -> None:
+        base_handler = getattr(super(), "enabledChanged", None)
+        if callable(base_handler):
+            base_handler()
+        if not getattr(self, "enabled", False):
+            self.monitor = np.nan
+        self._sync_enabled_toggle_widget()
+        apply_value = getattr(self, "applyValue", None)
+        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
+            apply_value(apply=True)
+
+    def setWidthText(self, text: str) -> None:
+        self._set_parameter_value_without_events(self.WIDTH_TICKS, text)
+
+    def setBurstText(self, text: str) -> None:
+        self._set_parameter_value_without_events(self.BURST, text)
+
+
+class AMXController(DeviceController):
+    """AMX hardware controller used by the ESIBD Explorer plugin."""
+
+    controllerParent: AMXDevice
+
+    def __init__(self, controllerParent) -> None:
+        super().__init__(controllerParent=controllerParent)
+        self.device: Any | None = None
+        self.main_state = "Disconnected"
+        self.device_enabled_state = "OFF"
+        self.device_state_summary = "n/a"
+        self.controller_state_summary = "n/a"
+        self.initialized = False
+        self.transitioning = False
+        self.transition_target_on: bool | None = None
+        self.values: dict[int, float] = {}
+        self.width_values: dict[int, str] = {}
+        self.burst_values: dict[int, str] = {}
+
+    def initializeValues(self, reset: bool = False) -> None:
+        if getattr(self, "values", None) is None or reset:
+            self.values = {
+                channel.pulser_number(): np.nan
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.width_values = {
+                channel.pulser_number(): "n/a"
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.burst_values = {
+                channel.pulser_number(): "n/a"
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+
+    def runInitialization(self) -> None:
+        self.initialized = False
+        self._dispose_device()
+        try:
+            driver_class = _get_amx_driver_class()
+            self.device = driver_class(
+                device_id=f"{self.controllerParent.name.lower()}_com{int(self.controllerParent.com)}",
+                com=int(self.controllerParent.com),
+                baudrate=int(self.controllerParent.baudrate),
+            )
+            backend_reason = str(
+                getattr(self.device, "_process_backend_disabled_reason", "")
+            ).strip()
+            if backend_reason:
+                self.print(backend_reason, flag=PRINT.WARNING)
+            self.device.connect(timeout_s=float(self.controllerParent.connect_timeout_s))
+            self._update_state()
+            self.signalComm.initCompleteSignal.emit()
+        except Exception as exc:  # noqa: BLE001
+            self._restore_off_ui_state()
+            self.print(
+                f"AMX initialization failed on COM{int(self.controllerParent.com)}: "
+                f"{self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+            self._dispose_device()
+        finally:
+            self.initializing = False
+
+    def initComplete(self) -> None:
+        if self.device is not None:
+            self.controllerParent._sync_channels()
+        self.initializeValues(reset=True)
+        self.initialized = True
+        self.super_init_complete_called = True
+        self._sync_status_to_gui()
+
+    def _startup_kwargs(self) -> dict[str, Any]:
+        standby_config = _coerce_int(
+            getattr(self.controllerParent, "standby_config", -1),
+            -1,
+        )
+        operating_config = _coerce_int(
+            getattr(self.controllerParent, "operating_config", -1),
+            -1,
+        )
+        kwargs: dict[str, Any] = {}
+        if standby_config >= 0:
+            kwargs["standby_config"] = standby_config
+        if operating_config >= 0:
+            kwargs["operating_config"] = operating_config
+        return kwargs
+
+    def _shutdown_kwargs(self) -> dict[str, Any]:
+        shutdown_config = _coerce_int(
+            getattr(self.controllerParent, "shutdown_config", -1),
+            -1,
+        )
+        if shutdown_config >= 0:
+            return {
+                "standby_config": shutdown_config,
+                "disable_device": False,
+            }
+        return {}
+
+    def _apply_channel_timing(self, channel: AMXChannel, timeout_s: float) -> None:
+        device = self.device
+        if device is None or not channel.real:
+            return
+
+        pulser = channel.pulser_number()
+        delay_ticks = _coerce_int(getattr(channel, "delay_ticks", 0), 0)
+        device.set_pulser_delay_ticks(pulser, delay_ticks, timeout_s=timeout_s)
+        duty_percent = _coerce_float(getattr(channel, "value", 0.0), 0.0)
+        if channel.enabled and duty_percent > 0.0:
+            device.set_pulser_duty_cycle(
+                pulser,
+                duty_percent / 100.0,
+                timeout_s=timeout_s,
+            )
+        else:
+            device.set_pulser_width_ticks(pulser, 0, timeout_s=timeout_s)
+
+    def applyGlobalSettings(self) -> None:
+        device = self.device
+        if (
+            device is None
+            or not getattr(self, "initialized", False)
+            or getattr(self, "transitioning", False)
+            or not getattr(self.controllerParent, "isOn", lambda: False)()
+        ):
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "connect_timeout_s", 5.0))
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to apply AMX frequency."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                device.set_frequency_khz(
+                    float(getattr(self.controllerParent, "frequency_khz", 2.0)),
+                    timeout_s=timeout_s,
+                )
+                for channel in self.controllerParent.getChannels():
+                    self._apply_channel_timing(channel, timeout_s)
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to apply AMX global settings: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+
+    def readNumbers(self) -> None:
+        if self.device is None or not getattr(self, "initialized", False):
+            self.initializeValues(reset=True)
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to read AMX housekeeping."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                snapshot = device.collect_housekeeping(timeout_s=timeout_s)
+        except TimeoutError:
+            self.errorCount += 1
+            self.print("Timed out while polling AMX housekeeping.", flag=PRINT.ERROR)
+            self.initializeValues(reset=True)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to read AMX housekeeping: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+            self.initializeValues(reset=True)
+            return
+
+        self._apply_snapshot(snapshot)
+
+    def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self.main_state = str(snapshot.get("main_state", {}).get("name", "Unknown"))
+        self.device_enabled_state = (
+            "ON" if bool(snapshot.get("device_enabled", False)) else "OFF"
+        )
+        flags = snapshot.get("device_state", {}).get("flags", [])
+        self.device_state_summary = ", ".join(str(flag) for flag in flags) if flags else "OK"
+        controller_flags = snapshot.get("controller_state", {}).get("flags", [])
+        self.controller_state_summary = (
+            ", ".join(str(flag) for flag in controller_flags) if controller_flags else "OK"
+        )
+
+        oscillator_period = _coerce_int(
+            snapshot.get("oscillator", {}).get("period"),
+            0,
+        )
+        osc_offset = _coerce_int(getattr(self.device, "OSC_OFFSET", 2), 2)
+        width_offset = _coerce_int(getattr(self.device, "PULSER_WIDTH_OFFSET", 2), 2)
+        total_ticks = oscillator_period + osc_offset
+        new_values: dict[int, float] = {}
+        new_widths: dict[int, str] = {}
+        new_bursts: dict[int, str] = {}
+
+        for pulser_snapshot in snapshot.get("pulsers", []):
+            pulser = _coerce_int(pulser_snapshot.get("pulser"), -1)
+            if pulser < 0:
+                continue
+            width_ticks = _coerce_int(pulser_snapshot.get("width_ticks"), 0)
+            if total_ticks > 0:
+                duty_percent = ((width_ticks + width_offset) / total_ticks) * 100.0
+            else:
+                duty_percent = np.nan
+            new_values[pulser] = duty_percent
+            new_widths[pulser] = str(width_ticks)
+            burst = pulser_snapshot.get("burst")
+            new_bursts[pulser] = "n/a" if burst is None else str(burst)
+
+        self.values = new_values
+        self.width_values = new_widths
+        self.burst_values = new_bursts
+        self._sync_status_to_gui()
+
+    def applyValue(self, channel: AMXChannel) -> None:
+        device = self.device
+        if (
+            device is None
+            or not getattr(self, "initialized", False)
+            or getattr(self, "transitioning", False)
+            or not getattr(self.controllerParent, "isOn", lambda: False)()
+        ):
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "connect_timeout_s", 5.0))
+        try:
+            with self._controller_lock_section(
+                f"Could not acquire lock to apply AMX P{channel.pulser_number()}."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                self._apply_channel_timing(channel, timeout_s)
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to apply AMX P{channel.pulser_number()}: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+
+    def updateValues(self) -> None:
+        if self.values is None:
+            return
+
+        self._sync_status_to_gui()
+        device_is_on = getattr(self.controllerParent, "isOn", lambda: False)()
+        for channel in self.controllerParent.getChannels():
+            pulser = channel.pulser_number()
+            if channel.real and device_is_on:
+                channel.monitor = self.values.get(pulser, np.nan)
+                channel.setWidthText(self.width_values.get(pulser, "n/a"))
+                channel.setBurstText(self.burst_values.get(pulser, "n/a"))
+            else:
+                channel.monitor = np.nan
+                channel.setWidthText("n/a")
+                channel.setBurstText("n/a")
+
+    def toggleOn(self) -> None:
+        target_on = bool(getattr(self.controllerParent, "isOn", lambda: False)())
+        device = self.device
+        if device is None:
+            self._end_transition()
+            return
+
+        stop_acquisition = getattr(self, "stopAcquisition", None)
+        if callable(stop_acquisition):
+            stop_acquisition()
+            self.acquiring = False
+
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+
+        try:
+            if target_on:
+                with self._controller_lock_section(
+                    "Could not acquire lock to start the AMX."
+                ):
+                    device = self.device
+                    if device is None:
+                        self._restore_off_ui_state()
+                        return
+                    startup_kwargs = self._startup_kwargs()
+                    if startup_kwargs:
+                        device.initialize(timeout_s=timeout_s, **startup_kwargs)
+                    elif not getattr(device, "connected", False):
+                        device.connect(timeout_s=timeout_s)
+                    device.set_frequency_khz(
+                        float(getattr(self.controllerParent, "frequency_khz", 2.0)),
+                        timeout_s=timeout_s,
+                    )
+                    for channel in self.controllerParent.getChannels():
+                        self._apply_channel_timing(channel, timeout_s)
+                    device.set_device_enabled(True, timeout_s=timeout_s)
+                self._update_state()
+                start_acquisition = getattr(self, "startAcquisition", None)
+                if callable(start_acquisition):
+                    start_acquisition()
+                self.print("AMX timing enabled.")
+            else:
+                self.shutdownCommunication()
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            if target_on:
+                self._restore_off_ui_state()
+            self.print(
+                f"Failed to toggle AMX: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        finally:
+            self._end_transition()
+            self._sync_status_to_gui()
+
+    def shutdownCommunication(self) -> None:
+        device = self.device
+        if device is None:
+            self.closeCommunication()
+            return
+
+        stop_acquisition = getattr(self, "stopAcquisition", None)
+        if callable(stop_acquisition):
+            stop_acquisition()
+            self.acquiring = False
+        self.print("Starting AMX shutdown sequence.")
+        try:
+            device.shutdown(
+                timeout_s=float(getattr(self.controllerParent, "startup_timeout_s", 10.0)),
+                **self._shutdown_kwargs(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"AMX shutdown failed: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        else:
+            self.print("AMX shutdown sequence completed.")
+        finally:
+            self.closeCommunication()
+
+    def closeCommunication(self) -> None:
+        base_close = getattr(super(), "closeCommunication", None)
+        if callable(base_close):
+            base_close()
+        self.main_state = "Disconnected"
+        self.device_enabled_state = "OFF"
+        self.device_state_summary = "n/a"
+        self.controller_state_summary = "n/a"
+        self._sync_status_to_gui()
+        self._dispose_device()
+        self.initialized = False
+
+    def _update_state(self) -> None:
+        device = self.device
+        if device is None:
+            self.main_state = "Disconnected"
+            self.device_enabled_state = "OFF"
+            self.device_state_summary = "n/a"
+            self.controller_state_summary = "n/a"
+            return
+
+        try:
+            snapshot = device.collect_housekeeping(
+                timeout_s=float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+            )
+        except Exception:
+            try:
+                self.main_state = str(device.get_status().get("connected", False))
+            except Exception:
+                self.main_state = "Unknown"
+            self.device_enabled_state = "Unknown"
+            self.device_state_summary = "Unknown"
+            self.controller_state_summary = "Unknown"
+            return
+
+        self._apply_snapshot(snapshot)
+
+    def _sync_status_to_gui(self) -> None:
+        self.controllerParent.main_state = self.main_state
+        self.controllerParent.device_enabled_state = self.device_enabled_state
+
+    def _dispose_device(self) -> None:
+        device = self.device
+        self.device = None
+        self.initialized = False
+        if device is None:
+            return
+        try:
+            device.disconnect()
+        except Exception:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                device.close()
+
+    def _restore_off_ui_state(self) -> None:
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(False)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = False
+
+    @contextlib.contextmanager
+    def _controller_lock_section(self, timeout_message: str):
+        acquire_timeout = getattr(self.lock, "acquire_timeout", None)
+        if callable(acquire_timeout):
+            with acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
+                if not lock_acquired:
+                    raise TimeoutError(timeout_message)
+                yield
+            return
+
+        acquire = getattr(self.lock, "acquire", None)
+        release = getattr(self.lock, "release", None)
+        if callable(acquire) and callable(release):
+            if not acquire(timeout=1):
+                self.print(timeout_message, flag=PRINT.ERROR)
+                raise TimeoutError(timeout_message)
+            try:
+                yield
+            finally:
+                release()
+            return
+
+        raise TypeError(
+            "AMX controller lock must provide either acquire_timeout() or acquire()/release()."
+        )
+
+    def _begin_transition(self, target_on: bool) -> bool:
+        if self.transitioning:
+            return False
+        self.transitioning = True
+        self.transition_target_on = bool(target_on)
+        return True
+
+    def _end_transition(self) -> None:
+        self.transitioning = False
+        self.transition_target_on = None
+
+    def _format_exception(self, exc: Exception) -> str:
+        return str(exc).strip()
