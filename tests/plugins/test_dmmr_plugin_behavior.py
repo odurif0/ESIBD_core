@@ -73,7 +73,10 @@ def _install_esibd_stubs() -> None:
         def __init__(self, controllerParent=None):
             self.controllerParent = controllerParent
             self.lock = threading.Lock()
-            self.signalComm = types.SimpleNamespace(initCompleteSignal=_Signal())
+            self.signalComm = types.SimpleNamespace(
+                initCompleteSignal=_Signal(),
+                closeCommunicationSignal=_Signal(),
+            )
             self.errorCount = 0
             self.initializing = False
             self.acquiring = False
@@ -262,6 +265,7 @@ def test_controller_read_numbers_polls_module_currents():
     controller = module.DMMRController(parent)
     controller.device = FakeDevice()
     controller.initialized = True
+    controller.acquiring = True
     controller.detected_module_ids = [1, 2]
 
     controller.readNumbers()
@@ -326,6 +330,7 @@ def test_controller_read_numbers_does_not_block_on_zero_ready_flags():
     controller = module.DMMRController(parent)
     controller.device = FakeDevice()
     controller.initialized = True
+    controller.acquiring = True
     controller.detected_module_ids = [1, 2]
 
     controller.readNumbers()
@@ -632,6 +637,7 @@ def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
     controller.device = device
     controller.lock = lock
     controller.initialized = True
+    controller.acquiring = True
     controller.detected_module_ids = [3]
 
     controller.readNumbers()
@@ -698,6 +704,7 @@ def test_controller_read_numbers_keeps_partial_results_on_timeout():
     controller = module.DMMRController(parent)
     controller.device = FakeDevice()
     controller.initialized = True
+    controller.acquiring = True
     controller.detected_module_ids = [1, 2, 3]
     controller.print = lambda message, flag=None: logs.append((message, flag))
 

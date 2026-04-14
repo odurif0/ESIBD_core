@@ -1297,33 +1297,20 @@ class DMMRChannel(Channel):
         super().updateDisplay()
 
     def updateColor(self):
-        """Apply curve color only to the Display cell; keep other cells neutral."""
+        """Keep all cells neutral; center the Display checkbox."""
+        from PyQt6.QtCore import Qt
         from PyQt6.QtGui import QBrush
-        from PyQt6.QtWidgets import QComboBox
+        from PyQt6.QtWidgets import QCheckBox, QComboBox, QSizePolicy
 
         color = super().updateColor()
         if color is None:
             return color
 
-        display_name = getattr(self, "DISPLAY", "Display")
-        display_param = self.getParameterByName(display_name)
-        display_index = (
-            self.parameters.index(display_param)
-            if display_param in self.parameters
-            else -1
-        )
-
         neutral = QBrush()
-        color_brush = QBrush(color)
         for i in range(len(self.parameters) + 1):
-            if i == display_index:
-                self.setBackground(i, color_brush)
-            else:
-                self.setBackground(i, neutral)
+            self.setBackground(i, neutral)
 
         for parameter in self.parameters:
-            if parameter == display_param:
-                continue
             widget = parameter.getWidget()
             if not widget:
                 continue
@@ -1331,6 +1318,23 @@ class DMMRChannel(Channel):
                 widget.container.setStyleSheet("")
             if not isinstance(widget, QComboBox):
                 widget.setStyleSheet("")
+
+        # Center the Display checkbox in its cell
+        display_param = self.getParameterByName(self.DISPLAY)
+        if display_param:
+            display_widget = display_param.getWidget()
+            if isinstance(display_widget, QCheckBox):
+                display_widget.setSizePolicy(
+                    QSizePolicy.Policy.Maximum,
+                    display_widget.sizePolicy().verticalPolicy(),
+                )
+                if (
+                    hasattr(display_widget, "container")
+                    and display_widget.container.layout()
+                ):
+                    display_widget.container.layout().setAlignment(
+                        display_widget, Qt.AlignmentFlag.AlignCenter
+                    )
 
         return color
 
@@ -1499,6 +1503,11 @@ class DMMRController(DeviceController):
             return
 
         self._update_state()
+        # If _update_state detected an unusable device it will have set
+        # acquiring=False and emitted closeCommunicationSignal.  Bail out
+        # immediately to avoid a cascade of redundant module-read errors.
+        if not self.acquiring:
+            return
         self.initializeValues(reset=True)
 
         if not getattr(self.controllerParent, "isOn", lambda: False)():
@@ -1767,6 +1776,14 @@ class DMMRController(DeviceController):
             self.device_state_summary = self._safe_query_state("get_device_state") or "Unknown"
             self.voltage_state_summary = self._safe_query_state("get_voltage_state") or "Unknown"
             self.temperature_state_summary = self._safe_query_state("get_temperature_state") or "Unknown"
+            # When the DLL marks the instance unusable (e.g. after a timeout),
+            # every subsequent call will fail immediately.  Stop the acquisition
+            # loop and trigger closeCommunication via the framework's
+            # thread-safe signal so the GUI updates on the main thread and the
+            # COM port is released for potential re-initialization.
+            if "unusable" in str(exc).lower():
+                self.acquiring = False
+                self.signalComm.closeCommunicationSignal.emit()
             return
 
         if status == self.device.NO_ERR:
@@ -1791,10 +1808,24 @@ class DMMRController(DeviceController):
         self.controllerParent.device_state_summary = self.device_state_summary
         self.controllerParent.voltage_state_summary = self.voltage_state_summary
         self.controllerParent.temperature_state_summary = self.temperature_state_summary
-        if hasattr(self.controllerParent, "_update_status_widgets"):
-            self.controllerParent._update_status_widgets()
+        # Defer Qt widget updates to the main thread so that status badges
+        # update reliably even when _sync_status_to_gui is called from the
+        # acquisition thread (e.g. via the framework error-count auto-close).
+        update_fn = getattr(self.controllerParent, "_update_status_widgets", None)
+        if callable(update_fn):
+            try:
+                from PyQt6.QtWidgets import QApplication
+                if QApplication.instance() is not None:
+                    from PyQt6.QtCore import QTimer
+                    QTimer.singleShot(0, update_fn)
+                else:
+                    update_fn()
+            except ImportError:
+                update_fn()
 
     def _dispose_device(self) -> None:
+        import gc
+
         device = self.device
         self.device = None
         self.initialized = False
@@ -1808,6 +1839,12 @@ class DMMRController(DeviceController):
         finally:
             with contextlib.suppress(Exception):
                 device.close()
+        # Force the Python GC to release the DMMR DLL instance so that the
+        # underlying serial port handle is freed.  Without this the DLL may
+        # keep the COM port locked and prevent re-initialization on the same
+        # port (Windows error -2 "port already in use").
+        del device
+        gc.collect()
 
     def _attempt_device_disable(self) -> None:
         """Best-effort attempt to disable the DMMR hardware before closing.
