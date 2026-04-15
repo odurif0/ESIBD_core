@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import shutil
 import sys
@@ -95,7 +96,15 @@ def _install_esibd_stubs() -> None:
             self.controllerParent = controllerParent
 
     class ToolButton:
-        pass
+        def __init__(self):
+            self.style = None
+            self.checked = None
+
+        def setStyleSheet(self, style):
+            self.style = style
+
+        def setChecked(self, checked):
+            self.checked = checked
 
     class Device:
         MAXDATAPOINTS = "Max data points"
@@ -183,6 +192,80 @@ def test_dmmr_plugin_loads_driver_from_private_runtime():
 
     assert driver_class.__name__ == "DMMR"
     assert driver_class.__module__.startswith("_esibd_bundled_dmmr_runtime_")
+
+
+def test_dmmr_plugin_runtime_supports_explicit_process_backend_when_supported(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_dmmr_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, controller_path, controller_kwargs, *, label, startup_timeout_s):
+            created["controller_path"] = controller_path
+            created["controller_kwargs"] = controller_kwargs
+            created["label"] = label
+            created["startup_timeout_s"] = startup_timeout_s
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["inline_kwargs"] = kwargs
+
+    monkeypatch.setattr(driver_common, "RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    dmmr = driver_class("dmmr_process", com=8, process_backend=True)
+
+    assert dmmr._backend_mode == "process"
+    assert created["controller_path"].endswith(".dmmr:_DMMRController")
+    assert created["label"] == "DMMR dmmr_process"
+    assert created["controller_kwargs"]["device_id"] == "dmmr_process"
+    assert created["controller_kwargs"]["com"] == 8
+    assert created["controller_kwargs"]["logger"] is None
+    assert "inline_kwargs" not in created
+
+    dmmr.close()
+
+    assert dmmr._backend.closed is True
+
+
+def test_dmmr_plugin_runtime_defaults_to_inline_backend(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_dmmr_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - should stay unused
+            created["proxy_called"] = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["inline_kwargs"] = kwargs
+
+    monkeypatch.setattr(driver_common, "RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    dmmr = driver_class("dmmr_inline", com=8)
+
+    assert dmmr._backend_mode == "inline"
+    assert created["inline_kwargs"]["device_id"] == "dmmr_inline"
+    assert "proxy_called" not in created
+    assert dmmr._process_backend_disabled_reason == ""
 
 
 def test_dmmr_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):
@@ -511,6 +594,68 @@ def test_dmmr_device_shutdown_keeps_ui_on_when_shutdown_is_unconfirmed():
     assert any("shutdown could not be confirmed" in message for message, _ in warnings)
 
 
+def test_dmmr_device_close_communication_bypasses_shutdown_when_transport_is_lost():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    close_calls = []
+    device = object.__new__(module.DMMRDevice)
+    device.useOnOffLogic = True
+    device.onAction = types.SimpleNamespace(state=True)
+    sync_states = []
+    device._sync_local_on_action = lambda: sync_states.append(device.onAction.state)
+    device.stopAcquisition = lambda: None
+    device._sync_acquisition_controls = lambda: None
+    device.recording = True
+    device.initialized = True
+    device.shutdownCommunication = lambda: (_ for _ in ()).throw(
+        AssertionError("forced communication loss must not call shutdownCommunication")
+    )
+    device.controller = types.SimpleNamespace(
+        initialized=True,
+        _forced_close_state=module._DMMR_COMMUNICATION_LOST_STATE,
+        closeCommunication=lambda final_state=None: close_calls.append(final_state),
+    )
+
+    module.DMMRDevice.closeCommunication(device)
+
+    assert device.onAction.state is False
+    assert sync_states == [False]
+    assert close_calls == [module._DMMR_COMMUNICATION_LOST_STATE]
+
+
+def test_dmmr_device_set_on_uses_controller_initialized_for_restart():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    init_calls = []
+    toggle_calls = []
+    device = object.__new__(module.DMMRDevice)
+    device.loading = False
+    device.initialized = True  # Simulate a stale framework flag after a forced close.
+    device.onAction = types.SimpleNamespace(state=True)
+    device.isOn = lambda: True
+    device._sync_local_on_action = lambda: None
+    device._update_status_widgets = lambda: None
+    device.initializeCommunication = lambda: init_calls.append(True)
+    device.controller = types.SimpleNamespace(
+        initialized=False,
+        initializing=False,
+        transitioning=False,
+        transition_target_on=None,
+        toggleOnFromThread=lambda parallel=True: toggle_calls.append(parallel),
+    )
+
+    module.DMMRDevice.setOn(device, on=True)
+
+    assert init_calls == [True]
+    assert toggle_calls == []
+
+
 def test_dmmr_channel_keeps_display_widget_default():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -540,3 +685,57 @@ def test_dmmr_channel_keeps_display_widget_default():
     assert channel.super_init_gui_called == {"Name": "dummy"}
     assert upgrade_calls == [("Enabled", "Read", 52)]
     assert channel.scaling_changed is True
+
+
+def test_dmmr_enabled_toggle_widget_syncs_checked_state_and_style():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    widget = module.ToolButton()
+    parameter = types.SimpleNamespace(check=widget)
+    channel = object.__new__(module.DMMRChannel)
+    channel.enabled = True
+    channel.getParameterByName = lambda name: {"Enabled": parameter}[name]
+
+    module.DMMRChannel._sync_enabled_toggle_widget(channel)
+
+    assert widget.checked is True
+    assert "#1f2933" in widget.style
+
+
+def test_dmmr_parameter_widget_style_updates_widget_and_container():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    class FakeContainer:
+        def __init__(self):
+            self.styles = []
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeWidget:
+        def __init__(self):
+            self.container = FakeContainer()
+            self.styles = []
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    widget = FakeWidget()
+    parameter = types.SimpleNamespace(getWidget=lambda: widget)
+    channel = object.__new__(module.DMMRChannel)
+    channel.getParameterByName = lambda name: {"Display": parameter}[name]
+
+    module.DMMRChannel._set_parameter_widget_style(
+        channel,
+        "Display",
+        module._DMMR_NEUTRAL_WIDGET_STYLE,
+    )
+
+    assert widget.container.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]
+    assert widget.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]

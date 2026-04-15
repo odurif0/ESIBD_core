@@ -387,6 +387,33 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             return None
         self._raise_on_status(status, action)
 
+    def _normalize_fixed_length_values(
+        self,
+        values,
+        *,
+        expected_len: int,
+        fill_value,
+        label: str,
+    ) -> list:
+        try:
+            normalized = list(values or [])
+        except TypeError:
+            normalized = [] if values is None else [values]
+
+        if len(normalized) < expected_len:
+            self.logger.warning(
+                f"PSU {label} returned {len(normalized)} item(s); expected "
+                f"{expected_len}. Padding missing values."
+            )
+            normalized.extend([fill_value] * (expected_len - len(normalized)))
+        elif len(normalized) > expected_len:
+            self.logger.warning(
+                f"PSU {label} returned {len(normalized)} item(s); expected "
+                f"{expected_len}. Ignoring extra values."
+            )
+            normalized = normalized[:expected_len]
+        return normalized
+
     def _get_output_enabled_unlocked(self) -> tuple[bool, bool]:
         status, psu0, psu1 = PSUBase.get_psu_enable(self)
         if status == self.NO_ERR:
@@ -732,7 +759,7 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         self._raise_on_status(device_state_status, "get_device_state")
         device_enabled_status, device_enabled = PSUBase.get_device_enable(self)
         self._raise_on_status(device_enabled_status, "get_device_enable")
-        psu0_enabled, psu1_enabled = self._get_output_enabled_unlocked()
+        output_enabled_raw = self._get_output_enabled_unlocked()
         housekeeping_status, volt_rect, volt_5v0, volt_3v3, temp_cpu = PSUBase.get_housekeeping(self)
         self._raise_on_status(housekeeping_status, "get_housekeeping")
         sensor_status, temperatures = PSUBase.get_sensor_data(self)
@@ -748,7 +775,66 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         total_time_status, total_uptime_s, total_operation_s = PSUBase.get_total_time(self)
         self._raise_on_status(total_time_status, "get_total_time")
 
-        output_enabled = (psu0_enabled, psu1_enabled)
+        output_enabled = tuple(
+            bool(value)
+            for value in self._normalize_fixed_length_values(
+                output_enabled_raw,
+                expected_len=self.PSU_NUM,
+                fill_value=False,
+                label="output enabled state",
+            )
+        )
+        temperatures = self._normalize_fixed_length_values(
+            temperatures,
+            expected_len=self.SENSOR_NUM,
+            fill_value=math.nan,
+            label="sensor data",
+        )
+        fan_enabled = [
+            bool(value)
+            for value in self._normalize_fixed_length_values(
+                fan_enabled,
+                expected_len=self.FAN_NUM,
+                fill_value=False,
+                label="fan enabled state",
+            )
+        ]
+        fan_failed = [
+            bool(value)
+            for value in self._normalize_fixed_length_values(
+                fan_failed,
+                expected_len=self.FAN_NUM,
+                fill_value=False,
+                label="fan failure state",
+            )
+        ]
+        fan_set_rpm = [
+            int(value)
+            for value in self._normalize_fixed_length_values(
+                fan_set_rpm,
+                expected_len=self.FAN_NUM,
+                fill_value=0,
+                label="fan setpoints",
+            )
+        ]
+        fan_measured_rpm = [
+            int(value)
+            for value in self._normalize_fixed_length_values(
+                fan_measured_rpm,
+                expected_len=self.FAN_NUM,
+                fill_value=0,
+                label="fan readbacks",
+            )
+        ]
+        fan_pwm = [
+            int(value)
+            for value in self._normalize_fixed_length_values(
+                fan_pwm,
+                expected_len=self.FAN_NUM,
+                fill_value=0,
+                label="fan PWM values",
+            )
+        ]
         channels = []
         for channel in range(self.PSU_NUM):
             measured_status, measured_voltage, measured_current, dropout_voltage = PSUBase.get_psu_data(self, channel)

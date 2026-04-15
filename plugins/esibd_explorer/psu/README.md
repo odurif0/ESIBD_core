@@ -34,6 +34,7 @@ including the PSU driver files and vendor DLL.
 - `Standby config`: standby slot loaded on ON. Use `-1` to skip.
 - `Operating config`: optional operating slot loaded after standby. Use `-1` to skip.
 - `Shutdown config`: optional slot loaded on OFF. Use `-1` to use software shutdown.
+- `Available configs`: live list of config slots reported by the connected PSU.
 
 The plugin keeps a fixed 2-channel layout matching the physical PSU outputs.
 It is intentionally not a free-form PSU editor. The normal workflow is:

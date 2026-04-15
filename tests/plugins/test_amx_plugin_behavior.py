@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import sys
 import threading
@@ -234,3 +235,104 @@ def test_controller_read_numbers_maps_pulser_snapshot():
     assert controller.burst_values == {0: "3", 1: "n/a"}
     assert parent.main_state == "ST_ON"
     assert parent.device_enabled_state == "ON"
+
+
+def test_controller_exposes_available_amx_configs_in_gui_state():
+    module = _load_module()
+
+    class FakeDevice:
+        def list_configs(self, timeout_s=None):
+            assert timeout_s == 2.5
+            return [
+                {"index": 0, "name": "Standby", "active": True, "valid": True},
+                {"index": 9, "name": "Static:Out0-3=Hi-Z", "active": True, "valid": True},
+            ]
+
+    parent = types.SimpleNamespace(
+        connect_timeout_s=2.5,
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+
+    controller._refresh_available_configs()
+    controller._sync_status_to_gui()
+
+    assert controller.available_configs_text == (
+        "0:Standby; 9:Static:Out0-3=Hi-Z"
+    )
+    assert parent.available_configs_text == controller.available_configs_text
+
+
+def test_amx_controller_lock_section_uses_raw_lock_and_propagates_errors():
+    module = _load_module()
+
+    class FakeLock:
+        def __init__(self):
+            self.acquire_calls = []
+            self.release_calls = 0
+            self.acquire_timeout_calls = []
+
+        def acquire(self, timeout=-1):
+            self.acquire_calls.append(timeout)
+            return True
+
+        def release(self):
+            self.release_calls += 1
+
+        @contextlib.contextmanager
+        def acquire_timeout(self, timeout, timeoutMessage="", already_acquired=False):
+            self.acquire_timeout_calls.append((timeout, timeoutMessage, already_acquired))
+            yield True
+
+    controller = module.AMXController(types.SimpleNamespace())
+    controller.lock = FakeLock()
+
+    with pytest.raises(IndexError, match="boom"):
+        with controller._controller_lock_section("lock failed"):
+            raise IndexError("boom")
+
+    assert controller.lock.acquire_calls == [1]
+    assert controller.lock.release_calls == 1
+    assert controller.lock.acquire_timeout_calls == []
+
+
+def test_amx_controller_read_numbers_marks_lock_as_already_acquired():
+    module = _load_module()
+
+    class FakeDevice:
+        def collect_housekeeping(self, timeout_s=None):
+            return {
+                "device_enabled": True,
+                "main_state": {"name": "ST_ON"},
+                "device_state": {"flags": ["DEVST_OK"]},
+                "controller_state": {"flags": ["CTRLST_OK"]},
+                "oscillator": {"period": 100000},
+                "pulsers": [],
+            }
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        getChannels=lambda: [],
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+    )
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def fake_lock_section(timeout_message, *, already_acquired=False):
+        lock_calls.append((timeout_message, already_acquired))
+        yield
+
+    controller._controller_lock_section = fake_lock_section
+    controller.readNumbers()
+
+    assert lock_calls == [("Could not acquire lock to read AMX housekeeping.", True)]

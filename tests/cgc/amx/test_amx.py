@@ -348,16 +348,80 @@ def test_load_config_calls_vendor_wrapper(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     amx.connected = True
     monkeypatch.setattr(AMXBase, "load_current_config", lambda self, index: self.NO_ERR)
+    monkeypatch.setattr(AMXBase, "get_config_name", lambda self, index: (self.NO_ERR, "Standby"))
 
     amx.load_config(40)
 
+    assert amx.get_status()["memory_config"] == 40
+    assert amx.get_status()["memory_config_name"] == "Standby"
+    assert amx.get_status()["memory_config_source"] == "explicit"
 
-def test_initialize_requires_at_least_one_config(monkeypatch):
+
+def test_initialize_can_connect_without_loading_any_config(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     backend = object.__getattribute__(amx, "_backend")
+    calls = []
 
-    with pytest.raises(ValueError, match="requires standby_config, operating_config, or both"):
-        backend.initialize()
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(backend, "_find_auto_standby_config", lambda timeout_s=None: None)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        Mock(side_effect=AssertionError("initialize() should not load a config by default")),
+    )
+
+    assert backend.initialize(timeout_s=2.0) == {}
+    assert calls == [("connect", 2.0)]
+
+
+def test_initialize_auto_loads_valid_standby_config_into_memory(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    backend = object.__getattribute__(amx, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "_find_auto_standby_config",
+        lambda timeout_s=None: {"index": 0, "name": "Standby", "valid": True},
+    )
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(
+        backend,
+        "get_device_enabled",
+        lambda timeout_s=None: calls.append(("get_device_enabled", timeout_s)) or False,
+    )
+
+    result = backend.initialize(timeout_s=2.5)
+
+    assert result == {
+        "standby_config": 0,
+        "device_enabled": False,
+        "memory_config": 0,
+        "memory_config_name": "Standby",
+        "memory_config_source": "auto-standby",
+    }
+    assert calls == [
+        ("connect", 2.5),
+        ("load_config", 0, 2.5),
+        ("get_device_enabled", 2.5),
+    ]
 
 
 def test_initialize_runs_standby_then_operating_sequence_and_returns_state(monkeypatch):
@@ -394,6 +458,9 @@ def test_initialize_runs_standby_then_operating_sequence_and_returns_state(monke
         "standby_config": 3,
         "device_enabled": False,
         "operating_config": 40,
+        "memory_config": 40,
+        "memory_config_name": None,
+        "memory_config_source": "operating",
     }
     assert calls == [
         ("connect", 2.5),
@@ -431,6 +498,9 @@ def test_initialize_can_load_only_an_operating_config(monkeypatch):
 
     assert result == {
         "operating_config": 40,
+        "memory_config": 40,
+        "memory_config_name": None,
+        "memory_config_source": "operating",
     }
     assert calls == [
         ("connect", 2.0),
@@ -585,6 +655,7 @@ def test_amx_critical_operations_use_timeout_safe_wrapper(monkeypatch):
 
     assert calls == [
         ("load_current_config", 2.0, "load_current_config", (backend, 40)),
+        ("get_config_name", 2.0, "get_config_name[40]", (backend, 40)),
         ("set_device_enable", 2.1, "set_device_enable", (backend, True)),
         ("get_device_enable", 2.2, "get_device_enable", (backend,)),
         ("set_oscillator_period", 2.3, "set_oscillator_period", (backend, 49998)),

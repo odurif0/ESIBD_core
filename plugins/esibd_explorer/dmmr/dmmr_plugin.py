@@ -48,6 +48,11 @@ _DMMR_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
 _DMMR_ATTENTION_STATE_TOKENS = ("error", "unconfirmed", "lost")
 _DMMR_POWER_ON_ICON = "switch-medium_on.png"
 _DMMR_POWER_OFF_ICON = "switch-medium_off.png"
+_DMMR_NEUTRAL_WIDGET_STYLE = "background: transparent;"
+_DMMR_TOGGLE_BUTTON_STYLE = (
+    "QToolButton { margin: 0px; padding: 0px 6px; }"
+    "QToolButton:checked { background-color: #1f2933; color: #ffffff; }"
+)
 
 
 def _is_nan(value: Any) -> bool:
@@ -1060,15 +1065,23 @@ class DMMRDevice(Device):
 
     def closeCommunication(self) -> None:
         """Close communication safely even if plugin finalization failed early."""
+        controller = self.controller if hasattr(self, "controller") else None
+        controller_initialized = bool(getattr(controller, "initialized", False))
+        forced_close_state = getattr(controller, "_forced_close_state", None)
         if self.useOnOffLogic and not hasattr(self, "onAction"):
             self.stopAcquisition()
-            if self.controller:
-                self.controller.closeCommunication()
+            if controller:
+                close_kwargs = (
+                    {"final_state": forced_close_state}
+                    if forced_close_state
+                    else {}
+                )
+                controller.closeCommunication(**close_kwargs)
             self.recording = False
             self._sync_acquisition_controls()
             return
 
-        if self.controller and getattr(self, "initialized", False):
+        if controller and controller_initialized and not forced_close_state:
             self.shutdownCommunication()
             return
 
@@ -1076,8 +1089,13 @@ class DMMRDevice(Device):
             self.onAction.state = False
             self._sync_local_on_action()
         self.stopAcquisition()
-        if self.controller:
-            self.controller.closeCommunication()
+        if controller:
+            close_kwargs = (
+                {"final_state": forced_close_state}
+                if forced_close_state
+                else {}
+            )
+            controller.closeCommunication(**close_kwargs)
         self.recording = False
         self._sync_acquisition_controls()
 
@@ -1141,7 +1159,7 @@ class DMMRDevice(Device):
         if getattr(self, "loading", False):
             return
 
-        if getattr(self, "initialized", False):
+        if controller and getattr(controller, "initialized", False):
             begin_transition = getattr(self.controller, "_begin_transition", None) if self.controller else None
             if self.controller and (not callable(begin_transition) or begin_transition(self.isOn())):
                 self.controller.toggleOnFromThread(parallel=True)
@@ -1201,6 +1219,7 @@ class DMMRChannel(Channel):
         if callable(getattr(self, "getParameterByName", None)):
             self._upgrade_monitor_widget()
         self._upgrade_toggle_widget(self.ENABLED, "Read", 52)
+        self._sync_enabled_toggle_widget()
         self.scalingChanged()
 
     def scalingChanged(self) -> None:
@@ -1241,9 +1260,45 @@ class DMMRChannel(Channel):
             parameter.check.setMinimumWidth(minimum_width)
             parameter.check.setText(label)
             parameter.check.setCheckable(True)
+            if hasattr(parameter.check, "setStyleSheet"):
+                parameter.check.setStyleSheet(_DMMR_TOGGLE_BUTTON_STYLE)
             if hasattr(parameter.check, "setAutoRaise"):
                 parameter.check.setAutoRaise(False)
         parameter.value = initial_value
+
+    def _sync_enabled_toggle_widget(self) -> None:
+        """Keep the Read button state visually synchronized with channel.enabled."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        parameter = getter(getattr(self, "ENABLED", "Enabled"))
+        widget = getattr(parameter, "check", None) if parameter is not None else None
+        if widget is None:
+            return
+        enabled_value = getattr(self, "enabled", None)
+        if enabled_value is None and parameter is not None:
+            enabled_value = getattr(parameter, "value", False)
+        if hasattr(widget, "setChecked"):
+            widget.setChecked(bool(enabled_value))
+        if hasattr(widget, "setStyleSheet"):
+            widget.setStyleSheet(_DMMR_TOGGLE_BUTTON_STYLE)
+
+    def _set_parameter_widget_style(self, parameter_name: str, style: str) -> None:
+        """Apply the same background style to a parameter widget and its container."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        parameter = getter(parameter_name)
+        if parameter is None:
+            return
+        widget = getattr(parameter, "getWidget", lambda: None)()
+        if widget is None:
+            return
+        container = getattr(widget, "container", None)
+        if container is not None and hasattr(container, "setStyleSheet"):
+            container.setStyleSheet(style)
+        if hasattr(widget, "setStyleSheet"):
+            widget.setStyleSheet(style)
 
     def _upgrade_monitor_widget(self) -> None:
         """Replace the default numeric monitor widget with the SI-aware DMMR monitor."""
@@ -1288,6 +1343,7 @@ class DMMRChannel(Channel):
         super().enabledChanged()
         if not self.enabled:
             self.monitor = np.nan
+        self._sync_enabled_toggle_widget()
 
     def monitorChanged(self) -> None:
         super().monitorChanged()
@@ -1335,6 +1391,10 @@ class DMMRChannel(Channel):
                     display_widget.container.layout().setAlignment(
                         display_widget, Qt.AlignmentFlag.AlignCenter
                     )
+
+        self._set_parameter_widget_style(self.DISPLAY, _DMMR_NEUTRAL_WIDGET_STYLE)
+        self._set_parameter_widget_style(self.MODULE, _DMMR_NEUTRAL_WIDGET_STYLE)
+        self._sync_enabled_toggle_widget()
 
         return color
 
@@ -1397,6 +1457,7 @@ class DMMRController(DeviceController):
         self.transitioning = False
         self.transition_target_on: bool | None = None
         self._closing = False
+        self._forced_close_state: str | None = None
 
     def initializeValues(self, reset: bool = False) -> None:
         if getattr(self, "values", None) is None or reset:
@@ -1432,8 +1493,53 @@ class DMMRController(DeviceController):
             )
         return sorted(configured_modules)
 
+    def _wrong_command_status(self, status: Any, device: Any | None = None) -> bool:
+        device = self.device if device is None else device
+        if device is None:
+            return False
+        wrong_command = getattr(device, "ERR_COMMAND_WRONG", None)
+        return wrong_command is not None and status == wrong_command
+
+    def _disable_automatic_current_for_module_polling(
+        self,
+        *,
+        timeout_s: float,
+        log_warning: bool = False,
+        device: Any | None = None,
+    ) -> bool:
+        """Force the controller back to manual module polling mode.
+
+        The plugin reads one module at a time via ``get_module_current()``.
+        That command stream is incompatible with the firmware automatic-current
+        frame mode used by ``get_current()``.
+        """
+        device = self.device if device is None else device
+        if device is None:
+            return False
+
+        disable_automatic = getattr(device, "set_automatic_current", None)
+        if not callable(disable_automatic):
+            return False
+
+        status = disable_automatic(False, timeout_s=timeout_s)
+        if status != getattr(device, "NO_ERR", status):
+            raise RuntimeError(
+                "set_automatic_current(False) failed: "
+                f"{self._format_status(status, device=device)}"
+            )
+
+        if log_warning:
+            self.print(
+                "DMMR automatic current mode was active; switched back to "
+                "manual module polling.",
+                flag=PRINT.WARNING,
+            )
+        return True
+
     def runInitialization(self) -> None:
         self.initialized = False
+        self._forced_close_state = None
+        self._end_transition()
         self._dispose_device()
         try:
             dmmr_driver_class = _get_dmmr_driver_class()
@@ -1554,6 +1660,37 @@ class DMMRController(DeviceController):
                 new_values[module] = float(measured_current)
                 continue
 
+            if self._wrong_command_status(status, device=device):
+                try:
+                    with self._controller_lock_section(
+                        "Could not acquire lock to recover DMMR polling mode.",
+                        already_acquired=True,
+                    ):
+                        device = self.device
+                        if device is None:
+                            return
+                        recovered = self._disable_automatic_current_for_module_polling(
+                            timeout_s=float(self.controllerParent.connect_timeout_s),
+                            log_warning=True,
+                            device=device,
+                        )
+                        if recovered:
+                            status, measured_current, _meas_range = device.get_module_current(
+                                module,
+                                timeout_s=float(self.controllerParent.poll_timeout_s),
+                            )
+                    if status == getattr(device, "NO_ERR", status):
+                        new_values[module] = float(measured_current)
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    self.errorCount += 1
+                    self.print(
+                        "Failed to recover DMMR manual polling mode: "
+                        f"{self._format_exception(exc)}",
+                        flag=PRINT.ERROR,
+                    )
+                    continue
+
             self.errorCount += 1
             self.print(
                 f"DMMR rejected current read for module {module}: "
@@ -1631,15 +1768,10 @@ class DMMRController(DeviceController):
                                     f"set_module_auto_range({module}, True) failed: "
                                     f"{self._format_status(auto_range_status, device=device)}"
                                 )
-                    automatic_status = device.set_automatic_current(
-                        True,
+                    self._disable_automatic_current_for_module_polling(
                         timeout_s=float(self.controllerParent.connect_timeout_s),
+                        device=device,
                     )
-                    if automatic_status != device.NO_ERR:
-                        raise RuntimeError(
-                            "set_automatic_current(True) failed: "
-                            f"{self._format_status(automatic_status, device=device)}"
-                        )
                 self._update_state()
                 start_acquisition = getattr(self, "startAcquisition", None)
                 if callable(start_acquisition):
@@ -1692,6 +1824,7 @@ class DMMRController(DeviceController):
             return
         self._closing = True
         try:
+            self._end_transition()
             # Signal the acquisition loop to stop early so it releases the
             # controller lock without waiting for a contested acquire_timeout.
             self.acquiring = False
@@ -1720,6 +1853,7 @@ class DMMRController(DeviceController):
             self._sync_status_to_gui()
             self._dispose_device()
             self.initialized = False
+            self._forced_close_state = None
         finally:
             self._closing = False
 
@@ -1771,7 +1905,11 @@ class DMMRController(DeviceController):
             status, _state_hex, state_name = self.device.get_state(timeout_s=timeout_s)
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
-            self.main_state = "State error"
+            lowered_exception = str(exc).lower()
+            transport_unusable = "unusable" in lowered_exception
+            self.main_state = (
+                _DMMR_COMMUNICATION_LOST_STATE if transport_unusable else "State error"
+            )
             self.print(f"Failed to read DMMR state: {exc}", flag=PRINT.ERROR)
             self.device_state_summary = self._safe_query_state("get_device_state") or "Unknown"
             self.voltage_state_summary = self._safe_query_state("get_voltage_state") or "Unknown"
@@ -1781,9 +1919,8 @@ class DMMRController(DeviceController):
             # loop and trigger closeCommunication via the framework's
             # thread-safe signal so the GUI updates on the main thread and the
             # COM port is released for potential re-initialization.
-            if "unusable" in str(exc).lower():
-                self.acquiring = False
-                self.signalComm.closeCommunicationSignal.emit()
+            if transport_unusable:
+                self._handle_transport_loss()
             return
 
         if status == self.device.NO_ERR:
@@ -1801,6 +1938,23 @@ class DMMRController(DeviceController):
         self.temperature_state_summary = (
             self._safe_query_state("get_temperature_state") or "Unknown"
         )
+
+    def _handle_transport_loss(self) -> None:
+        """Force immediate backend teardown after a fatal transport timeout."""
+        if (
+            self._forced_close_state == _DMMR_COMMUNICATION_LOST_STATE
+            and self.device is None
+        ):
+            return
+
+        self._forced_close_state = _DMMR_COMMUNICATION_LOST_STATE
+        self.acquiring = False
+        self.initialized = False
+        self._end_transition()
+        self._restore_off_ui_state()
+        self._dispose_device()
+        self._sync_status_to_gui()
+        self.signalComm.closeCommunicationSignal.emit()
 
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
