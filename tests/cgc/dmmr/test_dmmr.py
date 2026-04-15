@@ -1125,6 +1125,20 @@ def test_disconnect_keeps_connected_true_when_close_port_fails(monkeypatch):
     assert backend.connected is True
 
 
+def test_disconnect_releases_port_after_transport_timeout_when_force_close_succeeds(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = False
+    backend._transport_poisoned = True
+    backend._set_port_claimed(True)
+    monkeypatch.setattr(backend, "stop_housekeeping", Mock(return_value=True))
+    monkeypatch.setattr(DMMRBase, "close_port", lambda self: self.NO_ERR)
+
+    assert backend.disconnect() is True
+    assert backend.connected is False
+    assert backend._dll_port_claimed is False
+
+
 def test_dmmr_base_rejects_invalid_config_number(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")

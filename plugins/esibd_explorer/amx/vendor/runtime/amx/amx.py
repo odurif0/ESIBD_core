@@ -63,6 +63,9 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         self._dll_port_claimed = False
         self._transport_poisoned = False
         self._transport_error = None
+        self.loaded_config_number: Optional[int] = None
+        self.loaded_config_name: str = ""
+        self.loaded_config_source: str = ""
 
         self.thread_lock = thread_lock or threading.Lock()
 
@@ -241,6 +244,96 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 f"{exc}"
             )
 
+    def _set_loaded_config_state(
+        self,
+        config_number: Optional[int],
+        *,
+        config_name: Optional[str] = None,
+        source: str = "",
+    ) -> None:
+        self.loaded_config_number = (
+            None if config_number is None else int(config_number)
+        )
+        self.loaded_config_name = str(config_name or "").strip()
+        self.loaded_config_source = str(source or "").strip()
+
+    def _loaded_config_status(self) -> dict[str, object]:
+        return {
+            "memory_config": self.loaded_config_number,
+            "memory_config_name": self.loaded_config_name or None,
+            "memory_config_source": self.loaded_config_source or None,
+        }
+
+    def _remember_loaded_config(
+        self,
+        config_number: int,
+        *,
+        timeout_s: Optional[float] = None,
+        config_name: Optional[str] = None,
+        source: str = "explicit",
+    ) -> None:
+        resolved_name = str(config_name or "").strip()
+        if not resolved_name and self.connected:
+            try:
+                io_timeout_s = self._resolve_io_timeout(timeout_s)
+                status, resolved_name = self._call_locked_with_timeout(
+                    AMXBase.get_config_name,
+                    io_timeout_s,
+                    f"get_config_name[{config_number}]",
+                    self,
+                    config_number,
+                )
+                self._raise_on_status(status, f"get_config_name({config_number})")
+            except Exception as exc:  # noqa: BLE001
+                self.logger.debug(
+                    "Could not resolve AMX config name for loaded slot "
+                    f"{config_number}: {exc}"
+                )
+                resolved_name = ""
+
+        self._set_loaded_config_state(
+            config_number,
+            config_name=resolved_name,
+            source=source,
+        )
+
+    def _find_auto_standby_config(
+        self,
+        timeout_s: Optional[float] = None,
+    ) -> Optional[dict[str, object]]:
+        try:
+            configs = self.list_configs(timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(
+                "Could not inspect AMX config list during initialize(): "
+                f"{exc}"
+            )
+            return None
+
+        exact_matches = [
+            config
+            for config in configs
+            if bool(config.get("valid"))
+            and str(config.get("name", "")).strip().lower() == "standby"
+        ]
+        if exact_matches:
+            return exact_matches[0]
+
+        partial_matches = [
+            config
+            for config in configs
+            if bool(config.get("valid"))
+            and "standby" in str(config.get("name", "")).strip().lower()
+        ]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
+        if len(partial_matches) > 1:
+            self.logger.warning(
+                "AMX initialize() found multiple valid standby-like configs; "
+                "skipping automatic memory load. Choose a slot explicitly."
+            )
+        return None
+
     def initialize(
         self,
         timeout_s: float = 5.0,
@@ -252,18 +345,17 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         """
         Run the routine AMX startup sequence.
 
-        initialize() always establishes the transport with connect(). When a
-        validated standby configuration is available, it can be loaded first
-        and checked to confirm that the AMX device-enable flag stays cleared
-        before the operating configuration is applied.
+        initialize() always establishes the transport with connect(). Standby
+        and operating configurations are optional. When neither is provided,
+        initialize() will try to auto-load a valid configuration named
+        ``Standby`` into controller memory. When a standby configuration is
+        available, it is checked to confirm that the AMX device-enable flag
+        stays cleared before any operating configuration is applied.
         """
-        if standby_config is None and operating_config is None:
-            raise ValueError(
-                "initialize() requires standby_config, operating_config, or both."
-            )
-
         timeout_s = self._resolve_io_timeout(timeout_s)
         was_connected = self.connected
+        selected_standby_name = ""
+        standby_source = "standby"
         self.logger.info(
             f"Initializing AMX device {self.device_id}"
             + (
@@ -282,8 +374,22 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         try:
             self.connect(timeout_s=timeout_s)
 
+            if standby_config is None and operating_config is None:
+                auto_standby = self._find_auto_standby_config(timeout_s=timeout_s)
+                if auto_standby is not None:
+                    standby_config = int(auto_standby["index"])
+                    selected_standby_name = str(
+                        auto_standby.get("name", "")
+                    ).strip()
+                    standby_source = "auto-standby"
+
             if standby_config is not None:
                 self.load_config(standby_config, timeout_s=timeout_s)
+                self._set_loaded_config_state(
+                    standby_config,
+                    config_name=selected_standby_name or self.loaded_config_name,
+                    source=standby_source,
+                )
                 device_enabled = self.get_device_enabled(timeout_s=timeout_s)
                 initialization_state.update(
                     {
@@ -300,8 +406,15 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
 
             if operating_config is not None:
                 self.load_config(operating_config, timeout_s=timeout_s)
+                self._set_loaded_config_state(
+                    operating_config,
+                    config_name=self.loaded_config_name,
+                    source="operating",
+                )
                 initialization_state["operating_config"] = int(operating_config)
 
+            if self.loaded_config_number is not None:
+                initialization_state.update(self._loaded_config_status())
             return initialization_state
         except Exception:
             if was_connected or self.connected or self._transport_poisoned:
@@ -325,6 +438,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             if not was_connected:
                 if not self._dll_port_claimed:
                     self._set_port_claimed(False)
+                self._set_loaded_config_state(None)
                 return True
 
             self.logger.info(f"Disconnecting AMX device {self.device_id}")
@@ -336,6 +450,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             if status == self.NO_ERR:
                 self.connected = False
                 self._set_port_claimed(False)
+                self._set_loaded_config_state(None)
                 self.logger.info(
                     f"Successfully disconnected AMX device {self.device_id}"
                 )
@@ -361,6 +476,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             "baudrate": self.baudrate,
             "connected": self.connected,
             "transport_poisoned": self._transport_poisoned,
+            **self._loaded_config_status(),
         }
 
     def _list_configs_unlocked(self, include_empty: bool = False) -> list[dict]:
@@ -418,6 +534,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             config_number,
         )
         self._raise_on_status(status, f"load_current_config({config_number})")
+        self._remember_loaded_config(config_number, timeout_s=timeout_s)
 
     def set_device_enabled(
         self,

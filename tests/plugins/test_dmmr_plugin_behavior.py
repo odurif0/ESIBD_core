@@ -340,6 +340,87 @@ def test_controller_read_numbers_does_not_block_on_zero_ready_flags():
     assert controller.device.current_calls == [(1, 2.5), (2, 2.5)]
 
 
+def test_controller_read_numbers_recovers_from_automatic_current_mode():
+    module = _load_module()
+
+    class FakeDevice:
+        NO_ERR = 0
+        ERR_COMMAND_WRONG = -13
+
+        def __init__(self):
+            self.current_calls = []
+            self.automatic_current = True
+
+        def get_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", "ST_ON"
+
+        def get_device_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["DEVICE_OK"]
+
+        def get_voltage_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0007", ["VS_3V3_OK", "VS_5V0_OK", "VS_12V_OK"]
+
+        def get_temperature_state(self, timeout_s=None):
+            return self.NO_ERR, "0x0000", ["TEMPERATURE_OK"]
+
+        def set_automatic_current(self, enabled, timeout_s=None):
+            assert enabled is False
+            self.automatic_current = False
+            return self.NO_ERR
+
+        def get_module_current(self, module, timeout_s=None):
+            self.current_calls.append((module, timeout_s, self.automatic_current))
+            if self.automatic_current:
+                return self.ERR_COMMAND_WRONG, np.nan, 0
+            return self.NO_ERR, module * 1e-12, module + 10
+
+    class FakeChannel:
+        def __init__(self, module):
+            self._module = module
+            self.real = True
+            self.enabled = True
+
+        def module_address(self):
+            return self._module
+
+    logs = []
+    parent = types.SimpleNamespace(
+        connect_timeout_s=7.0,
+        poll_timeout_s=2.5,
+        isOn=lambda: True,
+        getChannels=lambda: [FakeChannel(3)],
+        getConfiguredModules=lambda: [3],
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.acquiring = True
+    controller.detected_module_ids = [3]
+    controller.print = lambda message, flag=None: logs.append((message, flag))
+
+    controller.readNumbers()
+
+    assert controller.values == {3: 3e-12}
+    assert controller.errorCount == 0
+    assert controller.device.current_calls == [
+        (3, 2.5, True),
+        (3, 2.5, False),
+    ]
+    assert logs == [
+        (
+            "DMMR automatic current mode was active; switched back to manual module polling.",
+            module.PRINT.WARNING,
+        )
+    ]
+
+
 def test_controller_toggle_on_enables_measurement():
     module = _load_module()
     calls = []
@@ -389,7 +470,7 @@ def test_controller_toggle_on_enables_measurement():
 
     assert calls == [
         ("set_enable", True, 7.0),
-        ("set_automatic_current", True, 7.0),
+        ("set_automatic_current", False, 7.0),
     ]
     assert controller.acquiring is True
 
@@ -451,7 +532,7 @@ def test_controller_toggle_on_enables_module_auto_range_for_active_modules():
         ("set_enable", True, 7.0),
         ("set_module_auto_range", 1, True, 7.0),
         ("set_module_auto_range", 3, True, 7.0),
-        ("set_automatic_current", True, 7.0),
+        ("set_automatic_current", False, 7.0),
     ]
     assert controller.acquiring is True
 
@@ -563,6 +644,57 @@ def test_controller_toggle_off_failure_restores_on_ui_state():
         "Failed to toggle DMMR acquisition:" in message
         for message, _flag in log_messages
     )
+
+
+def test_controller_marks_communication_lost_and_requests_forced_close_when_transport_is_unusable():
+    module = _load_module()
+    ui_states = []
+
+    class FakeDevice:
+        def get_state(self, timeout_s=None):
+            raise RuntimeError(
+                "DMMR DLL call timed out during 'get_state'. "
+                "The DMMR instance is now marked unusable."
+            )
+
+        def get_device_state(self, timeout_s=None):
+            raise RuntimeError("transport unusable")
+
+        def get_voltage_state(self, timeout_s=None):
+            raise RuntimeError("transport unusable")
+
+        def get_temperature_state(self, timeout_s=None):
+            raise RuntimeError("transport unusable")
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.0,
+        _set_on_ui_state=lambda on: ui_states.append(on),
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.acquiring = True
+    controller.transitioning = True
+    controller.transition_target_on = True
+
+    controller._update_state()
+
+    assert controller.main_state == module._DMMR_COMMUNICATION_LOST_STATE
+    assert controller._forced_close_state == module._DMMR_COMMUNICATION_LOST_STATE
+    assert controller.acquiring is False
+    assert controller.initialized is False
+    assert controller.device is None
+    assert controller.transitioning is False
+    assert controller.transition_target_on is None
+    assert ui_states == [False]
+    assert controller.signalComm.closeCommunicationSignal.last_emit == ((), {})
 
 
 def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():

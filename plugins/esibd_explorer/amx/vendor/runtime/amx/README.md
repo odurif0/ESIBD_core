@@ -34,6 +34,18 @@ device enable state, and by default refuses to continue if that standby config
 leaves the AMX enabled. `operating_config` remains optional because the driver
 does not assume a universal standby slot number or content for every AMX.
 
+## Configuration Slots Are Controller-Specific
+
+AMX config slots are not universal. The valid indices and their meanings depend
+on what is stored in the controller NVM on that particular unit.
+
+- Always inspect `list_configs()` before choosing a slot.
+- Treat `standby_config` and `operating_config` as optional inputs.
+- `initialize()` without configs is valid and simply establishes the transport.
+- Do not assume that slot `40` exists on every AMX. On the controller tested
+  on April 14, 2026, slot `40` was not valid and `load_current_config(40)`
+  failed with vendor status `-10`.
+
 Do not treat `open_port()` as the normal entry point. It is a low-level DLL
 primitive exposed by `amx_base.py`. `connect()` remains the safe transport
 entry point when you need a manual workflow.
@@ -94,10 +106,12 @@ terminated after an RPC timeout.
 from cgc.amx import AMX
 
 STANDBY_CONFIG = None  # Optional: replace with a validated disabled config.
-OPERATING_CONFIG = 40
+OPERATING_CONFIG = None  # Optional: choose a validated index from list_configs().
 
 amx = AMX("amx_main", com=8, port=0)
-startup_kwargs = {"operating_config": OPERATING_CONFIG}
+startup_kwargs = {}
+if OPERATING_CONFIG is not None:
+    startup_kwargs["operating_config"] = OPERATING_CONFIG
 if STANDBY_CONFIG is not None:
     startup_kwargs["standby_config"] = STANDBY_CONFIG
 

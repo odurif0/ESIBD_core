@@ -191,9 +191,6 @@ class ControllerProcessProxy:
                 except (BrokenPipeError, EOFError, OSError):
                     pass
                 self._process.join(timeout=1.0)
-                if self._process.is_alive():
-                    self._process.terminate()
-                    self._process.join(timeout=1.0)
         finally:
             self._closed = True
             self._close_transport()
@@ -268,6 +265,17 @@ class ControllerProcessProxy:
         if self._process.is_alive():
             self._process.terminate()
             self._process.join(timeout=1.0)
+            if self._process.is_alive():
+                kill = getattr(self._process, "kill", None)
+                if callable(kill):
+                    kill()
+                    self._process.join(timeout=1.0)
+        close_process = getattr(self._process, "close", None)
+        if callable(close_process) and not self._process.is_alive():
+            try:
+                close_process()
+            except Exception:
+                pass
 
     def __del__(self):  # pragma: no cover - best effort cleanup
         try:

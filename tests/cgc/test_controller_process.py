@@ -86,3 +86,49 @@ def test_controller_process_proxy_allows_backend_timeout_s_kwargs():
         ) == 0.25
     finally:
         proxy.close()
+
+
+def test_controller_process_proxy_close_transport_kills_stubborn_worker():
+    proxy = object.__new__(ControllerProcessProxy)
+
+    class FakeConnection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self):
+            self.alive = True
+            self.terminate_calls = 0
+            self.kill_calls = 0
+            self.join_timeouts = []
+            self.closed = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminate_calls += 1
+
+        def kill(self):
+            self.kill_calls += 1
+            self.alive = False
+
+        def join(self, timeout=None):
+            self.join_timeouts.append(timeout)
+
+        def close(self):
+            self.closed = True
+
+    proxy._connection = FakeConnection()
+    proxy._process = FakeProcess()
+
+    proxy._close_transport()
+
+    assert proxy._connection.closed is True
+    assert proxy._process.terminate_calls == 1
+    assert proxy._process.kill_calls == 1
+    assert proxy._process.join_timeouts == [1.0, 1.0]
+    assert proxy._process.closed is True

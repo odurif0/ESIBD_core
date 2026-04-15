@@ -861,6 +861,138 @@ def test_collect_housekeeping_returns_structured_snapshot(monkeypatch):
     assert snapshot["channels"][1]["enabled"] is False
 
 
+def test_collect_housekeeping_tolerates_short_driver_sequences(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    backend.connected = True
+    monkeypatch.setattr(
+        PSUBase, "get_main_state", lambda self: (self.NO_ERR, "0x0000", "STATE_ON")
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_device_state",
+        lambda self: (self.NO_ERR, "0x0000", ["DEVST_OK"]),
+    )
+    monkeypatch.setattr(PSUBase, "get_device_enable", lambda self: (self.NO_ERR, True))
+    monkeypatch.setattr(backend, "_get_output_enabled_unlocked", lambda: (True,))
+    monkeypatch.setattr(
+        PSUBase,
+        "get_housekeeping",
+        lambda self: (self.NO_ERR, 24.0, 5.0, 3.3, 41.5),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_sensor_data",
+        lambda self: (self.NO_ERR, [12.0]),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_fan_data",
+        lambda self: (
+            self.NO_ERR,
+            [True],
+            [False],
+            [1000],
+            [990],
+            [100],
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_led_data", lambda self: (self.NO_ERR, True, False, True)
+    )
+    monkeypatch.setattr(
+        PSUBase, "get_cpu_data", lambda self: (self.NO_ERR, 0.25, 250_000_000.0)
+    )
+    monkeypatch.setattr(PSUBase, "get_uptime", lambda self: (self.NO_ERR, 12, 34, 56))
+    monkeypatch.setattr(
+        PSUBase, "get_total_time", lambda self: (self.NO_ERR, 120, 560)
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_data",
+        lambda self, channel: (
+            self.NO_ERR,
+            10.0 + channel,
+            0.1 + channel,
+            1.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_set_output_voltage",
+        lambda self, channel: (
+            self.NO_ERR,
+            20.0 + channel,
+            30.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_set_output_current",
+        lambda self, channel: (
+            self.NO_ERR,
+            0.2 + channel,
+            0.3 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_adc_housekeeping",
+        lambda self, channel: (
+            self.NO_ERR,
+            1.1 + channel,
+            1.2 + channel,
+            1.3 + channel,
+            1.4 + channel,
+            1.5 + channel,
+            40.0 + channel,
+        ),
+    )
+    monkeypatch.setattr(
+        PSUBase,
+        "get_psu_housekeeping",
+        lambda self, channel: (
+            self.NO_ERR,
+            24.0 + channel,
+            12.0 + channel,
+            -12.0 - channel,
+            2.5 + channel,
+        ),
+    )
+
+    snapshot = backend.collect_housekeeping()
+
+    assert snapshot["output_enabled"] == (True, False)
+    assert snapshot["sensors_c"][0] == 12.0
+    assert snapshot["sensors_c"][1] != snapshot["sensors_c"][1]
+    assert snapshot["sensors_c"][2] != snapshot["sensors_c"][2]
+    assert snapshot["fans"][0] == {
+        "fan": 0,
+        "enabled": True,
+        "failed": False,
+        "set_rpm": 1000,
+        "measured_rpm": 990,
+        "pwm": 100,
+    }
+    assert snapshot["fans"][1] == {
+        "fan": 1,
+        "enabled": False,
+        "failed": False,
+        "set_rpm": 0,
+        "measured_rpm": 0,
+        "pwm": 0,
+    }
+    assert snapshot["fans"][2] == {
+        "fan": 2,
+        "enabled": False,
+        "failed": False,
+        "set_rpm": 0,
+        "measured_rpm": 0,
+        "pwm": 0,
+    }
+    assert snapshot["channels"][1]["enabled"] is False
+
+
 def test_psu_critical_operations_use_timeout_safe_wrapper(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     backend = object.__getattribute__(psu, "_backend")

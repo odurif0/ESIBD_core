@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from pathlib import Path
@@ -460,6 +461,67 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
                 self.disconnect()
             raise
 
+    def _force_disconnect_poisoned_transport(self, timeout_s: float = 1.0) -> bool:
+        """Best-effort close for an unusable inline transport.
+
+        After a timed-out DLL call, the normal serialized close path cannot run
+        because the transport lock may still be held by the blocked worker
+        thread. Try a direct ``close_port`` in a short-lived helper thread so a
+        fresh controller instance can reuse the COM port when the DLL accepts
+        the close.
+        """
+        result_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+        close_port = super().close_port
+
+        def runner() -> None:
+            try:
+                result_queue.put(("result", close_port()))
+            except Exception as exc:  # pragma: no cover - forwarded to caller
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(
+            target=runner,
+            name=f"DMMR_{self.device_id}_force_close",
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout_s)
+
+        if thread.is_alive():
+            self.logger.warning(
+                f"DMMR close_port did not return within {timeout_s:.1f}s after the "
+                "transport became unusable. Leaving the DLL port claim active."
+            )
+            return False
+
+        try:
+            kind, payload = result_queue.get_nowait()
+        except queue.Empty:
+            self.logger.warning(
+                "DMMR force-close worker exited without reporting a close_port result."
+            )
+            return False
+
+        if kind == "error":
+            self.logger.warning(
+                f"Best-effort DMMR close_port after transport timeout failed: {payload}"
+            )
+            return False
+
+        status = int(payload)
+        if status in {self.NO_ERR, self.ERR_NOT_CONNECTED}:
+            self.logger.warning(
+                f"Released DMMR port for {self.device_id} after a transport timeout. "
+                "Create a new controller instance before reconnecting."
+            )
+            return True
+
+        self.logger.warning(
+            "Best-effort DMMR close_port after transport timeout returned "
+            f"{self.format_status(status)}"
+        )
+        return False
+
     def disconnect(self) -> bool:
         """Disconnect from the DMMR device."""
         self.stop_housekeeping()
@@ -468,12 +530,9 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
         try:
             if self._transport_poisoned:
                 self.connected = False
-                self._set_port_claimed(True)
-                self.logger.warning(
-                    f"Skipping DMMR close_port for {self.device_id} because the "
-                    "transport is marked unusable."
-                )
-                return False
+                released = self._force_disconnect_poisoned_transport()
+                self._set_port_claimed(not released)
+                return released
 
             if not was_connected:
                 self.connected = False
@@ -1485,7 +1544,7 @@ class DMMR(ProcessIsolatedClientMixin):
                 "hk_thread": hk_thread,
                 "thread_lock": thread_lock,
             },
-            allow_process_backend=process_backend is not False,
+            allow_process_backend=bool(process_backend),
             process_backend_disabled_reason=(
                 "DMMR process isolation disabled by caller; using inline controller."
                 if process_backend is False
