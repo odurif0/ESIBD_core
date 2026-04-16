@@ -43,6 +43,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
         com: int,
         port: int = 0,
         baudrate: int = 230400,
+        process_backend: bool | None = None,
         logger: Optional[logging.Logger] = None,
         thread_lock: Optional[threading.Lock] = None,
         dll_path: Optional[str] = None,
@@ -1086,6 +1087,7 @@ class AMX(ProcessIsolatedClientMixin):
         com: int,
         port: int = 0,
         baudrate: int = 230400,
+        process_backend: bool | None = None,
         logger: Optional[logging.Logger] = None,
         thread_lock: Optional[threading.Lock] = None,
         dll_path: Optional[str] = None,
@@ -1109,4 +1111,10 @@ class AMX(ProcessIsolatedClientMixin):
                 "logger": logger,
                 "thread_lock": thread_lock,
             },
+            allow_process_backend=bool(process_backend),
+            process_backend_disabled_reason=(
+                "AMX process isolation disabled by caller; using inline controller."
+                if process_backend is False
+                else ""
+            ),
         )

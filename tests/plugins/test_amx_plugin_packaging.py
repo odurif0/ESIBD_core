@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import shutil
 import sys
@@ -251,6 +252,83 @@ def test_amx_plugin_loads_driver_from_private_runtime():
 
     assert driver_class.__name__ == "AMX"
     assert driver_class.__module__.startswith("_esibd_bundled_amx_runtime_")
+
+
+def test_amx_plugin_runtime_supports_explicit_process_backend_when_supported(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_amx_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, controller_path, controller_kwargs, *, label, startup_timeout_s):
+            created["controller_path"] = controller_path
+            created["controller_kwargs"] = controller_kwargs
+            created["label"] = label
+            created["startup_timeout_s"] = startup_timeout_s
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["inline_kwargs"] = kwargs
+
+    monkeypatch.setattr(driver_common, "RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    amx = driver_class("amx_process", com=8, port=1, process_backend=True)
+
+    assert amx._backend_mode == "process"
+    assert created["controller_path"].endswith(".amx:_AMXController")
+    assert created["label"] == "AMX amx_process"
+    assert created["controller_kwargs"]["device_id"] == "amx_process"
+    assert created["controller_kwargs"]["com"] == 8
+    assert created["controller_kwargs"]["port"] == 1
+    assert created["controller_kwargs"]["logger"] is None
+    assert "inline_kwargs" not in created
+
+    amx.close()
+
+    assert amx._backend.closed is True
+
+
+def test_amx_plugin_runtime_defaults_to_inline_backend(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_amx_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - should stay unused
+            created["proxy_called"] = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["inline_kwargs"] = kwargs
+
+    monkeypatch.setattr(driver_common, "RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    amx = driver_class("amx_inline", com=8, port=1)
+
+    assert amx._backend_mode == "inline"
+    assert created["inline_kwargs"]["device_id"] == "amx_inline"
+    assert created["inline_kwargs"]["com"] == 8
+    assert created["inline_kwargs"]["port"] == 1
+    assert "proxy_called" not in created
+    assert amx._process_backend_disabled_reason == ""
 
 
 def test_amx_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):
@@ -707,6 +785,140 @@ def test_status_widgets_summarize_global_amx_state():
     assert "#718096" in device.statusBadgeLabel.styles[-1]
 
 
+def test_status_widgets_relabel_fpga_disabled_off_state_as_standby():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+            self.styles = []
+
+        def setObjectName(self, _name):
+            return None
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeTitleBar:
+        def __init__(self):
+            self.inserted = []
+
+        def insertWidget(self, before, widget):
+            self.inserted.append((before, widget))
+
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.isOn = lambda: device.onAction.state
+    device.main_state = "STATE_ERR_FPGA_DIS"
+    device.device_enabled_state = "OFF"
+    device.available_configs_text = "0:Standby"
+    device.controller = types.SimpleNamespace(
+        device_state_summary="DEVST_FPGA_DIS",
+        controller_state_summary="CTRL_READY",
+    )
+
+    module.AMXDevice._ensure_status_widgets(device)
+
+    assert device.statusBadgeLabel.text == "Standby"
+    assert (
+        device.statusSummaryLabel.text
+        == "Device: OFF | Faults: Standby / FPGA off | Configs: 0:Standby"
+    )
+    tooltip = device.statusBadgeLabel.tooltips[-1]
+    assert "State: Standby" in tooltip
+    assert "Hardware state: STATE_ERR_FPGA_DIS" in tooltip
+    assert "Device enabled: OFF" in tooltip
+    assert "Faults: Standby / FPGA off" in tooltip
+    assert "Hardware flags: DEVST_FPGA_DIS" in tooltip
+    assert "#b7791f" in device.statusBadgeLabel.styles[-1]
+
+
+def test_status_widgets_keep_native_standby_state_and_badge_color():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+            self.styles = []
+
+        def setObjectName(self, _name):
+            return None
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeTitleBar:
+        def __init__(self):
+            self.inserted = []
+
+        def insertWidget(self, before, widget):
+            self.inserted.append((before, widget))
+
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.isOn = lambda: device.onAction.state
+    device.main_state = "ST_STBY"
+    device.device_enabled_state = "OFF"
+    device.available_configs_text = "0:Standby"
+    device.controller = types.SimpleNamespace(
+        device_state_summary="OK",
+        controller_state_summary="CTRL_READY",
+    )
+
+    module.AMXDevice._ensure_status_widgets(device)
+
+    assert device.statusBadgeLabel.text == "Standby"
+    assert "#b7791f" in device.statusBadgeLabel.styles[-1]
+
+
+def test_status_widgets_keep_fpga_disabled_state_when_device_is_on():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    device = object.__new__(module.AMXDevice)
+    device.onAction = types.SimpleNamespace(state=True)
+    device.isOn = lambda: device.onAction.state
+    device.main_state = "STATE_ERR_FPGA_DIS"
+    device.device_enabled_state = "ON"
+    device.controller = types.SimpleNamespace(
+        device_state_summary="DEVST_FPGA_DIS",
+        controller_state_summary="CTRL_READY",
+    )
+
+    assert module.AMXDevice._display_main_state(device) == "STATE_ERR_FPGA_DIS"
+    assert module.AMXDevice._display_device_state_summary(device) == "DEVST_FPGA_DIS"
+
+
 def test_channel_uses_explicit_toggle_buttons_and_minimum_row_height():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -763,3 +975,261 @@ def test_channel_uses_explicit_toggle_buttons_and_minimum_row_height():
     assert parameters["Active"].check.minimum_width == 72
     assert parameters["Display"].check is original_display_widget
     assert channel.tree.layouts == 1
+
+
+def test_config_controls_show_available_slots_loaded_status_and_load_now_action():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+        def emit(self, *args):
+            for callback in list(self.callbacks):
+                callback(*args)
+
+    class FakeCombo:
+        def __init__(self):
+            self.items = []
+            self._current_index = -1
+            self.tooltips = []
+            self.currentIndexChanged = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setMaxVisibleItems(self, _count):
+            return None
+
+        def setSizeAdjustPolicy(self, _policy):
+            return None
+
+        def clear(self):
+            self.items = []
+
+        def addItem(self, text, value=None):
+            self.items.append((text, value))
+
+        def findData(self, value):
+            for index, item in enumerate(self.items):
+                if item[1] == value:
+                    return index
+            return -1
+
+        def itemData(self, index):
+            return self.items[index][1]
+
+        def setCurrentIndex(self, index):
+            self._current_index = index
+
+        def currentIndex(self):
+            return self._current_index
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def blockSignals(self, _blocked):
+            return None
+
+    class FakeButton:
+        def __init__(self, text):
+            self.text = text
+            self.enabled = None
+            self.tooltips = []
+            self.clicked = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def click(self):
+            self.clicked.emit()
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+    class FakeTitleBar:
+        def __init__(self):
+            self.inserted = []
+
+        def insertWidget(self, before, widget):
+            self.inserted.append((before, widget))
+
+    load_calls = []
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.available_configs = [
+        {"index": 9, "name": "Static:Out0-3=Hi-Z", "active": True, "valid": True},
+        {"index": 0, "name": "Standby", "active": True, "valid": True},
+    ]
+    device.available_configs_text = "0:Standby; 9:Static:Out0-3=Hi-Z"
+    device.loaded_config_text = "9:Static:Out0-3=Hi-Z [memory]"
+    device.standby_config = -1
+    device.operating_config = 9
+    device.shutdown_config = 0
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initialized=True,
+        initializing=False,
+        transitioning=False,
+        loadOperatingConfigNowFromThread=lambda parallel=True: load_calls.append(parallel),
+    )
+    device._update_status_widgets = lambda: None
+    device._create_config_selector_widget = lambda: FakeCombo()
+    device._create_config_button_widget = lambda text: FakeButton(text)
+
+    module.AMXDevice._ensure_config_controls(device)
+
+    assert len(device.titleBar.inserted) == 9
+    assert device.loadedConfigValueLabel.text == "9:Static:Out0-3=Hi-Z [memory]"
+    assert device.operatingConfigCombo.items == [
+        ("Skip (-1)", -1),
+        ("0:Standby", 0),
+        ("9:Static:Out0-3=Hi-Z", 9),
+    ]
+    assert device.operatingConfigCombo.currentIndex() == 2
+    assert "Available AMX configs:" in device.operatingConfigCombo.tooltips[-1]
+    assert "Loaded: 9:Static:Out0-3=Hi-Z [memory]" in device.loadedConfigValueLabel.tooltips[-1]
+    assert device.loadOperatingConfigButton.enabled is True
+
+    device.loadOperatingConfigButton.click()
+
+    assert load_calls == [True]
+
+
+def test_config_controls_disable_load_now_until_amx_is_ready():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeCombo:
+        def __init__(self):
+            self.items = []
+            self._current_index = -1
+            self.tooltips = []
+            self.currentIndexChanged = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setMaxVisibleItems(self, _count):
+            return None
+
+        def setSizeAdjustPolicy(self, _policy):
+            return None
+
+        def clear(self):
+            self.items = []
+
+        def addItem(self, text, value=None):
+            self.items.append((text, value))
+
+        def findData(self, value):
+            for index, item in enumerate(self.items):
+                if item[1] == value:
+                    return index
+            return -1
+
+        def itemData(self, index):
+            return self.items[index][1]
+
+        def setCurrentIndex(self, index):
+            self._current_index = index
+
+        def currentIndex(self):
+            return self._current_index
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def blockSignals(self, _blocked):
+            return None
+
+    class FakeButton:
+        def __init__(self, text):
+            self.text = text
+            self.enabled = None
+            self.tooltips = []
+            self.clicked = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+    class FakeTitleBar:
+        def insertWidget(self, _before, _widget):
+            return None
+
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.available_configs = [{"index": 9, "name": "Operate", "active": True, "valid": True}]
+    device.available_configs_text = "9:Operate"
+    device.loaded_config_text = "n/a"
+    device.standby_config = -1
+    device.operating_config = 9
+    device.shutdown_config = -1
+    device.controller = types.SimpleNamespace(
+        device=None,
+        initialized=False,
+        initializing=False,
+        transitioning=False,
+    )
+    device._update_status_widgets = lambda: None
+    device._create_config_selector_widget = lambda: FakeCombo()
+    device._create_config_button_widget = lambda text: FakeButton(text)
+
+    module.AMXDevice._ensure_config_controls(device)
+
+    assert device.loadOperatingConfigButton.enabled is False
+    assert "Currently unavailable: device disconnected." in (
+        device.loadOperatingConfigButton.tooltips[-1]
+    )

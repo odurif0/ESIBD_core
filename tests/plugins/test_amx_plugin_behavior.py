@@ -264,7 +264,140 @@ def test_controller_exposes_available_amx_configs_in_gui_state():
     assert controller.available_configs_text == (
         "0:Standby; 9:Static:Out0-3=Hi-Z"
     )
+    assert controller.available_configs == [
+        {"index": 0, "name": "Standby", "active": True, "valid": True},
+        {"index": 9, "name": "Static:Out0-3=Hi-Z", "active": True, "valid": True},
+    ]
     assert parent.available_configs_text == controller.available_configs_text
+
+
+def test_controller_exposes_loaded_amx_config_in_gui_state():
+    module = _load_module()
+
+    class FakeDevice:
+        def get_status(self):
+            return {
+                "memory_config": 9,
+                "memory_config_name": "Static:Out0-3=Hi-Z",
+                "memory_config_source": "memory",
+            }
+
+    parent = types.SimpleNamespace(
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+        loaded_config_text="",
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+
+    controller._refresh_loaded_config_status()
+    controller._sync_status_to_gui()
+
+    assert controller.loaded_config_text == "9:Static:Out0-3=Hi-Z [memory]"
+    assert parent.loaded_config_text == controller.loaded_config_text
+
+
+def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.initialize_calls = []
+            self.frequency_calls = []
+            self.enable_calls = []
+
+        def initialize(self, timeout_s=None, **kwargs):
+            self.initialize_calls.append((timeout_s, kwargs))
+
+        def set_frequency_khz(self, value, timeout_s=None):
+            self.frequency_calls.append((value, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            self.enable_calls.append((enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            return {
+                "device_enabled": True,
+                "main_state": {"name": "ST_ON"},
+                "device_state": {"flags": ["DEVST_OK"]},
+                "controller_state": {"flags": ["CTRLST_OK"]},
+                "oscillator": {"period": 100000},
+                "pulsers": [],
+            }
+
+        def get_status(self):
+            return {
+                "memory_config": 9,
+                "memory_config_name": "Operate",
+                "memory_config_source": "memory",
+            }
+
+    sync_calls = []
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        poll_timeout_s=2.5,
+        frequency_khz=2.0,
+        operating_config=9,
+        standby_config=-1,
+        getChannels=lambda: [],
+        isOn=lambda: True,
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+        loaded_config_text="",
+        _update_config_controls=lambda: sync_calls.append("config"),
+        _update_status_widgets=lambda: sync_calls.append("status"),
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    controller.toggleOn()
+
+    assert controller.device.initialize_calls == [(7.5, {"operating_config": 9})]
+    assert controller.device.frequency_calls == [(2.0, 7.5)]
+    assert controller.device.enable_calls == [(True, 7.5)]
+    assert controller.loaded_config_text == "9:Operate [memory]"
+    assert parent.loaded_config_text == "9:Operate [memory]"
+    assert controller.main_state == "ST_ON"
+    assert parent.main_state == "ST_ON"
+    assert sync_calls
+
+
+def test_controller_close_communication_syncs_after_device_is_disposed():
+    module = _load_module()
+
+    class FakeDevice:
+        def disconnect(self):
+            return None
+
+        def close(self):
+            return None
+
+    sync_states = []
+    parent = types.SimpleNamespace(
+        _update_config_controls=lambda: sync_states.append(
+            (controller.device is None, controller.initialized)
+        )
+    )
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.loaded_config_text = "9:Operate [memory]"
+    controller.available_configs = [{"index": 9, "name": "Operate"}]
+    controller.available_configs_text = "9:Operate"
+
+    controller.closeCommunication()
+
+    assert controller.device is None
+    assert controller.initialized is False
+    assert controller.loaded_config_text == "n/a"
+    assert controller.available_configs == []
+    assert sync_states == [(True, False)]
 
 
 def test_amx_controller_lock_section_uses_raw_lock_and_propagates_errors():
