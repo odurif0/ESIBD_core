@@ -1102,7 +1102,8 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
 
     module.AMXDevice._ensure_config_controls(device)
 
-    assert len(device.titleBar.inserted) == 9
+    assert len(device.titleBar.inserted) == 5
+    assert device.operatingConfigLabel.text == "Config:"
     assert device.loadedConfigValueLabel.text == "9:Static:Out0-3=Hi-Z [memory]"
     assert device.operatingConfigCombo.items == [
         ("Skip (-1)", -1),
@@ -1113,6 +1114,8 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     assert "Available AMX configs:" in device.operatingConfigCombo.tooltips[-1]
     assert "Loaded: 9:Static:Out0-3=Hi-Z [memory]" in device.loadedConfigValueLabel.tooltips[-1]
     assert device.loadOperatingConfigButton.enabled is True
+    assert not hasattr(device, "standbyConfigCombo")
+    assert not hasattr(device, "shutdownConfigCombo")
 
     device.loadOperatingConfigButton.click()
 

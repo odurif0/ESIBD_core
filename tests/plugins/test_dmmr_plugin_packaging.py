@@ -687,6 +687,34 @@ def test_dmmr_channel_keeps_display_widget_default():
     assert channel.scaling_changed is True
 
 
+def test_dmmr_channel_init_gui_applies_neutral_display_and_module_styles():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    neutral_calls = []
+    channel = object.__new__(module.DMMRChannel)
+    channel.useDisplays = True
+    channel._upgrade_monitor_widget = lambda: None
+    channel._upgrade_toggle_widget = lambda *args, **kwargs: None
+    channel._sync_enabled_toggle_widget = lambda: None
+    channel.scalingChanged = lambda: None
+    channel._sync_neutral_parameter_styles = lambda: neutral_calls.append(True)
+
+    original_init_gui = getattr(module.Channel, "initGUI", None)
+    module.Channel.initGUI = lambda self, item: setattr(self, "super_init_gui_called", item)
+    try:
+        module.DMMRChannel.initGUI(channel, {"Name": "dummy"})
+    finally:
+        if original_init_gui is None:
+            delattr(module.Channel, "initGUI")
+        else:
+            module.Channel.initGUI = original_init_gui
+
+    assert neutral_calls == [True]
+
+
 def test_dmmr_enabled_toggle_widget_syncs_checked_state_and_style():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -714,6 +742,17 @@ def test_dmmr_parameter_widget_style_updates_widget_and_container():
     class FakeContainer:
         def __init__(self):
             self.styles = []
+            self.children = []
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+        def findChildren(self, _type):
+            return list(self.children)
+
+    class FakeLineEdit:
+        def __init__(self):
+            self.styles = []
 
         def setStyleSheet(self, style):
             self.styles.append(style)
@@ -722,9 +761,18 @@ def test_dmmr_parameter_widget_style_updates_widget_and_container():
         def __init__(self):
             self.container = FakeContainer()
             self.styles = []
+            self.line_edit = FakeLineEdit()
+            self.child = FakeLineEdit()
+            self.container.children.append(self.child)
 
         def setStyleSheet(self, style):
             self.styles.append(style)
+
+        def lineEdit(self):
+            return self.line_edit
+
+        def findChildren(self, _type):
+            return []
 
     widget = FakeWidget()
     parameter = types.SimpleNamespace(getWidget=lambda: widget)
@@ -739,3 +787,5 @@ def test_dmmr_parameter_widget_style_updates_widget_and_container():
 
     assert widget.container.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]
     assert widget.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]
+    assert widget.line_edit.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]
+    assert widget.child.styles == [module._DMMR_NEUTRAL_WIDGET_STYLE]
