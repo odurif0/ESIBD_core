@@ -724,7 +724,7 @@ class AMXDevice(Device):
         if (
             getattr(self, "titleBar", None) is None
             or getattr(self, "titleBarLabel", None) is None
-            or hasattr(self, "standbyConfigCombo")
+            or hasattr(self, "operatingConfigCombo")
         ):
             return
 
@@ -733,28 +733,18 @@ class AMXDevice(Device):
 
         self.loadedConfigLabel = label_type("Loaded:")
         self.loadedConfigValueLabel = label_type("")
-        self.standbyConfigLabel = label_type("Stby:")
-        self.operatingConfigLabel = label_type("Run:")
-        self.shutdownConfigLabel = label_type("Off:")
-        self.standbyConfigCombo = self._create_config_selector_widget()
+        self.operatingConfigLabel = label_type("Config:")
         self.operatingConfigCombo = self._create_config_selector_widget()
-        self.shutdownConfigCombo = self._create_config_selector_widget()
         self.loadOperatingConfigButton = self._create_config_button_widget("Load now")
 
-        self._connect_config_selector(self.standbyConfigCombo, "standby_config")
         self._connect_config_selector(self.operatingConfigCombo, "operating_config")
-        self._connect_config_selector(self.shutdownConfigCombo, "shutdown_config")
         self._connect_config_button(self.loadOperatingConfigButton, self.loadOperatingConfigNow)
 
         widgets = (
             self.loadedConfigLabel,
             self.loadedConfigValueLabel,
-            self.standbyConfigLabel,
-            self.standbyConfigCombo,
             self.operatingConfigLabel,
             self.operatingConfigCombo,
-            self.shutdownConfigLabel,
-            self.shutdownConfigCombo,
             self.loadOperatingConfigButton,
         )
         for widget in widgets:
@@ -801,7 +791,7 @@ class AMXDevice(Device):
         if not getattr(controller, "initialized", False):
             return False, "communication not initialized"
         if self._config_setting_value("operating_config") < 0:
-            return False, "select an operating config first"
+            return False, "select a config first"
         return True, ""
 
     def _update_config_controls(self) -> None:
@@ -825,7 +815,7 @@ class AMXDevice(Device):
         self._set_action_enabled(button, ready)
         if button is not None and hasattr(button, "setToolTip"):
             tooltip = (
-                "Load the selected operating config immediately into AMX memory. "
+                "Load the selected AMX config immediately into controller memory. "
                 "If the AMX is ON, runtime timing is reapplied afterwards."
             )
             if not ready and reason:
@@ -1288,9 +1278,13 @@ class AMXDevice(Device):
             value=-1,
             minimum=-1,
             maximum=255,
-            toolTip="Optional standby config index. Use -1 to skip standby loading.",
+            toolTip=(
+                "Advanced standby config index. Use -1 to auto-use slot 0 when it exists, "
+                "otherwise skip standby loading."
+            ),
             parameterType=PARAMETERTYPE.INT,
             attr="standby_config",
+            advanced=True,
             event=self._update_config_controls,
         )
         settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
@@ -1298,7 +1292,7 @@ class AMXDevice(Device):
             minimum=-1,
             maximum=255,
             toolTip=(
-                "Optional operating config index. Use -1 to drive the AMX directly "
+                "AMX config used for normal operation. Use -1 to drive the AMX directly "
                 "from software without loading a stored controller config."
             ),
             parameterType=PARAMETERTYPE.INT,
@@ -1309,9 +1303,13 @@ class AMXDevice(Device):
             value=-1,
             minimum=-1,
             maximum=255,
-            toolTip="Optional shutdown config index. Use -1 to use software shutdown.",
+            toolTip=(
+                "Advanced shutdown config index. Use -1 to auto-use slot 0 when it exists, "
+                "otherwise use software shutdown."
+            ),
             parameterType=PARAMETERTYPE.INT,
             attr="shutdown_config",
+            advanced=True,
             event=self._update_config_controls,
         )
         settings[f"{self.name}/{self.FREQUENCY_KHZ}"] = parameterDict(
@@ -1860,10 +1858,7 @@ class AMXController(DeviceController):
         self._sync_status_to_gui()
 
     def _startup_kwargs(self) -> dict[str, Any]:
-        standby_config = _coerce_int(
-            getattr(self.controllerParent, "standby_config", -1),
-            -1,
-        )
+        standby_config = self._resolved_safety_config("standby_config")
         operating_config = _coerce_int(
             getattr(self.controllerParent, "operating_config", -1),
             -1,
@@ -1876,16 +1871,21 @@ class AMXController(DeviceController):
         return kwargs
 
     def _shutdown_kwargs(self) -> dict[str, Any]:
-        shutdown_config = _coerce_int(
-            getattr(self.controllerParent, "shutdown_config", -1),
-            -1,
-        )
+        shutdown_config = self._resolved_safety_config("shutdown_config")
         if shutdown_config >= 0:
             return {
                 "standby_config": shutdown_config,
                 "disable_device": False,
             }
         return {}
+
+    def _resolved_safety_config(self, attr_name: str) -> int:
+        config_index = _coerce_int(getattr(self.controllerParent, attr_name, -1), -1)
+        if config_index >= 0:
+            return config_index
+        if any(_coerce_int(config.get("index"), -1) == 0 for config in self.available_configs):
+            return 0
+        return -1
 
     def _refresh_available_configs(self) -> None:
         device = self.device
@@ -1953,7 +1953,7 @@ class AMXController(DeviceController):
         device = self.device
         if device is None or not getattr(self, "initialized", False):
             self.print(
-                f"Cannot load {self.controllerParent.name} operating config: communication not initialized.",
+                f"Cannot load {self.controllerParent.name} config: communication not initialized.",
                 flag=PRINT.WARNING,
             )
             return
@@ -1964,7 +1964,7 @@ class AMXController(DeviceController):
         )
         if config_index < 0:
             self.print(
-                f"Cannot load {self.controllerParent.name} operating config: select a valid slot first.",
+                f"Cannot load {self.controllerParent.name} config: select a valid slot first.",
                 flag=PRINT.WARNING,
             )
             return
@@ -1972,7 +1972,7 @@ class AMXController(DeviceController):
         timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
         try:
             with self._controller_lock_section(
-                "Could not acquire lock to load the AMX operating config."
+                "Could not acquire lock to load the AMX config."
             ):
                 device = self.device
                 if device is None:
@@ -1988,13 +1988,13 @@ class AMXController(DeviceController):
                         self._apply_channel_timing(channel, timeout_s)
                     device.set_device_enabled(True, timeout_s=timeout_s)
             self._update_state()
-            self.print(f"Loaded AMX operating config {config_index}.")
+            self.print(f"Loaded AMX config {config_index}.")
         except TimeoutError:
             return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
             self.print(
-                f"Failed to load AMX operating config {config_index}: {self._format_exception(exc)}",
+                f"Failed to load AMX config {config_index}: {self._format_exception(exc)}",
                 flag=PRINT.ERROR,
             )
         finally:

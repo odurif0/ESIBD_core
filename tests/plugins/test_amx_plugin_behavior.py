@@ -368,6 +368,47 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
     assert sync_calls
 
 
+def test_controller_defaults_standby_and_shutdown_to_slot_zero_when_available():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        standby_config=-1,
+        operating_config=9,
+        shutdown_config=-1,
+    )
+    controller = module.AMXController(parent)
+    controller.available_configs = [
+        {"index": 0, "name": "Standby", "active": True, "valid": True},
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+
+    assert controller._startup_kwargs() == {
+        "standby_config": 0,
+        "operating_config": 9,
+    }
+    assert controller._shutdown_kwargs() == {
+        "standby_config": 0,
+        "disable_device": False,
+    }
+
+
+def test_controller_skips_implicit_slot_zero_when_unavailable():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        standby_config=-1,
+        operating_config=9,
+        shutdown_config=-1,
+    )
+    controller = module.AMXController(parent)
+    controller.available_configs = [
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+
+    assert controller._startup_kwargs() == {"operating_config": 9}
+    assert controller._shutdown_kwargs() == {}
+
+
 def test_controller_close_communication_syncs_after_device_is_disposed():
     module = _load_module()
 

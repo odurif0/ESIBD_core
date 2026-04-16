@@ -48,7 +48,16 @@ _DMMR_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
 _DMMR_ATTENTION_STATE_TOKENS = ("error", "unconfirmed", "lost")
 _DMMR_POWER_ON_ICON = "switch-medium_on.png"
 _DMMR_POWER_OFF_ICON = "switch-medium_off.png"
-_DMMR_NEUTRAL_WIDGET_STYLE = "background: transparent;"
+_DMMR_NEUTRAL_WIDGET_STYLE = (
+    "background: transparent;"
+    "background-color: transparent;"
+    "border: none;"
+    "QWidget { background: transparent; background-color: transparent; border: none; }"
+    "QFrame { background: transparent; background-color: transparent; border: none; }"
+    "QLabel { background: transparent; background-color: transparent; border: none; }"
+    "QLineEdit { background: transparent; background-color: transparent; border: none; }"
+    "QCheckBox { background: transparent; background-color: transparent; border: none; }"
+)
 _DMMR_TOGGLE_BUTTON_STYLE = (
     "QToolButton { margin: 0px; padding: 0px 6px; }"
     "QToolButton:checked { background-color: #1f2933; color: #ffffff; }"
@@ -1221,6 +1230,7 @@ class DMMRChannel(Channel):
         self._upgrade_toggle_widget(self.ENABLED, "Read", 52)
         self._sync_enabled_toggle_widget()
         self.scalingChanged()
+        self._sync_neutral_parameter_styles()
 
     def scalingChanged(self) -> None:
         super().scalingChanged()
@@ -1294,11 +1304,34 @@ class DMMRChannel(Channel):
         widget = getattr(parameter, "getWidget", lambda: None)()
         if widget is None:
             return
-        container = getattr(widget, "container", None)
-        if container is not None and hasattr(container, "setStyleSheet"):
-            container.setStyleSheet(style)
-        if hasattr(widget, "setStyleSheet"):
-            widget.setStyleSheet(style)
+
+        seen: set[int] = set()
+        targets = [getattr(widget, "container", None), widget]
+        for owner in list(targets):
+            if owner is None:
+                continue
+            line_edit = getattr(owner, "lineEdit", None)
+            if callable(line_edit):
+                targets.append(line_edit())
+            find_children = getattr(owner, "findChildren", None)
+            if callable(find_children):
+                with contextlib.suppress(Exception):
+                    targets.extend(find_children(object))
+
+        for target in targets:
+            if target is None:
+                continue
+            target_id = id(target)
+            if target_id in seen:
+                continue
+            seen.add(target_id)
+            if hasattr(target, "setStyleSheet"):
+                target.setStyleSheet(style)
+
+    def _sync_neutral_parameter_styles(self) -> None:
+        """Keep Display and Mod visually neutral like the other DMMR cells."""
+        for parameter_name in (self.DISPLAY, self.MODULE):
+            self._set_parameter_widget_style(parameter_name, _DMMR_NEUTRAL_WIDGET_STYLE)
 
     def _upgrade_monitor_widget(self) -> None:
         """Replace the default numeric monitor widget with the SI-aware DMMR monitor."""
@@ -1392,8 +1425,7 @@ class DMMRChannel(Channel):
                         display_widget, Qt.AlignmentFlag.AlignCenter
                     )
 
-        self._set_parameter_widget_style(self.DISPLAY, _DMMR_NEUTRAL_WIDGET_STYLE)
-        self._set_parameter_widget_style(self.MODULE, _DMMR_NEUTRAL_WIDGET_STYLE)
+        self._sync_neutral_parameter_styles()
         self._sync_enabled_toggle_widget()
 
         return color
