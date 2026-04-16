@@ -74,11 +74,12 @@ entry point when you need a manual workflow.
 
 ## Process Isolation
 
-On Windows, the high-level `AMX` client runs the DLL-backed controller in a
-dedicated worker process when possible. This keeps a blocked vendor DLL call
-from poisoning the main Python process, which is especially important in
-notebooks. Advanced injected objects such as an external `logger` or
-`thread_lock` fall back to inline mode because they cannot be shared across
+The high-level `AMX` client now defaults to the inline controller path. This
+avoids slow worker startup failures on systems where process isolation is not
+stable. Process isolation remains available explicitly through
+`AMX(..., process_backend=True)` when you want DLL calls isolated in a worker
+process. Advanced injected objects such as an external `logger` or
+`thread_lock` still force inline mode because they cannot be shared across
 process boundaries.
 
 ## Timeout Recovery

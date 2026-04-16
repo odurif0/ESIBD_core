@@ -37,6 +37,13 @@ including the AMX driver files and vendor DLL.
 - `Available configs`: live list of config slots reported by the connected AMX.
 - `Frequency (kHz)`: oscillator frequency applied after startup.
 
+Runtime timing notes:
+
+- switch trigger `rise` and `fall` delays are coarse AMX controller ticks in
+  the range `0..15`
+- switch enable delay is also limited to `0..15`
+- values outside that hardware range are rejected by the AMX wrapper on purpose
+
 ## AMX Configurations
 
 AMX configuration slots are stored in the controller NVM and are specific to
@@ -97,6 +104,13 @@ Each channel exposes:
 Switch topology and routing remain managed by the saved AMX controller
 configurations. The plugin focuses on the runtime timing adjustments typically
 changed between experiments.
+
+## Process Backend
+
+The embedded AMX runtime now defaults to the inline controller path. This
+avoids the repeated "worker timed out during worker startup" warnings seen on
+some Explorer deployments. Process isolation remains available for debugging or
+special cases by constructing the AMX runtime with `process_backend=True`.
 
 ## Portability Note
 

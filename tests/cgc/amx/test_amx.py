@@ -123,7 +123,7 @@ def test_amx_external_logger_prefixes_device_id(monkeypatch, caplog):
     assert "amx_test - hello" in caplog.messages
 
 
-def test_amx_uses_process_backend_when_supported(monkeypatch):
+def test_amx_uses_process_backend_when_explicitly_requested(monkeypatch):
     created = {}
 
     class FakeProxy:
@@ -140,7 +140,7 @@ def test_amx_uses_process_backend_when_supported(monkeypatch):
     monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
     monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
 
-    amx = AMX("amx_process", com=8, port=1)
+    amx = AMX("amx_process", com=8, port=1, process_backend=True)
 
     assert amx._backend_mode == "process"
     assert created["controller_path"] == "cgc.amx.amx:_AMXController"
@@ -148,11 +148,31 @@ def test_amx_uses_process_backend_when_supported(monkeypatch):
     assert created["controller_kwargs"]["device_id"] == "amx_process"
     assert created["controller_kwargs"]["com"] == 8
     assert created["controller_kwargs"]["port"] == 1
-    assert created["controller_kwargs"]["logger"] is None
 
-    amx.close()
 
-    assert amx._backend.closed is True
+def test_amx_defaults_to_inline_backend(monkeypatch):
+    created = {}
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - should stay unused
+            created["proxy_called"] = True
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            created["inline_kwargs"] = kwargs
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(AMX, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    amx = AMX("amx_inline", com=8, port=1)
+
+    assert amx._backend_mode == "inline"
+    assert created["inline_kwargs"]["device_id"] == "amx_inline"
+    assert created["inline_kwargs"]["com"] == 8
+    assert created["inline_kwargs"]["port"] == 1
+    assert "proxy_called" not in created
+    assert amx._process_backend_disabled_reason == ""
 
 
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):

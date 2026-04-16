@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
+from threading import Thread
 from typing import Any, cast
 
 import numpy as np
@@ -107,6 +108,18 @@ def _normalize_runtime_state(state: Any) -> str:
     return text
 
 
+def _status_tokens(value: Any) -> set[str]:
+    """Split comma/semicolon separated status text into normalized tokens."""
+    if value is None:
+        return set()
+    normalized = str(value).replace(";", ",")
+    return {
+        token.strip()
+        for token in normalized.split(",")
+        if token.strip()
+    }
+
+
 def _status_requires_operator_attention(state: Any) -> bool:
     """Return True when the raw state describes a fault or uncertain condition."""
     normalized = str(state or "").strip().lower()
@@ -144,6 +157,48 @@ def _format_available_configs(configs: list[dict[str, Any]]) -> str:
             label = f"{label} ({', '.join(suffixes)})"
         formatted.append(label)
     return "; ".join(formatted)
+
+
+def _format_config_option(
+    index: int,
+    name: str = "",
+    *,
+    active: bool = True,
+    valid: bool = True,
+    unavailable: bool = False,
+) -> str:
+    """Return one human-readable AMX config entry."""
+    if index < 0:
+        return "Skip (-1)"
+
+    label = f"{index}:{str(name or '').strip() or '<unnamed>'}"
+    suffixes: list[str] = []
+    if unavailable:
+        suffixes.append("not listed")
+    else:
+        if not valid:
+            suffixes.append("invalid")
+        if not active:
+            suffixes.append("inactive")
+    if suffixes:
+        label = f"{label} ({', '.join(suffixes)})"
+    return label
+
+
+def _format_loaded_config_text(status: dict[str, Any]) -> str:
+    """Format the config currently reported in AMX controller memory."""
+    index = _coerce_int(status.get("memory_config"), -1)
+    if index < 0:
+        return "None"
+
+    label = _format_config_option(
+        index,
+        str(status.get("memory_config_name", "") or "").strip(),
+    )
+    source = str(status.get("memory_config_source", "") or "").strip()
+    if source:
+        return f"{label} [{source}]"
+    return label
 
 
 def _channel_key_from_item(item: dict[str, Any]) -> int:
@@ -440,6 +495,7 @@ class AMXDevice(Device):
     STATE = "State"
     DEVICE_ENABLED = "Device enabled"
     AVAILABLE_CONFIGS = "Available configs"
+    LOADED_CONFIG = "Loaded config"
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -471,6 +527,7 @@ class AMXDevice(Device):
             self.advancedAction.setToolTip(self.advancedAction.toolTipFalse)
         self._ensure_local_on_action()
         self._ensure_status_widgets()
+        self._ensure_config_controls()
         self._update_channel_column_visibility()
         self._sync_acquisition_controls()
 
@@ -488,7 +545,9 @@ class AMXDevice(Device):
     frequency_khz: float
     main_state: str
     device_enabled_state: str
+    available_configs: list[dict[str, Any]]
     available_configs_text: str
+    loaded_config_text: str
 
     def _current_channel_items(self) -> list[dict[str, Any]]:
         return [channel.asDict() for channel in self.getChannels()]
@@ -498,6 +557,306 @@ class AMXDevice(Device):
 
     def _default_channel_item(self) -> dict[str, Any]:
         return self.channelType(channelParent=self, tree=None).asDict()
+
+    def _setting(self, setting_name: str) -> Any | None:
+        plugin_manager = getattr(self, "pluginManager", None)
+        settings_plugin = getattr(plugin_manager, "Settings", None)
+        settings = getattr(settings_plugin, "settings", None)
+        if not isinstance(settings, dict):
+            return None
+        return settings.get(f"{self.name}/{setting_name}")
+
+    def _config_setting_name(self, attr_name: str) -> str:
+        return {
+            "standby_config": self.STANDBY_CONFIG,
+            "operating_config": self.OPERATING_CONFIG,
+            "shutdown_config": self.SHUTDOWN_CONFIG,
+        }[attr_name]
+
+    def _config_setting_value(self, attr_name: str) -> int:
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        if setting is not None:
+            return _coerce_int(getattr(setting, "value", None), getattr(self, attr_name, -1))
+        return _coerce_int(getattr(self, attr_name, -1), -1)
+
+    def _set_config_setting_value(self, attr_name: str, value: int) -> bool:
+        value = _coerce_int(value, -1)
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        if setting is not None:
+            if _coerce_int(getattr(setting, "value", None), value) == value:
+                return False
+            setting.value = value
+            return True
+        if _coerce_int(getattr(self, attr_name, value), value) == value:
+            return False
+        setattr(self, attr_name, value)
+        return True
+
+    def _available_config_entries(self) -> list[dict[str, Any]]:
+        configs = list(getattr(self, "available_configs", []) or [])
+        return sorted(configs, key=lambda config: _coerce_int(config.get("index"), 10_000))
+
+    def _config_selector_entries(self, attr_name: str) -> list[tuple[int, str]]:
+        entries: list[tuple[int, str]] = [(-1, _format_config_option(-1))]
+        seen = {-1}
+        for config in self._available_config_entries():
+            index = _coerce_int(config.get("index"), -1)
+            if index < 0 or index in seen:
+                continue
+            entries.append(
+                (
+                    index,
+                    _format_config_option(
+                        index,
+                        str(config.get("name", "") or "").strip(),
+                        active=_coerce_bool(config.get("active"), True),
+                        valid=_coerce_bool(config.get("valid"), True),
+                    ),
+                )
+            )
+            seen.add(index)
+        current_value = self._config_setting_value(attr_name)
+        if current_value >= 0 and current_value not in seen:
+            entries.append(
+                (
+                    current_value,
+                    _format_config_option(current_value, "<saved>", unavailable=True),
+                )
+            )
+        return entries
+
+    def _config_selector_tooltip_text(self, attr_name: str) -> str:
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        tooltip = str(getattr(setting, "toolTip", "") or "").strip() if setting is not None else ""
+        lines = [tooltip] if tooltip else []
+        lines.append("Available AMX configs:")
+        available = str(getattr(self, "available_configs_text", "") or "n/a")
+        for entry in available.split(";"):
+            entry = entry.strip()
+            if entry:
+                lines.append(f"- {entry}")
+        return "\n".join(lines)
+
+    def _loaded_config_tooltip_text(self) -> str:
+        lines = [
+            "AMX config currently reported in controller memory.",
+            f"Loaded: {getattr(self, 'loaded_config_text', '') or 'n/a'}",
+        ]
+        available = str(getattr(self, "available_configs_text", "") or "").strip()
+        if available:
+            lines.append(f"Available: {available}")
+        return "\n".join(lines)
+
+    def _create_config_selector_widget(self) -> Any:
+        from PyQt6.QtWidgets import QComboBox
+
+        combo = QComboBox()
+        combo.setMinimumWidth(180)
+        combo.setMaxVisibleItems(32)
+        with contextlib.suppress(AttributeError):
+            combo.setSizeAdjustPolicy(type(combo).SizeAdjustPolicy.AdjustToContents)
+        return combo
+
+    def _create_config_button_widget(self, text: str) -> Any:
+        from PyQt6.QtWidgets import QPushButton
+
+        button = QPushButton(text)
+        button.setMinimumWidth(96)
+        return button
+
+    def _combo_clear(self, combo: Any) -> None:
+        clear = getattr(combo, "clear", None)
+        if callable(clear):
+            clear()
+
+    def _combo_add_item(self, combo: Any, text: str, value: int) -> None:
+        add_item = getattr(combo, "addItem", None)
+        if callable(add_item):
+            try:
+                add_item(text, value)
+            except TypeError:
+                add_item(text)
+
+    def _combo_find_data(self, combo: Any, value: int) -> int:
+        find_data = getattr(combo, "findData", None)
+        if callable(find_data):
+            return int(find_data(value))
+        items = getattr(combo, "items", None)
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, tuple) and len(item) >= 2 and item[1] == value:
+                    return index
+        return -1
+
+    def _combo_item_data(self, combo: Any, index: int) -> Any:
+        item_data = getattr(combo, "itemData", None)
+        if callable(item_data):
+            return item_data(index)
+        items = getattr(combo, "items", None)
+        if isinstance(items, list) and 0 <= index < len(items):
+            item = items[index]
+            if isinstance(item, tuple) and len(item) >= 2:
+                return item[1]
+        return None
+
+    def _combo_current_value(self, combo: Any, default: int = -1) -> int:
+        current_index = getattr(combo, "currentIndex", None)
+        if not callable(current_index):
+            return default
+        return _coerce_int(self._combo_item_data(combo, current_index()), default)
+
+    def _connect_config_selector(self, combo: Any, attr_name: str) -> None:
+        signal = getattr(combo, "currentIndexChanged", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(lambda *_args, attr_name=attr_name: self._config_selector_changed(attr_name))
+
+    def _connect_config_button(self, button: Any, callback: Any) -> None:
+        signal = getattr(button, "clicked", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(callback)
+
+    def _ensure_config_controls(self) -> None:
+        if (
+            getattr(self, "titleBar", None) is None
+            or getattr(self, "titleBarLabel", None) is None
+            or hasattr(self, "standbyConfigCombo")
+        ):
+            return
+
+        label_type = type(self.titleBarLabel)
+        insert_before = getattr(self, "stretchAction", None)
+
+        self.loadedConfigLabel = label_type("Loaded:")
+        self.loadedConfigValueLabel = label_type("")
+        self.standbyConfigLabel = label_type("Stby:")
+        self.operatingConfigLabel = label_type("Run:")
+        self.shutdownConfigLabel = label_type("Off:")
+        self.standbyConfigCombo = self._create_config_selector_widget()
+        self.operatingConfigCombo = self._create_config_selector_widget()
+        self.shutdownConfigCombo = self._create_config_selector_widget()
+        self.loadOperatingConfigButton = self._create_config_button_widget("Load now")
+
+        self._connect_config_selector(self.standbyConfigCombo, "standby_config")
+        self._connect_config_selector(self.operatingConfigCombo, "operating_config")
+        self._connect_config_selector(self.shutdownConfigCombo, "shutdown_config")
+        self._connect_config_button(self.loadOperatingConfigButton, self.loadOperatingConfigNow)
+
+        widgets = (
+            self.loadedConfigLabel,
+            self.loadedConfigValueLabel,
+            self.standbyConfigLabel,
+            self.standbyConfigCombo,
+            self.operatingConfigLabel,
+            self.operatingConfigCombo,
+            self.shutdownConfigLabel,
+            self.shutdownConfigCombo,
+            self.loadOperatingConfigButton,
+        )
+        for widget in widgets:
+            if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
+                self.titleBar.insertWidget(insert_before, widget)
+            elif hasattr(self.titleBar, "addWidget"):
+                self.titleBar.addWidget(widget)
+
+        self._update_config_controls()
+
+    def _update_config_selector(self, combo: Any | None, attr_name: str) -> None:
+        if combo is None:
+            return
+        block_signals = getattr(combo, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            self._combo_clear(combo)
+            for value, label in self._config_selector_entries(attr_name):
+                self._combo_add_item(combo, label, value)
+            selected_index = self._combo_find_data(combo, self._config_setting_value(attr_name))
+            if selected_index < 0:
+                selected_index = 0
+            set_current_index = getattr(combo, "setCurrentIndex", None)
+            if callable(set_current_index):
+                set_current_index(selected_index)
+            tooltip = self._config_selector_tooltip_text(attr_name)
+            if hasattr(combo, "setToolTip"):
+                combo.setToolTip(tooltip)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _load_operating_now_ready(self) -> tuple[bool, str]:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False, "controller unavailable"
+        if getattr(controller, "initializing", False):
+            return False, "initialization in progress"
+        if getattr(controller, "transitioning", False):
+            return False, "ON/OFF transition in progress"
+        if getattr(controller, "device", None) is None:
+            return False, "device disconnected"
+        if not getattr(controller, "initialized", False):
+            return False, "communication not initialized"
+        if self._config_setting_value("operating_config") < 0:
+            return False, "select an operating config first"
+        return True, ""
+
+    def _update_config_controls(self) -> None:
+        self._update_config_selector(getattr(self, "standbyConfigCombo", None), "standby_config")
+        self._update_config_selector(getattr(self, "operatingConfigCombo", None), "operating_config")
+        self._update_config_selector(getattr(self, "shutdownConfigCombo", None), "shutdown_config")
+
+        loaded_text = str(getattr(self, "loaded_config_text", "") or "n/a")
+        loaded_tooltip = self._loaded_config_tooltip_text()
+        loaded_value = getattr(self, "loadedConfigValueLabel", None)
+        if loaded_value is not None and hasattr(loaded_value, "setText"):
+            loaded_value.setText(loaded_text)
+        if loaded_value is not None and hasattr(loaded_value, "setToolTip"):
+            loaded_value.setToolTip(loaded_tooltip)
+        loaded_label = getattr(self, "loadedConfigLabel", None)
+        if loaded_label is not None and hasattr(loaded_label, "setToolTip"):
+            loaded_label.setToolTip(loaded_tooltip)
+
+        button = getattr(self, "loadOperatingConfigButton", None)
+        ready, reason = self._load_operating_now_ready()
+        self._set_action_enabled(button, ready)
+        if button is not None and hasattr(button, "setToolTip"):
+            tooltip = (
+                "Load the selected operating config immediately into AMX memory. "
+                "If the AMX is ON, runtime timing is reapplied afterwards."
+            )
+            if not ready and reason:
+                tooltip = f"{tooltip}\nCurrently unavailable: {reason}."
+            button.setToolTip(tooltip)
+
+    def _config_selector_changed(self, attr_name: str) -> None:
+        combo = getattr(
+            self,
+            {
+                "standby_config": "standbyConfigCombo",
+                "operating_config": "operatingConfigCombo",
+                "shutdown_config": "shutdownConfigCombo",
+            }[attr_name],
+            None,
+        )
+        if combo is None:
+            return
+        if self._set_config_setting_value(attr_name, self._combo_current_value(combo)):
+            self._update_config_controls()
+            self._update_status_widgets()
+
+    def loadOperatingConfigNow(self) -> None:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return
+        load_now = getattr(controller, "loadOperatingConfigNowFromThread", None)
+        if callable(load_now):
+            load_now(parallel=True)
+            return
+        controller.loadOperatingConfigNow()
 
     def _ensure_local_on_action(self) -> None:
         """Expose the global AMX ON/OFF control directly in the plugin toolbar."""
@@ -534,6 +893,11 @@ class AMXDevice(Device):
     def _display_main_state(self) -> str:
         """Return the operator-facing state shown in the toolbar badge."""
         raw_state = _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
+        if self._fpga_disabled_standby_state(raw_state=raw_state):
+            return "Standby"
+        normalized = raw_state.lower()
+        if "stby" in normalized or "standby" in normalized:
+            return "Standby"
         is_on = getattr(self, "isOn", None)
         if (
             raw_state != "Disconnected"
@@ -543,6 +907,43 @@ class AMXDevice(Device):
         ):
             return "OFF"
         return raw_state
+
+    def _raw_device_state_summary(self) -> str:
+        controller = getattr(self, "controller", None)
+        return str(getattr(controller, "device_state_summary", "") or "").strip()
+
+    def _fpga_disabled_standby_state(self, *, raw_state: str | None = None) -> bool:
+        """Return True when the AMX reports FPGA disabled while the device is OFF.
+
+        On this hardware the vendor state often remains ``STATE_ERR_FPGA_DIS``
+        together with ``DEVST_FPGA_DIS`` while a valid standby/off config keeps
+        the device disabled. Treat that combination as a standby indication in
+        the plugin UI so operators do not read it as a hard FPGA failure.
+        """
+        raw_state = (
+            _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
+            if raw_state is None
+            else raw_state
+        )
+        if raw_state != "STATE_ERR_FPGA_DIS":
+            return False
+        device_enabled = _coerce_bool(
+            getattr(self, "device_enabled_state", None),
+            default=None,
+        )
+        if device_enabled is not False:
+            return False
+        flags = {
+            token.upper()
+            for token in _status_tokens(self._raw_device_state_summary())
+        }
+        return not flags or flags <= {"DEVST_FPGA_DIS"}
+
+    def _display_device_state_summary(self) -> str:
+        raw_summary = self._raw_device_state_summary()
+        if self._fpga_disabled_standby_state():
+            return "Standby / FPGA off"
+        return raw_summary or "n/a"
 
     def _ensure_status_widgets(self) -> None:
         """Add compact global AMX status labels to the plugin toolbar."""
@@ -603,10 +1004,9 @@ class AMXDevice(Device):
 
     def _status_summary_text(self) -> str:
         """Return the compact AMX runtime summary displayed in the toolbar."""
-        controller = getattr(self, "controller", None)
         device_enabled = str(getattr(self, "device_enabled_state", "OFF") or "OFF")
         faults = _compact_status_text(
-            getattr(controller, "device_state_summary", None),
+            self._display_device_state_summary(),
             default="n/a",
         )
         configs = _compact_status_text(
@@ -620,15 +1020,20 @@ class AMXDevice(Device):
         controller = getattr(self, "controller", None)
         display_state = self._display_main_state()
         hardware_state = _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
+        display_faults = self._display_device_state_summary()
+        hardware_faults = self._raw_device_state_summary() or "n/a"
         lines = [f"State: {display_state}"]
         if display_state != hardware_state:
             lines.append(f"Hardware state: {hardware_state}")
+        lines.append(f"Device enabled: {getattr(self, 'device_enabled_state', '') or 'Unknown'}")
+        lines.append(f"Faults: {display_faults}")
+        if display_faults != hardware_faults:
+            lines.append(f"Hardware flags: {hardware_faults}")
         lines.extend(
             (
-                f"Device enabled: {getattr(self, 'device_enabled_state', '') or 'Unknown'}",
-                f"Faults: {getattr(controller, 'device_state_summary', '') or 'n/a'}",
                 f"Controller: {getattr(controller, 'controller_state_summary', '') or 'n/a'}",
                 f"Configs: {getattr(self, 'available_configs_text', '') or 'n/a'}",
+                f"Loaded: {getattr(self, 'loaded_config_text', '') or 'n/a'}",
             )
         )
         return "\n".join(lines)
@@ -886,6 +1291,7 @@ class AMXDevice(Device):
             toolTip="Optional standby config index. Use -1 to skip standby loading.",
             parameterType=PARAMETERTYPE.INT,
             attr="standby_config",
+            event=self._update_config_controls,
         )
         settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
             value=-1,
@@ -897,6 +1303,7 @@ class AMXDevice(Device):
             ),
             parameterType=PARAMETERTYPE.INT,
             attr="operating_config",
+            event=self._update_config_controls,
         )
         settings[f"{self.name}/{self.SHUTDOWN_CONFIG}"] = parameterDict(
             value=-1,
@@ -905,6 +1312,7 @@ class AMXDevice(Device):
             toolTip="Optional shutdown config index. Use -1 to use software shutdown.",
             parameterType=PARAMETERTYPE.INT,
             attr="shutdown_config",
+            event=self._update_config_controls,
         )
         settings[f"{self.name}/{self.FREQUENCY_KHZ}"] = parameterDict(
             value=2.0,
@@ -944,6 +1352,16 @@ class AMXDevice(Device):
             attr="available_configs_text",
             indicator=True,
             internal=True,
+            restore=False,
+        )
+        settings[f"{self.name}/{self.LOADED_CONFIG}"] = parameterDict(
+            value="n/a",
+            toolTip="AMX config currently reported in controller memory.",
+            parameterType=PARAMETERTYPE.LABEL,
+            attr="loaded_config_text",
+            indicator=True,
+            internal=True,
+            advanced=True,
             restore=False,
         )
         settings[f"{self.name}/Interval"][Parameter.VALUE] = 1000
@@ -1374,7 +1792,9 @@ class AMXController(DeviceController):
         self.device_enabled_state = "OFF"
         self.device_state_summary = "n/a"
         self.controller_state_summary = "n/a"
+        self.available_configs: list[dict[str, Any]] = []
         self.available_configs_text = "n/a"
+        self.loaded_config_text = "n/a"
         self.initialized = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
@@ -1417,6 +1837,7 @@ class AMXController(DeviceController):
                 self.print(backend_reason, flag=PRINT.WARNING)
             self.device.connect(timeout_s=float(self.controllerParent.connect_timeout_s))
             self._refresh_available_configs()
+            self._refresh_loaded_config_status()
             self._update_state()
             self.signalComm.initCompleteSignal.emit()
         except Exception as exc:  # noqa: BLE001
@@ -1469,11 +1890,13 @@ class AMXController(DeviceController):
     def _refresh_available_configs(self) -> None:
         device = self.device
         if device is None:
+            self.available_configs = []
             self.available_configs_text = "n/a"
             return
 
         list_configs = getattr(device, "list_configs", None)
         if not callable(list_configs):
+            self.available_configs = []
             self.available_configs_text = "Unavailable"
             return
 
@@ -1482,6 +1905,7 @@ class AMXController(DeviceController):
                 timeout_s=float(getattr(self.controllerParent, "connect_timeout_s", 5.0))
             )
         except Exception as exc:  # noqa: BLE001
+            self.available_configs = []
             self.available_configs_text = "Unavailable"
             self.print(
                 f"Could not read AMX config list: {self._format_exception(exc)}",
@@ -1489,7 +1913,92 @@ class AMXController(DeviceController):
             )
             return
 
+        self.available_configs = list(configs)
         self.available_configs_text = _format_available_configs(configs)
+
+    def _refresh_loaded_config_status(self) -> None:
+        device = self.device
+        if device is None:
+            self.loaded_config_text = "n/a"
+            return
+
+        get_status = getattr(device, "get_status", None)
+        if not callable(get_status):
+            self.loaded_config_text = "Unavailable"
+            return
+
+        try:
+            status = get_status()
+        except Exception as exc:  # noqa: BLE001
+            self.loaded_config_text = "Unavailable"
+            self.print(
+                f"Could not read loaded AMX config: {self._format_exception(exc)}",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        self.loaded_config_text = _format_loaded_config_text(status)
+
+    def loadOperatingConfigNowFromThread(self, parallel: bool = True) -> None:
+        if parallel:
+            Thread(
+                target=self.loadOperatingConfigNow,
+                name=f"{self.controllerParent.name} loadOperatingConfigThread",
+                daemon=True,
+            ).start()
+            return
+        self.loadOperatingConfigNow()
+
+    def loadOperatingConfigNow(self) -> None:
+        device = self.device
+        if device is None or not getattr(self, "initialized", False):
+            self.print(
+                f"Cannot load {self.controllerParent.name} operating config: communication not initialized.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        config_index = _coerce_int(
+            getattr(self.controllerParent, "operating_config", -1),
+            -1,
+        )
+        if config_index < 0:
+            self.print(
+                f"Cannot load {self.controllerParent.name} operating config: select a valid slot first.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to load the AMX operating config."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                device.load_config(config_index, timeout_s=timeout_s)
+                self._refresh_loaded_config_status()
+                if bool(getattr(self.controllerParent, "isOn", lambda: False)()):
+                    device.set_frequency_khz(
+                        float(getattr(self.controllerParent, "frequency_khz", 2.0)),
+                        timeout_s=timeout_s,
+                    )
+                    for channel in self.controllerParent.getChannels():
+                        self._apply_channel_timing(channel, timeout_s)
+                    device.set_device_enabled(True, timeout_s=timeout_s)
+            self._update_state()
+            self.print(f"Loaded AMX operating config {config_index}.")
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to load AMX operating config {config_index}: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        finally:
+            self._sync_status_to_gui()
 
     def _apply_channel_timing(self, channel: AMXChannel, timeout_s: float) -> None:
         device = self.device
@@ -1695,6 +2204,7 @@ class AMXController(DeviceController):
                     for channel in self.controllerParent.getChannels():
                         self._apply_channel_timing(channel, timeout_s)
                     device.set_device_enabled(True, timeout_s=timeout_s)
+                    self._refresh_loaded_config_status()
                 self._update_state()
                 start_acquisition = getattr(self, "startAcquisition", None)
                 if callable(start_acquisition):
@@ -1750,10 +2260,12 @@ class AMXController(DeviceController):
         self.device_enabled_state = "OFF"
         self.device_state_summary = "n/a"
         self.controller_state_summary = "n/a"
+        self.available_configs = []
         self.available_configs_text = "n/a"
-        self._sync_status_to_gui()
+        self.loaded_config_text = "n/a"
         self._dispose_device()
         self.initialized = False
+        self._sync_status_to_gui()
 
     def _update_state(self) -> None:
         device = self.device
@@ -1783,7 +2295,9 @@ class AMXController(DeviceController):
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
         self.controllerParent.device_enabled_state = self.device_enabled_state
+        self.controllerParent.available_configs = list(self.available_configs)
         self.controllerParent.available_configs_text = self.available_configs_text
+        self.controllerParent.loaded_config_text = self.loaded_config_text
         sync_acquisition_controls = getattr(
             self.controllerParent,
             "_sync_acquisition_controls",
@@ -1791,6 +2305,9 @@ class AMXController(DeviceController):
         )
         if callable(sync_acquisition_controls):
             sync_acquisition_controls()
+        update_config_controls = getattr(self.controllerParent, "_update_config_controls", None)
+        if callable(update_config_controls):
+            update_config_controls()
         update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
         if callable(update_status_widgets):
             update_status_widgets()
