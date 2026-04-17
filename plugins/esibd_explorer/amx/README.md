@@ -33,7 +33,6 @@ including the AMX driver files and vendor DLL.
 - `Poll timeout (s)`: timeout used for periodic housekeeping reads.
 - `Standby config`: optional standby slot loaded on ON. Use `-1` to skip.
 - `Operating config`: optional operating slot loaded on ON. Use `-1` to skip.
-- `Shutdown config`: optional slot loaded on OFF. Use `-1` to use software shutdown.
 - `Available configs`: live list of config slots reported by the connected AMX.
 - `Frequency (kHz)`: oscillator frequency applied after startup.
 
@@ -53,9 +52,11 @@ will exist on the current unit.
 
 Important points:
 
-- `Standby config`, `Operating config`, and `Shutdown config` are optional.
+- `Standby config` and `Operating config` are optional.
 - Set them to `-1` when you want the plugin to connect and drive the AMX
   directly from software without loading a saved controller config.
+- The plugin `OFF` action always performs a full software shutdown and
+  disconnect. There is no config-based shutdown slot anymore.
 - Before choosing a config index, query the controller with the AMX wrapper
   notebook or `cgc.amx.AMX.list_configs()`.
 - In the Python wrapper, `cgc.amx.AMX.initialize()` can be called without an

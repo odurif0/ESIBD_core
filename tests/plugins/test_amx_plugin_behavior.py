@@ -374,7 +374,6 @@ def test_controller_defaults_standby_to_slot_zero_when_available():
     parent = types.SimpleNamespace(
         standby_config=-1,
         operating_config=9,
-        shutdown_config=-1,
     )
     controller = module.AMXController(parent)
     controller.available_configs = [
@@ -389,25 +388,20 @@ def test_controller_defaults_standby_to_slot_zero_when_available():
     assert controller._shutdown_kwargs() == {}
 
 
-def test_controller_uses_explicit_shutdown_config_when_configured():
+def test_controller_shutdown_kwargs_are_always_empty():
     module = _load_module()
 
     parent = types.SimpleNamespace(
         standby_config=-1,
         operating_config=9,
-        shutdown_config=5,
     )
     controller = module.AMXController(parent)
     controller.available_configs = [
         {"index": 0, "name": "Standby", "active": True, "valid": True},
-        {"index": 5, "name": "Shutdown", "active": True, "valid": True},
         {"index": 9, "name": "Operate", "active": True, "valid": True},
     ]
 
-    assert controller._shutdown_kwargs() == {
-        "standby_config": 5,
-        "disable_device": False,
-    }
+    assert controller._shutdown_kwargs() == {}
 
 
 def test_controller_ignores_slot_zero_when_it_is_not_a_standby_config():
@@ -416,7 +410,6 @@ def test_controller_ignores_slot_zero_when_it_is_not_a_standby_config():
     parent = types.SimpleNamespace(
         standby_config=-1,
         operating_config=9,
-        shutdown_config=-1,
     )
     controller = module.AMXController(parent)
     controller.available_configs = [
@@ -434,7 +427,6 @@ def test_controller_skips_implicit_slot_zero_when_unavailable():
     parent = types.SimpleNamespace(
         standby_config=-1,
         operating_config=9,
-        shutdown_config=-1,
     )
     controller = module.AMXController(parent)
     controller.available_configs = [
@@ -505,6 +497,38 @@ def test_controller_close_communication_syncs_after_device_is_disposed():
     assert controller.loaded_config_text == "n/a"
     assert controller.available_configs == []
     assert sync_states == [(True, False)]
+
+
+def test_controller_shutdown_uses_full_software_shutdown():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def shutdown(self, timeout_s=None, **kwargs):
+            self.shutdown_calls.append((timeout_s, kwargs))
+            return True
+
+        def disconnect(self):
+            return None
+
+        def close(self):
+            return None
+
+    parent = types.SimpleNamespace(
+        startup_timeout_s=7.5,
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+    controller = module.AMXController(parent)
+    device = FakeDevice()
+    controller.device = device
+    controller.initialized = True
+    controller.shutdownCommunication()
+
+    assert controller.device is None
+    assert device.shutdown_calls == [(7.5, {})]
 
 
 def test_amx_controller_lock_section_uses_raw_lock_and_propagates_errors():

@@ -253,7 +253,7 @@ def test_controller_read_numbers_maps_housekeeping_snapshot():
             return {
                 "device_enabled": True,
                 "output_enabled": (True, False),
-                "main_state": {"name": "ST_ON"},
+                "main_state": {"name": "STATE_ON"},
                 "device_state": {"flags": ["DEVICE_OK"]},
                 "channels": [
                     {
@@ -294,6 +294,7 @@ def test_controller_read_numbers_maps_housekeeping_snapshot():
     controller.readNumbers()
 
     assert controller.main_state == "ST_ON"
+    assert controller.hardware_main_state == "STATE_ON"
     assert controller.device_state_summary == "DEVICE_OK"
     assert controller.output_state_summary == "CH0=ON, CH1=OFF"
     assert controller.values == {0: 25.0, 1: 0.0}
@@ -302,7 +303,54 @@ def test_controller_read_numbers_maps_housekeeping_snapshot():
     assert controller.voltage_setpoints == {0: "30 V", 1: "0 V"}
     assert controller.current_setpoints == {0: "0.5 A", 1: "0 A"}
     assert parent.main_state == "ST_ON"
+    assert parent.hardware_main_state == "STATE_ON"
     assert parent.output_summary == "CH0=ON, CH1=OFF"
+
+
+def test_controller_maps_disabled_psu_state_to_standby():
+    module = _load_module()
+
+    class FakeDevice:
+        def collect_housekeeping(self, timeout_s=None):
+            return {
+                "device_enabled": False,
+                "output_enabled": (False, False),
+                "main_state": {"name": "STATE_ERR_PSU_DIS"},
+                "device_state": {"flags": ["DEVST_PSU_DIS"]},
+                "channels": [
+                    {
+                        "channel": 0,
+                        "enabled": False,
+                        "voltage": {"measured_v": 0.0, "set_v": 0.0},
+                        "current": {"measured_a": 0.0, "set_a": 0.0},
+                    },
+                    {
+                        "channel": 1,
+                        "enabled": False,
+                        "voltage": {"measured_v": 0.0, "set_v": 0.0},
+                        "current": {"measured_a": 0.0, "set_a": 0.0},
+                    },
+                ],
+            }
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    controller.readNumbers()
+
+    assert controller.main_state == "ST_STBY"
+    assert controller.hardware_main_state == "STATE_ERR_PSU_DIS"
+    assert controller.device_state_summary == "DEVST_PSU_DIS"
+    assert parent.main_state == "ST_STBY"
+    assert parent.hardware_main_state == "STATE_ERR_PSU_DIS"
 
 
 def test_controller_read_numbers_reports_snapshot_apply_failures_explicitly():
@@ -373,6 +421,34 @@ def test_controller_exposes_available_psu_configs_in_gui_state():
     assert controller.available_configs_text == "1:Standby; 7:Operate 5 kV"
     assert parent.available_configs == controller.available_configs
     assert parent.available_configs_text == controller.available_configs_text
+
+
+def test_psu_config_selector_change_updates_operating_slot():
+    module = _load_module()
+
+    class FakeCombo:
+        def __init__(self):
+            self.items = [("Skip (-1)", -1), ("7:Operate 5 kV", 7)]
+            self._current_index = 1
+
+        def currentIndex(self):
+            return self._current_index
+
+        def itemData(self, index):
+            return self.items[index][1]
+
+    updates = []
+    device = object.__new__(module.PSUDevice)
+    device.name = "PSU"
+    device.operating_config = -1
+    device.operatingConfigCombo = FakeCombo()
+    device._update_config_selectors = lambda: updates.append("selectors")
+    device._update_status_widgets = lambda: updates.append("status")
+
+    module.PSUDevice._config_selector_changed(device, "operating_config")
+
+    assert device.operating_config == 7
+    assert updates == ["selectors", "status"]
 
 
 def test_psu_controller_lock_section_uses_raw_lock_and_propagates_errors():

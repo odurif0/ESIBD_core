@@ -984,6 +984,19 @@ def test_channel_uses_explicit_toggle_buttons_and_minimum_row_height():
     assert channel.tree.layouts == 1
 
 
+def test_channel_places_display_column_last():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    channel = object.__new__(module.AMXChannel)
+    module.AMXChannel.setDisplayedParameters(channel)
+
+    assert channel.displayedParameters[-1] == "Display"
+    assert "Active" in channel.displayedParameters
+
+
 def test_channel_seeds_legacy_value_bounds_before_base_init(monkeypatch):
     _clear_test_modules()
     _install_esibd_stubs()
@@ -1140,7 +1153,6 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     device.loaded_config_text = "9:Static:Out0-3=Hi-Z [memory]"
     device.standby_config = -1
     device.operating_config = 9
-    device.shutdown_config = 0
     device.isOn = lambda: True
     device.controller = types.SimpleNamespace(
         device=object(),
@@ -1168,7 +1180,6 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     assert "Loaded: 9:Static:Out0-3=Hi-Z [memory]" in device.loadedConfigValueLabel.tooltips[-1]
     assert device.loadOperatingConfigButton.enabled is True
     assert not hasattr(device, "standbyConfigCombo")
-    assert not hasattr(device, "shutdownConfigCombo")
 
     device.loadOperatingConfigButton.click()
 
@@ -1272,7 +1283,6 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
     device.loaded_config_text = "n/a"
     device.standby_config = -1
     device.operating_config = 9
-    device.shutdown_config = -1
     device.isOn = lambda: False
     device.controller = types.SimpleNamespace(
         device=None,
@@ -1389,7 +1399,6 @@ def test_config_controls_disable_load_now_when_amx_is_off():
     device.loaded_config_text = "n/a"
     device.standby_config = -1
     device.operating_config = 9
-    device.shutdown_config = -1
     device.isOn = lambda: False
     device.controller = types.SimpleNamespace(
         device=object(),

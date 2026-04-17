@@ -52,6 +52,23 @@ _PSU_OUTPUT_OFF_STYLE = (
     "background-color: #4a5568; color: #ffffff; margin:0px; padding:0px 6px;"
 )
 _PSU_FLOAT_SENTINEL = -1
+_PSU_MAIN_STATE_ALIASES = {
+    "state_on": "ST_ON",
+    "state_error": "ST_ERROR",
+    "state_err_vsup": "ST_ERR_VSUP",
+    "state_err_temp_low": "ST_ERR_TEMP_LOW",
+    "state_err_temp_high": "ST_ERR_TEMP_HIGH",
+    "state_err_ilock": "ST_ERR_ILOCK",
+    "state_err_psu_dis": "ST_ERR_PSU_DIS",
+    "st_on": "ST_ON",
+    "st_error": "ST_ERROR",
+    "st_err_vsup": "ST_ERR_VSUP",
+    "st_err_temp_low": "ST_ERR_TEMP_LOW",
+    "st_err_temp_high": "ST_ERR_TEMP_HIGH",
+    "st_err_ilock": "ST_ERR_ILOCK",
+    "st_err_psu_dis": "ST_ERR_PSU_DIS",
+    "st_stby": "ST_STBY",
+}
 
 
 def _is_nan(value: Any) -> bool:
@@ -114,7 +131,29 @@ def _normalize_runtime_state(state: Any) -> str:
         return "Disconnected"
     if normalized in {"true", "connected"}:
         return "Connected"
+    harmonized = _PSU_MAIN_STATE_ALIASES.get(normalized)
+    if harmonized is not None:
+        return harmonized
     return text
+
+
+def _harmonize_psu_main_state(
+    state: Any,
+    *,
+    device_enabled: Any = None,
+    output_enabled: Any = None,
+) -> str:
+    """Map raw PSU backend states onto the UI convention used by other plugins."""
+    harmonized = _normalize_runtime_state(state)
+    if harmonized != "ST_ERR_PSU_DIS":
+        return harmonized
+
+    device_is_enabled = _coerce_bool(device_enabled, default=True)
+    output_bits = tuple(bool(value) for value in output_enabled or ())
+    outputs_disabled = bool(output_bits) and not any(output_bits)
+    if (device_enabled is False or not device_is_enabled) and outputs_disabled:
+        return "ST_STBY"
+    return harmonized
 
 
 def _status_requires_operator_attention(state: Any) -> bool:
@@ -154,6 +193,32 @@ def _format_available_configs(configs: list[dict[str, Any]]) -> str:
             label = f"{label} ({', '.join(suffixes)})"
         formatted.append(label)
     return "; ".join(formatted)
+
+
+def _format_config_option(
+    index: int,
+    name: str = "",
+    *,
+    active: bool = True,
+    valid: bool = True,
+    unavailable: bool = False,
+) -> str:
+    """Return one human-readable PSU config entry."""
+    if index < 0:
+        return "Skip (-1)"
+
+    label = f"{index}:{str(name or '').strip() or '<unnamed>'}"
+    suffixes: list[str] = []
+    if unavailable:
+        suffixes.append("not listed")
+    else:
+        if not valid:
+            suffixes.append("invalid")
+        if not active:
+            suffixes.append("inactive")
+    if suffixes:
+        label = f"{label} ({', '.join(suffixes)})"
+    return label
 
 
 def _psu_output_state_badge_style(state: Any) -> str:
@@ -537,6 +602,145 @@ class PSUDevice(Device):
     def _default_channel_template(self) -> dict[str, dict[str, Any]]:
         return self.channelType(channelParent=self, tree=None).getSortedDefaultChannel()
 
+    def _setting(self, setting_name: str) -> Any | None:
+        plugin_manager = getattr(self, "pluginManager", None)
+        settings_plugin = getattr(plugin_manager, "Settings", None)
+        settings = getattr(settings_plugin, "settings", None)
+        if not isinstance(settings, dict):
+            return None
+        return settings.get(f"{self.name}/{setting_name}")
+
+    def _config_setting_name(self, attr_name: str) -> str:
+        return {
+            "standby_config": self.STANDBY_CONFIG,
+            "operating_config": self.OPERATING_CONFIG,
+            "shutdown_config": self.SHUTDOWN_CONFIG,
+        }[attr_name]
+
+    def _config_setting_value(self, attr_name: str) -> int:
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        if setting is not None:
+            return _coerce_int(getattr(setting, "value", None), getattr(self, attr_name, -1))
+        return _coerce_int(getattr(self, attr_name, -1), -1)
+
+    def _set_config_setting_value(self, attr_name: str, value: int) -> bool:
+        value = _coerce_int(value, -1)
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        if setting is not None:
+            if _coerce_int(getattr(setting, "value", None), value) == value:
+                return False
+            setting.value = value
+            return True
+        if _coerce_int(getattr(self, attr_name, value), value) == value:
+            return False
+        setattr(self, attr_name, value)
+        return True
+
+    def _available_config_entries(self) -> list[dict[str, Any]]:
+        configs = list(getattr(self, "available_configs", []) or [])
+        return sorted(configs, key=lambda config: _coerce_int(config.get("index"), 10_000))
+
+    def _config_selector_entries(self, attr_name: str) -> list[tuple[int, str]]:
+        entries: list[tuple[int, str]] = [(-1, _format_config_option(-1))]
+        seen = {-1}
+        for config in self._available_config_entries():
+            index = _coerce_int(config.get("index"), -1)
+            if index < 0 or index in seen:
+                continue
+            entries.append(
+                (
+                    index,
+                    _format_config_option(
+                        index,
+                        str(config.get("name", "") or "").strip(),
+                        active=_coerce_bool(config.get("active"), True),
+                        valid=_coerce_bool(config.get("valid"), True),
+                    ),
+                )
+            )
+            seen.add(index)
+        current_value = self._config_setting_value(attr_name)
+        if current_value >= 0 and current_value not in seen:
+            entries.append(
+                (
+                    current_value,
+                    _format_config_option(current_value, "<saved>", unavailable=True),
+                )
+            )
+        return entries
+
+    def _config_selector_tooltip_text(self, attr_name: str) -> str:
+        setting_name = self._config_setting_name(attr_name)
+        setting = self._setting(setting_name)
+        tooltip = str(getattr(setting, "toolTip", "") or "").strip() if setting is not None else ""
+        lines = [tooltip] if tooltip else []
+        lines.append("Available PSU configs:")
+        available = str(getattr(self, "available_configs_text", "") or "n/a")
+        for entry in available.split(";"):
+            entry = entry.strip()
+            if entry:
+                lines.append(f"- {entry}")
+        return "\n".join(lines)
+
+    def _create_config_selector_widget(self) -> Any:
+        from PyQt6.QtWidgets import QComboBox
+
+        combo = QComboBox()
+        combo.setMinimumWidth(180)
+        combo.setMaxVisibleItems(32)
+        with contextlib.suppress(AttributeError):
+            combo.setSizeAdjustPolicy(type(combo).SizeAdjustPolicy.AdjustToContents)
+        return combo
+
+    def _combo_clear(self, combo: Any) -> None:
+        clear = getattr(combo, "clear", None)
+        if callable(clear):
+            clear()
+
+    def _combo_add_item(self, combo: Any, text: str, value: int) -> None:
+        add_item = getattr(combo, "addItem", None)
+        if callable(add_item):
+            try:
+                add_item(text, value)
+            except TypeError:
+                add_item(text)
+
+    def _combo_find_data(self, combo: Any, value: int) -> int:
+        find_data = getattr(combo, "findData", None)
+        if callable(find_data):
+            return int(find_data(value))
+        items = getattr(combo, "items", None)
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, tuple) and len(item) >= 2 and item[1] == value:
+                    return index
+        return -1
+
+    def _combo_item_data(self, combo: Any, index: int) -> Any:
+        item_data = getattr(combo, "itemData", None)
+        if callable(item_data):
+            return item_data(index)
+        items = getattr(combo, "items", None)
+        if isinstance(items, list) and 0 <= index < len(items):
+            item = items[index]
+            if isinstance(item, tuple) and len(item) >= 2:
+                return item[1]
+        return None
+
+    def _combo_current_value(self, combo: Any, default: int = -1) -> int:
+        current_index = getattr(combo, "currentIndex", None)
+        if not callable(current_index):
+            return default
+        return _coerce_int(self._combo_item_data(combo, current_index()), default)
+
+    def _connect_config_selector(self, combo: Any, attr_name: str) -> None:
+        signal = getattr(combo, "currentIndexChanged", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(lambda *_args, attr_name=attr_name: self._config_selector_changed(attr_name))
+
     def _bootstrap_channel_items(self) -> list[dict[str, Any]]:
         default_item = self._default_channel_item()
         return [
@@ -638,7 +842,7 @@ class PSUDevice(Device):
     def _config_list_tooltip_text(self) -> str:
         return "\n".join(
             (
-                "Configs reported by the PSU controller:",
+                "Available PSU configs:",
                 self._config_list_text(),
             )
         )
@@ -657,47 +861,114 @@ class PSUDevice(Device):
             "stretchAction",
             None,
         )
-        self.availableConfigsLabel = label_type("Configs:")
+        self.availableConfigsLabel = label_type("Available:")
         self.availableConfigsValueLabel = label_type("")
+        self.standbyConfigLabel = label_type("Standby:")
+        self.standbyConfigCombo = self._create_config_selector_widget()
+        self.operatingConfigLabel = label_type("Operating:")
+        self.operatingConfigCombo = self._create_config_selector_widget()
         if hasattr(self.availableConfigsLabel, "setObjectName"):
             self.availableConfigsLabel.setObjectName(f"{self.name}ConfigsLabel")
         if hasattr(self.availableConfigsValueLabel, "setObjectName"):
             self.availableConfigsValueLabel.setObjectName(f"{self.name}ConfigsValue")
         if hasattr(self.availableConfigsValueLabel, "setStyleSheet"):
             self.availableConfigsValueLabel.setStyleSheet("QLabel { padding-left: 4px; }")
+        self._connect_config_selector(self.standbyConfigCombo, "standby_config")
+        self._connect_config_selector(self.operatingConfigCombo, "operating_config")
         if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
-            self.availableConfigsAction = self.titleBar.insertWidget(
-                insert_before,
-                self.availableConfigsLabel,
-            )
-            self.availableConfigsValueAction = self.titleBar.insertWidget(
-                insert_before,
-                self.availableConfigsValueLabel,
-            )
+            for attr_name, widget in (
+                ("availableConfigsAction", self.availableConfigsLabel),
+                ("availableConfigsValueAction", self.availableConfigsValueLabel),
+                ("standbyConfigAction", self.standbyConfigLabel),
+                ("standbyConfigComboAction", self.standbyConfigCombo),
+                ("operatingConfigAction", self.operatingConfigLabel),
+                ("operatingConfigComboAction", self.operatingConfigCombo),
+            ):
+                setattr(
+                    self,
+                    attr_name,
+                    self.titleBar.insertWidget(insert_before, widget),
+                )
         elif hasattr(self.titleBar, "addWidget"):
-            self.availableConfigsAction = self.titleBar.addWidget(self.availableConfigsLabel)
-            self.availableConfigsValueAction = self.titleBar.addWidget(
-                self.availableConfigsValueLabel
-            )
+            for attr_name, widget in (
+                ("availableConfigsAction", self.availableConfigsLabel),
+                ("availableConfigsValueAction", self.availableConfigsValueLabel),
+                ("standbyConfigAction", self.standbyConfigLabel),
+                ("standbyConfigComboAction", self.standbyConfigCombo),
+                ("operatingConfigAction", self.operatingConfigLabel),
+                ("operatingConfigComboAction", self.operatingConfigCombo),
+            ):
+                setattr(self, attr_name, self.titleBar.addWidget(widget))
         else:
             self.availableConfigsAction = None
             self.availableConfigsValueAction = None
+            self.standbyConfigAction = None
+            self.standbyConfigComboAction = None
+            self.operatingConfigAction = None
+            self.operatingConfigComboAction = None
 
         self._update_config_selectors()
 
     def _update_config_selectors(self) -> None:
         label = getattr(self, "availableConfigsLabel", None)
         value_label = getattr(self, "availableConfigsValueLabel", None)
-        if value_label is None:
+        if value_label is not None:
+            text = self._config_list_text()
+            tooltip = self._config_list_tooltip_text()
+            if hasattr(value_label, "setText"):
+                value_label.setText(text)
+            if hasattr(value_label, "setToolTip"):
+                value_label.setToolTip(tooltip)
+            if label is not None and hasattr(label, "setToolTip"):
+                label.setToolTip(tooltip)
+
+        for attr_name, combo_attr, label_attr in (
+            ("standby_config", "standbyConfigCombo", "standbyConfigLabel"),
+            ("operating_config", "operatingConfigCombo", "operatingConfigLabel"),
+        ):
+            combo = getattr(self, combo_attr, None)
+            combo_label = getattr(self, label_attr, None)
+            if combo is None:
+                continue
+            block_signals = getattr(combo, "blockSignals", None)
+            if callable(block_signals):
+                block_signals(True)
+            try:
+                self._combo_clear(combo)
+                for value, entry_label in self._config_selector_entries(attr_name):
+                    self._combo_add_item(combo, entry_label, value)
+                selected_index = self._combo_find_data(
+                    combo,
+                    self._config_setting_value(attr_name),
+                )
+                if selected_index < 0:
+                    selected_index = 0
+                set_current_index = getattr(combo, "setCurrentIndex", None)
+                if callable(set_current_index):
+                    set_current_index(selected_index)
+                tooltip = self._config_selector_tooltip_text(attr_name)
+                if hasattr(combo, "setToolTip"):
+                    combo.setToolTip(tooltip)
+                if combo_label is not None and hasattr(combo_label, "setToolTip"):
+                    combo_label.setToolTip(tooltip)
+            finally:
+                if callable(block_signals):
+                    block_signals(False)
+
+    def _config_selector_changed(self, attr_name: str) -> None:
+        combo = getattr(
+            self,
+            {
+                "standby_config": "standbyConfigCombo",
+                "operating_config": "operatingConfigCombo",
+            }[attr_name],
+            None,
+        )
+        if combo is None:
             return
-        text = self._config_list_text()
-        tooltip = self._config_list_tooltip_text()
-        if hasattr(value_label, "setText"):
-            value_label.setText(text)
-        if hasattr(value_label, "setToolTip"):
-            value_label.setToolTip(tooltip)
-        if label is not None and hasattr(label, "setToolTip"):
-            label.setToolTip(tooltip)
+        if self._set_config_setting_value(attr_name, self._combo_current_value(combo)):
+            self._update_config_selectors()
+            self._update_status_widgets()
 
     def _status_badge_style(self) -> str:
         """Return a compact badge style that reflects the PSU main state."""
@@ -737,21 +1008,28 @@ class PSUDevice(Device):
             getattr(controller, "device_state_summary", None),
             default="n/a",
         )
-        return f"Outputs: {outputs} | Faults: {faults}"
+        return f"HV outputs: {outputs} | Device flags: {faults}"
 
     def _status_tooltip_text(self) -> str:
         """Return the full PSU status tooltip for the toolbar widgets."""
         controller = getattr(self, "controller", None)
         display_state = self._display_main_state()
-        hardware_state = _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
+        hardware_state = str(
+            getattr(
+                self,
+                "hardware_main_state",
+                getattr(self, "main_state", "Disconnected"),
+            )
+            or "Disconnected"
+        )
         lines = [f"State: {display_state}"]
         if display_state != hardware_state:
             lines.append(f"Hardware state: {hardware_state}")
         lines.extend(
             (
-                f"Outputs: {getattr(self, 'output_summary', '') or 'n/a'}",
-                f"Faults: {getattr(controller, 'device_state_summary', '') or 'n/a'}",
-                f"Configs: {getattr(self, 'available_configs_text', '') or 'n/a'}",
+                f"HV outputs: {getattr(self, 'output_summary', '') or 'n/a'}",
+                f"Device flags: {getattr(controller, 'device_state_summary', '') or 'n/a'}",
+                f"Available configs: {getattr(self, 'available_configs_text', '') or 'n/a'}",
             )
         )
         return "\n".join(lines)
@@ -1392,7 +1670,6 @@ class PSUChannel(Channel):
             getattr(self, "MONITOR", "Monitor"),
             self.CURRENT_SET,
             self.CURRENT_MONITOR,
-            self.DISPLAY,
             self.ID,
             self.ENABLED,
             self.VALUE,
@@ -1407,6 +1684,7 @@ class PSUChannel(Channel):
             getattr(self, "COLOR", "Color"),
             getattr(self, "MIN", "Min"),
             getattr(self, "MAX", "Max"),
+            self.DISPLAY,
         ]
         self.displayedParameters = list(dict.fromkeys(displayed))
 
@@ -1604,6 +1882,7 @@ class PSUController(DeviceController):
         super().__init__(controllerParent=controllerParent)
         self.device: Any | None = None
         self.main_state = "Disconnected"
+        self.hardware_main_state = "Disconnected"
         self.output_state_summary = "CH0=OFF, CH1=OFF"
         self.device_state_summary = "n/a"
         self.available_configs: list[dict[str, Any]] = []
@@ -1784,12 +2063,19 @@ class PSUController(DeviceController):
             return
 
     def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
-        self.main_state = str(
+        self.hardware_main_state = str(
             snapshot.get("main_state", {}).get("name", "Unknown")
+        )
+        output_enabled = tuple(
+            bool(value) for value in snapshot.get("output_enabled", (False, False))
+        )
+        self.main_state = _harmonize_psu_main_state(
+            self.hardware_main_state,
+            device_enabled=snapshot.get("device_enabled"),
+            output_enabled=output_enabled,
         )
         flags = snapshot.get("device_state", {}).get("flags", [])
         self.device_state_summary = ", ".join(str(flag) for flag in flags) if flags else "OK"
-        output_enabled = tuple(snapshot.get("output_enabled", (False, False)))
         self.output_state_summary = ", ".join(
             f"CH{index}={'ON' if bool(enabled) else 'OFF'}"
             for index, enabled in enumerate(output_enabled)
@@ -1938,6 +2224,7 @@ class PSUController(DeviceController):
         if callable(base_close):
             base_close()
         self.main_state = "Disconnected"
+        self.hardware_main_state = "Disconnected"
         self.output_state_summary = "CH0=OFF, CH1=OFF"
         self.device_state_summary = "n/a"
         self.available_configs = []
@@ -1951,6 +2238,7 @@ class PSUController(DeviceController):
         device = self.device
         if device is None:
             self.main_state = "Disconnected"
+            self.hardware_main_state = "Disconnected"
             self.output_state_summary = "CH0=OFF, CH1=OFF"
             self.device_state_summary = "n/a"
             return
@@ -1961,9 +2249,12 @@ class PSUController(DeviceController):
             )
         except Exception:
             try:
-                self.main_state = str(device.get_status().get("connected", False))
+                self.hardware_main_state = str(
+                    device.get_status().get("connected", False)
+                )
             except Exception:
-                self.main_state = "Unknown"
+                self.hardware_main_state = "Unknown"
+            self.main_state = _normalize_runtime_state(self.hardware_main_state)
             self.device_state_summary = "Unknown"
             self.output_state_summary = "Unknown"
             return
@@ -1972,6 +2263,7 @@ class PSUController(DeviceController):
 
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
+        self.controllerParent.hardware_main_state = self.hardware_main_state
         self.controllerParent.output_summary = self.output_state_summary
         self.controllerParent.available_configs = list(self.available_configs)
         self.controllerParent.available_configs_text = self.available_configs_text

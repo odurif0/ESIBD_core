@@ -1221,7 +1221,10 @@ class DMMRChannel(Channel):
         super().setDisplayedParameters()
         if self.OPTIMIZE in self.displayedParameters:
             self.displayedParameters.remove(self.OPTIMIZE)
+        if self.DISPLAY in self.displayedParameters:
+            self.displayedParameters.remove(self.DISPLAY)
         self.displayedParameters.append(self.MODULE)
+        self.displayedParameters.append(self.DISPLAY)
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)

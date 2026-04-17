@@ -250,7 +250,7 @@ def test_config_list_text_uses_detected_configs_verbatim():
     assert module.PSUDevice._config_list_text(device) == "1:Standby; 7:Operate 5 kV"
     assert (
         module.PSUDevice._config_list_tooltip_text(device)
-        == "Configs reported by the PSU controller:\n1:Standby; 7:Operate 5 kV"
+        == "Available PSU configs:\n1:Standby; 7:Operate 5 kV"
     )
 
 
@@ -564,20 +564,124 @@ def test_status_widgets_summarize_global_psu_state():
 
     assert len(device.titleBar.inserted) == 2
     assert device.statusBadgeLabel.text == "Disconnected"
-    assert device.statusSummaryLabel.text == "Outputs: CH0=OFF +1 | Faults: OK"
+    assert device.statusSummaryLabel.text == "HV outputs: CH0=OFF +1 | Device flags: OK"
     tooltip = device.statusBadgeLabel.tooltips[-1]
     assert "State: Disconnected" in tooltip
-    assert "Outputs: CH0=OFF, CH1=OFF" in tooltip
-    assert "Faults: OK" in tooltip
-    assert "Configs: 0:Standby; 1:Operate" in tooltip
+    assert "HV outputs: CH0=OFF, CH1=OFF" in tooltip
+    assert "Device flags: OK" in tooltip
+    assert "Available configs: 0:Standby; 1:Operate" in tooltip
     assert "#718096" in device.statusBadgeLabel.styles[-1]
 
 
-def test_config_list_widgets_show_available_configs():
+def test_status_widgets_show_hardware_state_when_psu_state_is_harmonized():
     _clear_test_modules()
     _install_esibd_stubs()
 
     module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+            self.styles = []
+            self.object_names = []
+
+        def setObjectName(self, name):
+            self.object_names.append(name)
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeTitleBar:
+        def __init__(self):
+            self.inserted = []
+
+        def insertWidget(self, before, widget):
+            self.inserted.append((before, widget))
+
+    device = object.__new__(module.PSUDevice)
+    device.name = "PSU"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.onAction = types.SimpleNamespace(state=True)
+    device.isOn = lambda: device.onAction.state
+    device.main_state = "ST_STBY"
+    device.hardware_main_state = "STATE_ERR_PSU_DIS"
+    device.output_summary = "CH0=OFF, CH1=OFF"
+    device.available_configs_text = "0:Standby; 9:Operate"
+    device.controller = types.SimpleNamespace(device_state_summary="DEVST_PSU_DIS")
+
+    module.PSUDevice._ensure_status_widgets(device)
+
+    assert device.statusBadgeLabel.text == "ST_STBY"
+    tooltip = device.statusBadgeLabel.tooltips[-1]
+    assert "State: ST_STBY" in tooltip
+    assert "Hardware state: STATE_ERR_PSU_DIS" in tooltip
+    assert "#b7791f" in device.statusBadgeLabel.styles[-1]
+
+
+def test_config_controls_show_available_configs():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeCombo:
+        def __init__(self):
+            self.items = []
+            self._current_index = -1
+            self.tooltips = []
+            self.currentIndexChanged = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setMaxVisibleItems(self, _count):
+            return None
+
+        def setSizeAdjustPolicy(self, _policy):
+            return None
+
+        def clear(self):
+            self.items = []
+
+        def addItem(self, text, value=None):
+            self.items.append((text, value))
+
+        def findData(self, value):
+            for index, item in enumerate(self.items):
+                if item[1] == value:
+                    return index
+            return -1
+
+        def itemData(self, index):
+            return self.items[index][1]
+
+        def setCurrentIndex(self, index):
+            self._current_index = index
+
+        def currentIndex(self):
+            return self._current_index
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def blockSignals(self, _blocked):
+            return None
 
     class FakeLabel:
         def __init__(self, text=""):
@@ -611,17 +715,40 @@ def test_config_list_widgets_show_available_configs():
     device.titleBar = FakeTitleBar()
     device.titleBarLabel = FakeLabel()
     device.stretchAction = object()
+    device.available_configs = [
+        {"index": 1, "name": "Standby", "active": True, "valid": True},
+        {"index": 7, "name": "Operate 5 kV", "active": True, "valid": True},
+    ]
     device.available_configs_text = "1:Standby; 7:Operate 5 kV"
+    device.standby_config = 1
+    device.operating_config = 7
+    device._create_config_selector_widget = lambda: FakeCombo()
+    device._update_status_widgets = lambda: None
 
     module.PSUDevice._ensure_config_selectors(device)
 
-    assert len(device.titleBar.inserted) == 2
-    assert device.availableConfigsLabel.text == "Configs:"
+    assert len(device.titleBar.inserted) == 6
+    assert device.availableConfigsLabel.text == "Available:"
     assert device.availableConfigsValueLabel.text == "1:Standby; 7:Operate 5 kV"
+    assert device.standbyConfigLabel.text == "Standby:"
+    assert device.standbyConfigCombo.items == [
+        ("Skip (-1)", -1),
+        ("1:Standby", 1),
+        ("7:Operate 5 kV", 7),
+    ]
+    assert device.standbyConfigCombo.currentIndex() == 1
+    assert device.operatingConfigLabel.text == "Operating:"
+    assert device.operatingConfigCombo.items == [
+        ("Skip (-1)", -1),
+        ("1:Standby", 1),
+        ("7:Operate 5 kV", 7),
+    ]
+    assert device.operatingConfigCombo.currentIndex() == 2
     assert (
         device.availableConfigsValueLabel.tooltips[-1]
-        == "Configs reported by the PSU controller:\n1:Standby; 7:Operate 5 kV"
+        == "Available PSU configs:\n1:Standby; 7:Operate 5 kV"
     )
+    assert "Available PSU configs:" in device.standbyConfigCombo.tooltips[-1]
 
 
 def test_psu_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):
@@ -715,7 +842,7 @@ def test_channel_display_order_prioritizes_psu_readbacks():
 
     module.PSUChannel.setDisplayedParameters(channel)
 
-    assert channel.displayedParameters[:10] == [
+    assert channel.displayedParameters[:9] == [
         "Collapse",
         "Select",
         "Name",
@@ -724,9 +851,9 @@ def test_channel_display_order_prioritizes_psu_readbacks():
         "Monitor",
         "Current set",
         "Current monitor",
-        "Display",
         "CH",
     ]
+    assert channel.displayedParameters[-1] == "Display"
 
 
 def test_psu_output_state_badge_style_matches_on_off_states():
