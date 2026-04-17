@@ -1130,7 +1130,12 @@ class AMXDevice(Device):
 
     def _update_channel_column_visibility(self) -> None:
         """Hide framework columns and configure key columns as user-resizable."""
-        if self.tree is None or not self.channels:
+        if self.tree is None:
+            return
+        set_root_decorated = getattr(self.tree, "setRootIsDecorated", None)
+        if callable(set_root_decorated):
+            set_root_decorated(False)
+        if not self.channels:
             return
 
         parameter_names = list(self.channels[0].getSortedDefaultChannel())
@@ -1332,8 +1337,8 @@ class AMXDevice(Device):
             minimum=-1,
             maximum=255,
             toolTip=(
-                "Advanced shutdown config index. Use -1 to auto-use slot 0 when it exists, "
-                "otherwise use software shutdown."
+                "Advanced shutdown config index. Use -1 for a full software shutdown "
+                "that disables the AMX before disconnecting."
             ),
             parameterType=PARAMETERTYPE.INT,
             attr="shutdown_config",
@@ -1722,6 +1727,27 @@ class AMXChannel(Channel):
         ])
 
     def initGUI(self, item: dict) -> None:
+        # Legacy AMX channel configs may reach core.Channel.updateMin()/updateMax()
+        # before framework attributes are hydrated from the stored config.
+        if not hasattr(self, "active"):
+            self.active = _coerce_bool(item.get(getattr(self, "ACTIVE", "Active")), True)
+        if not hasattr(self, "enabled"):
+            self.enabled = _coerce_bool(
+                item.get(getattr(self, "ENABLED", "Enabled")),
+                False,
+            )
+        if not hasattr(self, "real"):
+            self.real = _coerce_bool(item.get(getattr(self, "REAL", "Real")), True)
+        if not hasattr(self, "value"):
+            self.value = _coerce_float(item.get(getattr(self, "VALUE", "Value")), 0.0)
+        if not hasattr(self, "min"):
+            self.min = _coerce_float(item.get(getattr(self, "MIN", "Min")), 0.0)
+        if not hasattr(self, "max"):
+            max_value = item.get(getattr(self, "MAX", "Max"))
+            channel_parent = getattr(self, "channelParent", None)
+            freq_khz = _coerce_float(getattr(channel_parent, "frequency_khz", 2.0), 2.0)
+            default_max = 1000.0 / freq_khz if freq_khz > 0 else 500.0
+            self.max = _coerce_float(max_value, default_max)
         super().initGUI(item)
         self._upgrade_toggle_widget(
             self.ENABLED,
@@ -1968,7 +1994,10 @@ class AMXController(DeviceController):
         return kwargs
 
     def _shutdown_kwargs(self) -> dict[str, Any]:
-        shutdown_config = self._resolved_safety_config("shutdown_config")
+        shutdown_config = _coerce_int(
+            getattr(self.controllerParent, "shutdown_config", -1),
+            -1,
+        )
         if shutdown_config >= 0:
             return {
                 "standby_config": shutdown_config,

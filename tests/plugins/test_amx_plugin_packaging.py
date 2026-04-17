@@ -359,9 +359,13 @@ def test_plugin_hides_framework_collapse_and_real_columns():
     class FakeTree:
         def __init__(self):
             self.calls = []
+            self.root_decorated = []
 
         def setColumnHidden(self, index, hidden):
             self.calls.append((index, hidden))
+
+        def setRootIsDecorated(self, value):
+            self.root_decorated.append(value)
 
     class FakeChannel:
         def getSortedDefaultChannel(self):
@@ -379,6 +383,7 @@ def test_plugin_hides_framework_collapse_and_real_columns():
 
     module.AMXDevice._update_channel_column_visibility(device)
 
+    assert device.tree.root_decorated == [False]
     assert device.tree.calls == [(0, True), (1, True)]
 
 
@@ -977,6 +982,51 @@ def test_channel_uses_explicit_toggle_buttons_and_minimum_row_height():
     assert parameters["Active"].check.minimum_width == 72
     assert parameters["Display"].check is original_display_widget
     assert channel.tree.layouts == 1
+
+
+def test_channel_seeds_legacy_value_bounds_before_base_init(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    observed = {}
+
+    def fake_super_init(self, item):
+        observed["value"] = self.value
+        observed["min"] = self.min
+        observed["max"] = self.max
+        observed["enabled"] = self.enabled
+        observed["real"] = self.real
+        self.super_init_gui_called = item
+
+    monkeypatch.setattr(module.Channel, "initGUI", fake_super_init)
+
+    channel = object.__new__(module.AMXChannel)
+    channel.channelParent = types.SimpleNamespace(frequency_khz=4.0)
+    channel.parameters = []
+    channel.loading = False
+    channel.tree = None
+    channel.getParameterByName = lambda _name: None
+
+    module.AMXChannel.initGUI(
+        channel,
+        {
+            "Name": "legacy",
+            "Value": "12.5",
+            "Enabled": True,
+            "Real": True,
+        },
+    )
+
+    assert observed == {
+        "value": 12.5,
+        "min": 0.0,
+        "max": 250.0,
+        "enabled": True,
+        "real": True,
+    }
+    assert channel.super_init_gui_called["Name"] == "legacy"
 
 
 def test_config_controls_show_available_slots_loaded_status_and_load_now_action():
