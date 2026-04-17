@@ -343,7 +343,7 @@ def test_plugin_enables_monitors_and_hides_optimize_column():
     module.AMPRChannel.setDisplayedParameters(channel)
 
     assert "Optimize" not in channel.displayedParameters
-    assert channel.displayedParameters[-2:] == ["Module", "CH"]
+    assert channel.displayedParameters[-3:] == ["Module", "CH", "Display"]
 
     channel_defaults = module.AMPRChannel.getDefaultChannel(channel)
     assert channel_defaults["Enabled"][module.Parameter.ADVANCED] is False

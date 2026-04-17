@@ -1203,8 +1203,11 @@ class AMPRChannel(Channel):
         super().setDisplayedParameters()
         if self.OPTIMIZE in self.displayedParameters:
             self.displayedParameters.remove(self.OPTIMIZE)
+        if self.DISPLAY in self.displayedParameters:
+            self.displayedParameters.remove(self.DISPLAY)
         self.displayedParameters.append(self.MODULE)
         self.displayedParameters.append(self.ID)
+        self.displayedParameters.append(self.DISPLAY)
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)
@@ -1303,6 +1306,31 @@ class AMPRChannel(Channel):
         super().updateDisplay()
         state = "ON" if self.display else "OFF"
         self._log_channel_event(f"Display switched {state}.")
+
+    def updateColor(self):
+        """Keep the Display checkbox centered in its column."""
+        color = super().updateColor()
+        try:
+            from PyQt6.QtCore import Qt
+            from PyQt6.QtWidgets import QCheckBox, QSizePolicy
+        except Exception:
+            return color
+
+        display_param = self.getParameterByName(self.DISPLAY)
+        if display_param is None:
+            return color
+        display_widget = display_param.getWidget()
+        if not isinstance(display_widget, QCheckBox):
+            return color
+        display_widget.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            display_widget.sizePolicy().verticalPolicy(),
+        )
+        if hasattr(display_widget, "container") and display_widget.container.layout():
+            display_widget.container.layout().setAlignment(
+                display_widget, Qt.AlignmentFlag.AlignCenter
+            )
+        return color
 
     def _enabled_toggle_label(self) -> str:
         """Return the explicit ON/OFF label used by the channel toggle."""

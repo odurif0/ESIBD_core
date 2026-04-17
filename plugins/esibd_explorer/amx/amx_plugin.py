@@ -490,7 +490,6 @@ class AMXDevice(Device):
     POLL_TIMEOUT = "Poll timeout (s)"
     STANDBY_CONFIG = "Standby config"
     OPERATING_CONFIG = "Operating config"
-    SHUTDOWN_CONFIG = "Shutdown config"
     FREQUENCY_KHZ = "Frequency (kHz)"
     STATE = "State"
     DEVICE_ENABLED = "Device enabled"
@@ -541,7 +540,6 @@ class AMXDevice(Device):
     poll_timeout_s: float
     standby_config: int
     operating_config: int
-    shutdown_config: int
     frequency_khz: float
     main_state: str
     device_enabled_state: str
@@ -570,7 +568,6 @@ class AMXDevice(Device):
         return {
             "standby_config": self.STANDBY_CONFIG,
             "operating_config": self.OPERATING_CONFIG,
-            "shutdown_config": self.SHUTDOWN_CONFIG,
         }[attr_name]
 
     def _config_setting_value(self, attr_name: str) -> int:
@@ -800,7 +797,6 @@ class AMXDevice(Device):
     def _update_config_controls(self) -> None:
         self._update_config_selector(getattr(self, "standbyConfigCombo", None), "standby_config")
         self._update_config_selector(getattr(self, "operatingConfigCombo", None), "operating_config")
-        self._update_config_selector(getattr(self, "shutdownConfigCombo", None), "shutdown_config")
 
         loaded_text = str(getattr(self, "loaded_config_text", "") or "n/a")
         loaded_tooltip = self._loaded_config_tooltip_text()
@@ -831,7 +827,6 @@ class AMXDevice(Device):
             {
                 "standby_config": "standbyConfigCombo",
                 "operating_config": "operatingConfigCombo",
-                "shutdown_config": "shutdownConfigCombo",
             }[attr_name],
             None,
         )
@@ -1332,19 +1327,6 @@ class AMXDevice(Device):
             attr="operating_config",
             event=self._update_config_controls,
         )
-        settings[f"{self.name}/{self.SHUTDOWN_CONFIG}"] = parameterDict(
-            value=-1,
-            minimum=-1,
-            maximum=255,
-            toolTip=(
-                "Advanced shutdown config index. Use -1 for a full software shutdown "
-                "that disables the AMX before disconnecting."
-            ),
-            parameterType=PARAMETERTYPE.INT,
-            attr="shutdown_config",
-            advanced=True,
-            event=self._update_config_controls,
-        )
         settings[f"{self.name}/{self.FREQUENCY_KHZ}"] = parameterDict(
             value=2.0,
             minimum=0.001,
@@ -1723,7 +1705,7 @@ class AMXChannel(Channel):
         self.displayedParameters.extend([
             self.DUTY, self.FREQ_KHZ, self.ID,
             self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST,
-            self.DISPLAY, self.ACTIVE,
+            self.ACTIVE, self.DISPLAY,
         ])
 
     def initGUI(self, item: dict) -> None:
@@ -1831,6 +1813,34 @@ class AMXChannel(Channel):
         update_display = getattr(super(), "updateDisplay", None)
         if callable(update_display):
             update_display()
+
+    def updateColor(self):
+        """Keep the Display checkbox centered in its column."""
+        color = super().updateColor()
+        try:
+            from PyQt6.QtCore import Qt
+            from PyQt6.QtWidgets import QCheckBox, QSizePolicy
+        except Exception:
+            return color
+
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return color
+        display_param = getter(self.DISPLAY)
+        if display_param is None:
+            return color
+        display_widget = display_param.getWidget()
+        if not isinstance(display_widget, QCheckBox):
+            return color
+        display_widget.setSizePolicy(
+            QSizePolicy.Policy.Maximum,
+            display_widget.sizePolicy().verticalPolicy(),
+        )
+        if hasattr(display_widget, "container") and display_widget.container.layout():
+            display_widget.container.layout().setAlignment(
+                display_widget, Qt.AlignmentFlag.AlignCenter
+            )
+        return color
 
     def realChanged(self) -> None:
         getter = getattr(self, "getParameterByName", None)
@@ -1994,15 +2004,6 @@ class AMXController(DeviceController):
         return kwargs
 
     def _shutdown_kwargs(self) -> dict[str, Any]:
-        shutdown_config = _coerce_int(
-            getattr(self.controllerParent, "shutdown_config", -1),
-            -1,
-        )
-        if shutdown_config >= 0:
-            return {
-                "standby_config": shutdown_config,
-                "disable_device": False,
-            }
         return {}
 
     def _resolved_safety_config(self, attr_name: str) -> int:

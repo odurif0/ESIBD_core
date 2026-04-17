@@ -424,7 +424,7 @@ def test_dmmr_channel_keeps_active_parameter_for_core_init():
             module.Channel.setDisplayedParameters = original_set_displayed
 
     assert "Active" in channel.displayedParameters
-    assert channel.displayedParameters[-1] == "Module"
+    assert channel.displayedParameters[-2:] == ["Module", "Display"]
 
 
 def test_dmmr_channel_marks_reference_as_advanced_only():
@@ -713,6 +713,50 @@ def test_dmmr_channel_init_gui_applies_neutral_display_and_module_styles():
             module.Channel.initGUI = original_init_gui
 
     assert neutral_calls == [True]
+
+
+def test_dmmr_channel_neutralizes_display_and_module_widgets():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    class FakeWidget:
+        def __init__(self):
+            self.styles = []
+            self.container = types.SimpleNamespace(
+                styles=[],
+                setStyleSheet=lambda style: self.container.styles.append(style),
+            )
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeParameter:
+        def __init__(self, widget):
+            self.widget = widget
+
+        def getWidget(self):
+            return self.widget
+
+    display_widget = FakeWidget()
+    module_widget = FakeWidget()
+    parameters = {
+        "Display": FakeParameter(display_widget),
+        "Module": FakeParameter(module_widget),
+    }
+
+    channel = object.__new__(module.DMMRChannel)
+    channel.DISPLAY = "Display"
+    channel.MODULE = "Module"
+    channel.getParameterByName = lambda name: parameters[name]
+
+    module.DMMRChannel._sync_neutral_parameter_styles(channel)
+
+    assert display_widget.styles[-1] == module._DMMR_NEUTRAL_WIDGET_STYLE
+    assert display_widget.container.styles[-1] == module._DMMR_NEUTRAL_WIDGET_STYLE
+    assert module_widget.styles[-1] == module._DMMR_NEUTRAL_WIDGET_STYLE
+    assert module_widget.container.styles[-1] == module._DMMR_NEUTRAL_WIDGET_STYLE
 
 
 def test_dmmr_enabled_toggle_widget_syncs_checked_state_and_style():
