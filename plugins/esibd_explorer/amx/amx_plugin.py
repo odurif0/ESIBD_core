@@ -790,6 +790,9 @@ class AMXDevice(Device):
             return False, "device disconnected"
         if not getattr(controller, "initialized", False):
             return False, "communication not initialized"
+        is_on = getattr(self, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            return False, "AMX is OFF"
         if self._config_setting_value("operating_config") < 0:
             return False, "select a config first"
         return True, ""
@@ -815,8 +818,8 @@ class AMXDevice(Device):
         self._set_action_enabled(button, ready)
         if button is not None and hasattr(button, "setToolTip"):
             tooltip = (
-                "Load the selected AMX config immediately into controller memory. "
-                "If the AMX is ON, runtime timing is reapplied afterwards."
+                "Load the selected AMX config immediately and reapply runtime timing. "
+                "This action is only available while the AMX is ON."
             )
             if not ready and reason:
                 tooltip = f"{tooltip}\nCurrently unavailable: {reason}."
@@ -903,12 +906,13 @@ class AMXDevice(Device):
         return str(getattr(controller, "device_state_summary", "") or "").strip()
 
     def _fpga_disabled_standby_state(self, *, raw_state: str | None = None) -> bool:
-        """Return True when the AMX reports FPGA disabled while the device is OFF.
+        """Return True when the AMX reports FPGA disabled as a standby indication.
 
         On this hardware the vendor state often remains ``STATE_ERR_FPGA_DIS``
         together with ``DEVST_FPGA_DIS`` while a valid standby/off config keeps
         the device disabled. Treat that combination as a standby indication in
-        the plugin UI so operators do not read it as a hard FPGA failure.
+        the plugin UI when the operator currently keeps the AMX OFF, so it is
+        not mistaken for a runtime fault while parked in standby.
         """
         raw_state = (
             _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
@@ -917,17 +921,23 @@ class AMXDevice(Device):
         )
         if raw_state != "STATE_ERR_FPGA_DIS":
             return False
-        device_enabled = _coerce_bool(
-            getattr(self, "device_enabled_state", None),
-            default=None,
-        )
-        if device_enabled is not False:
-            return False
+
+        # If device state flags are empty or only DEVST_FPGA_DIS, this is
+        # a benign standby state -- not a real hardware fault.
         flags = {
             token.upper()
             for token in _status_tokens(self._raw_device_state_summary())
         }
-        return not flags or flags <= {"DEVST_FPGA_DIS"}
+        if not flags or flags <= {"DEVST_FPGA_DIS"}:
+            is_on = getattr(self, "isOn", None)
+            if callable(is_on):
+                return not bool(is_on())
+            return (
+                str(getattr(self, "device_enabled_state", "")).strip().upper()
+                in {"OFF", "FALSE", "0"}
+            )
+
+        return False
 
     def _display_device_state_summary(self) -> str:
         raw_summary = self._raw_device_state_summary()
@@ -999,11 +1009,11 @@ class AMXDevice(Device):
             self._display_device_state_summary(),
             default="n/a",
         )
-        configs = _compact_status_text(
-            getattr(self, "available_configs_text", None),
+        loaded = _compact_status_text(
+            getattr(self, "loaded_config_text", None),
             default="n/a",
         )
-        return f"Device: {device_enabled} | Faults: {faults} | Configs: {configs}"
+        return f"Device: {device_enabled} | Faults: {faults} | Loaded: {loaded}"
 
     def _status_tooltip_text(self) -> str:
         """Return the full AMX status tooltip for the toolbar widgets."""
@@ -1119,6 +1129,7 @@ class AMXDevice(Device):
         )
 
     def _update_channel_column_visibility(self) -> None:
+        """Hide framework columns and configure key columns as user-resizable."""
         if self.tree is None or not self.channels:
             return
 
@@ -1129,6 +1140,23 @@ class AMXDevice(Device):
         ):
             if hidden_name in parameter_names:
                 self.tree.setColumnHidden(parameter_names.index(hidden_name), True)
+
+        # Make key data columns user-resizable with sensible defaults.
+        header_getter = getattr(self.tree, "header", None)
+        header = header_getter() if callable(header_getter) else None
+        if header is not None:
+            for parameter_name, default_width in (
+                (Channel.VALUE, 90),         # Width (us)
+                (self.channelType.DUTY, 65),  # Duty (%)
+                (Channel.MONITOR, 100),       # Duty (Monitor)
+                (self.channelType.FREQ_KHZ, 80),  # Freq (kHz)
+            ):
+                if parameter_name in parameter_names:
+                    col_index = parameter_names.index(parameter_name)
+                    header.setSectionResizeMode(
+                        col_index, type(header).ResizeMode.Interactive
+                    )
+                    header.resizeSection(col_index, default_width)
 
     def _sync_channels(self) -> bool:
         current_items = self._current_channel_items()
@@ -1367,6 +1395,7 @@ class AMXDevice(Device):
         return settings
 
     def frequencyChanged(self) -> None:
+        self._update_width_bounds()
         controller = getattr(self, "controller", None)
         if (
             controller is None
@@ -1378,6 +1407,22 @@ class AMXDevice(Device):
         apply_global = getattr(controller, "applyGlobalSettings", None)
         if callable(apply_global):
             apply_global()
+
+    def _update_width_bounds(self) -> None:
+        """Update Width (us) max bound on all channels based on current frequency."""
+        freq_khz = float(getattr(self, "frequency_khz", 2.0))
+        if freq_khz <= 0:
+            return
+        period_us = 1000.0 / freq_khz
+        for channel in self.getChannels():
+            param = channel.getParameterByName(channel.VALUE)
+            if param is None:
+                continue
+            setattr(param, _PARAMETER_MAX_KEY, period_us)
+            current = _coerce_float(getattr(channel, "value", 0.0), 0.0)
+            if current > period_us:
+                channel.value = period_us
+            channel._update_duty_label()
 
     def _set_on_ui_state(self, on: bool) -> None:
         state = bool(on)
@@ -1583,18 +1628,19 @@ class AMXChannel(Channel):
     DELAY_TICKS = "Delay ticks"
     WIDTH_TICKS = "Width ticks"
     BURST = "Burst"
+    DUTY = "Duty"
+    FREQ_KHZ = "Freq kHz"
     channelParent: AMXDevice
 
     def getDefaultChannel(self) -> dict[str, dict]:
         self.id: int
-        self.delay_ticks: int
+        self.delay_ticks: str
         self.width_ticks: str
         self.burst: str
 
         channel = super().getDefaultChannel()
-        channel[self.VALUE][Parameter.HEADER] = "Duty (%)"
+        channel[self.VALUE][Parameter.HEADER] = "Width (us)"
         channel[self.VALUE][_PARAMETER_MIN_KEY] = 0.0
-        channel[self.VALUE][_PARAMETER_MAX_KEY] = 100.0
         channel[self.VALUE][_PARAMETER_EVENT_KEY] = self.valueChanged
         channel[self.ENABLED][_PARAMETER_ADVANCED_KEY] = False
         channel[self.ENABLED][Parameter.HEADER] = "On"
@@ -1607,7 +1653,23 @@ class AMXChannel(Channel):
         channel[self.SCALING][Parameter.VALUE] = "large"
         monitor_name = getattr(self, "MONITOR", "Monitor")
         if monitor_name in channel:
-            channel[monitor_name][Parameter.HEADER] = "Duty mon"
+            channel[monitor_name][Parameter.HEADER] = "Duty (Monitor)"
+        channel[self.DUTY] = parameterDict(
+            value="n/a",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=False,
+            indicator=True,
+            header="Duty (%)",
+            attr="duty_text",
+        )
+        channel[self.FREQ_KHZ] = parameterDict(
+            value="n/a",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=False,
+            indicator=True,
+            header="Freq (kHz)",
+            attr="freq_khz_text",
+        )
         channel[self.ID] = parameterDict(
             value="0",
             parameterType=PARAMETERTYPE.LABEL,
@@ -1617,22 +1679,19 @@ class AMXChannel(Channel):
             attr="id",
         )
         channel[self.DELAY_TICKS] = parameterDict(
-            value=0,
-            minimum=0,
-            maximum=2147483647,  # int32 max; QSpinBox cannot handle values beyond this range
-            toolTip="Pulser delay register in raw AMX ticks.",
-            parameterType=PARAMETERTYPE.INT,
-            advanced=False,
-            header="Delay",
+            value="n/a",
+            parameterType=PARAMETERTYPE.LABEL,
+            advanced=True,
+            indicator=True,
+            header="Delay (us)",
             attr="delay_ticks",
-            event=self.delayChanged,
         )
         channel[self.WIDTH_TICKS] = parameterDict(
             value="n/a",
             parameterType=PARAMETERTYPE.LABEL,
-            advanced=False,
+            advanced=True,
             indicator=True,
-            header="Width",
+            header="Width ticks",
             attr="width_ticks",
         )
         channel[self.BURST] = parameterDict(
@@ -1647,9 +1706,20 @@ class AMXChannel(Channel):
 
     def setDisplayedParameters(self) -> None:
         super().setDisplayedParameters()
-        if self.OPTIMIZE in getattr(self, "displayedParameters", []):
-            self.displayedParameters.remove(self.OPTIMIZE)
-        self.displayedParameters.extend([self.ID, self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST])
+        # Remove unused columns.
+        for name in (self.OPTIMIZE, self.MIN, self.MAX):
+            if name in getattr(self, "displayedParameters", []):
+                self.displayedParameters.remove(name)
+        # Move display-related columns to the end.
+        for name in (self.DISPLAY, self.ACTIVE):
+            if name in self.displayedParameters:
+                self.displayedParameters.remove(name)
+        # AMX-specific columns before display controls.
+        self.displayedParameters.extend([
+            self.DUTY, self.FREQ_KHZ, self.ID,
+            self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST,
+            self.DISPLAY, self.ACTIVE,
+        ])
 
     def initGUI(self, item: dict) -> None:
         super().initGUI(item)
@@ -1739,7 +1809,7 @@ class AMXChannel(Channel):
     def realChanged(self) -> None:
         getter = getattr(self, "getParameterByName", None)
         if callable(getter):
-            for parameter_name in (self.ID, self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST):
+            for parameter_name in (self.ID, self.DUTY, self.FREQ_KHZ, self.DELAY_TICKS, self.WIDTH_TICKS, self.BURST):
                 parameter = getter(parameter_name)
                 if parameter is not None and hasattr(parameter, "setVisible"):
                     parameter.setVisible(self.real)
@@ -1751,11 +1821,7 @@ class AMXChannel(Channel):
         base_handler = getattr(super(), "valueChanged", None)
         if callable(base_handler):
             base_handler()
-        apply_value = getattr(self, "applyValue", None)
-        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
-            apply_value(apply=True)
-
-    def delayChanged(self) -> None:
+        self._update_duty_label()
         apply_value = getattr(self, "applyValue", None)
         if callable(apply_value) and not getattr(self.channelParent, "loading", False):
             apply_value(apply=True)
@@ -1771,8 +1837,27 @@ class AMXChannel(Channel):
         if callable(apply_value) and not getattr(self.channelParent, "loading", False):
             apply_value(apply=True)
 
+    def _update_duty_label(self) -> None:
+        """Recalculate Duty (%) from current Width (us) and device frequency."""
+        freq_khz = float(getattr(self.channelParent, "frequency_khz", 2.0))
+        period_us = 1000.0 / freq_khz if freq_khz > 0 else 0.0
+        width_us = _coerce_float(getattr(self, "value", 0.0), 0.0)
+        if period_us > 0 and width_us > 0:
+            self.setDutyText(f"{width_us / period_us * 100:.1f}")
+        else:
+            self.setDutyText("0.0")
+
     def setWidthText(self, text: str) -> None:
         self._set_parameter_value_without_events(self.WIDTH_TICKS, text)
+
+    def setDelayText(self, text: str) -> None:
+        self._set_parameter_value_without_events(self.DELAY_TICKS, text)
+
+    def setDutyText(self, text: str) -> None:
+        self._set_parameter_value_without_events(self.DUTY, text)
+
+    def setFreqText(self, text: str) -> None:
+        self._set_parameter_value_without_events(self.FREQ_KHZ, text)
 
     def setBurstText(self, text: str) -> None:
         self._set_parameter_value_without_events(self.BURST, text)
@@ -1797,7 +1882,9 @@ class AMXController(DeviceController):
         self.transitioning = False
         self.transition_target_on: bool | None = None
         self.values: dict[int, float] = {}
+        self.width_us_values: dict[int, str] = {}
         self.width_values: dict[int, str] = {}
+        self.delay_values: dict[int, str] = {}
         self.burst_values: dict[int, str] = {}
 
     def initializeValues(self, reset: bool = False) -> None:
@@ -1807,7 +1894,17 @@ class AMXController(DeviceController):
                 for channel in self.controllerParent.getChannels()
                 if channel.real
             }
+            self.width_us_values = {
+                channel.pulser_number(): "n/a"
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
             self.width_values = {
+                channel.pulser_number(): "n/a"
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.delay_values = {
                 channel.pulser_number(): "n/a"
                 for channel in self.controllerParent.getChannels()
                 if channel.real
@@ -1883,8 +1980,22 @@ class AMXController(DeviceController):
         config_index = _coerce_int(getattr(self.controllerParent, attr_name, -1), -1)
         if config_index >= 0:
             return config_index
-        if any(_coerce_int(config.get("index"), -1) == 0 for config in self.available_configs):
-            return 0
+        exact_matches = [
+            _coerce_int(config.get("index"), -1)
+            for config in self.available_configs
+            if _coerce_bool(config.get("valid"), True)
+            and str(config.get("name", "")).strip().lower() == "standby"
+        ]
+        if exact_matches:
+            return exact_matches[0]
+        partial_matches = [
+            _coerce_int(config.get("index"), -1)
+            for config in self.available_configs
+            if _coerce_bool(config.get("valid"), True)
+            and "standby" in str(config.get("name", "")).strip().lower()
+        ]
+        if len(partial_matches) == 1:
+            return partial_matches[0]
         return -1
 
     def _refresh_available_configs(self) -> None:
@@ -1957,6 +2068,13 @@ class AMXController(DeviceController):
                 flag=PRINT.WARNING,
             )
             return
+        is_on = getattr(self.controllerParent, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            self.print(
+                f"Cannot load {self.controllerParent.name} config while the AMX is OFF.",
+                flag=PRINT.WARNING,
+            )
+            return
 
         config_index = _coerce_int(
             getattr(self.controllerParent, "operating_config", -1),
@@ -2006,15 +2124,10 @@ class AMXController(DeviceController):
             return
 
         pulser = channel.pulser_number()
-        delay_ticks = _coerce_int(getattr(channel, "delay_ticks", 0), 0)
-        device.set_pulser_delay_ticks(pulser, delay_ticks, timeout_s=timeout_s)
-        duty_percent = _coerce_float(getattr(channel, "value", 0.0), 0.0)
-        if channel.enabled and duty_percent > 0.0:
-            device.set_pulser_duty_cycle(
-                pulser,
-                duty_percent / 100.0,
-                timeout_s=timeout_s,
-            )
+        width_us = _coerce_float(getattr(channel, "value", 0.0), 0.0)
+        width_ticks = round(width_us * device.CLOCK / 1e6)
+        if channel.enabled and width_us > 0.0:
+            device.set_pulser_width_ticks(pulser, width_ticks, timeout_s=timeout_s)
         else:
             device.set_pulser_width_ticks(pulser, 0, timeout_s=timeout_s)
 
@@ -2101,8 +2214,12 @@ class AMXController(DeviceController):
         osc_offset = _coerce_int(getattr(self.device, "OSC_OFFSET", 2), 2)
         width_offset = _coerce_int(getattr(self.device, "PULSER_WIDTH_OFFSET", 2), 2)
         total_ticks = oscillator_period + osc_offset
+        ticks_per_us = getattr(self.device, "CLOCK", 100e6) / 1e6  # 100 ticks/us
+
         new_values: dict[int, float] = {}
-        new_widths: dict[int, str] = {}
+        new_width_us: dict[int, str] = {}
+        new_width_ticks: dict[int, str] = {}
+        new_delay_us: dict[int, str] = {}
         new_bursts: dict[int, str] = {}
 
         for pulser_snapshot in snapshot.get("pulsers", []):
@@ -2110,17 +2227,22 @@ class AMXController(DeviceController):
             if pulser < 0:
                 continue
             width_ticks = _coerce_int(pulser_snapshot.get("width_ticks"), 0)
+            delay_ticks = _coerce_int(pulser_snapshot.get("delay_ticks"), 0)
             if total_ticks > 0:
                 duty_percent = ((width_ticks + width_offset) / total_ticks) * 100.0
             else:
                 duty_percent = np.nan
             new_values[pulser] = duty_percent
-            new_widths[pulser] = str(width_ticks)
+            new_width_ticks[pulser] = str(width_ticks)
+            new_width_us[pulser] = f"{width_ticks / ticks_per_us:.2f}"
+            new_delay_us[pulser] = f"{delay_ticks / ticks_per_us:.2f}"
             burst = pulser_snapshot.get("burst")
             new_bursts[pulser] = "n/a" if burst is None else str(burst)
 
         self.values = new_values
-        self.width_values = new_widths
+        self.width_us_values = new_width_us
+        self.width_values = new_width_ticks
+        self.delay_values = new_delay_us
         self.burst_values = new_bursts
         self._sync_status_to_gui()
 
@@ -2158,16 +2280,30 @@ class AMXController(DeviceController):
 
         self._sync_status_to_gui()
         device_is_on = getattr(self.controllerParent, "isOn", lambda: False)()
+        freq_khz = float(getattr(self.controllerParent, "frequency_khz", 2.0))
+        period_us = 1000.0 / freq_khz if freq_khz > 0 else 0.0
+
         for channel in self.controllerParent.getChannels():
             pulser = channel.pulser_number()
             if channel.real and device_is_on:
                 channel.monitor = self.values.get(pulser, np.nan)
                 channel.setWidthText(self.width_values.get(pulser, "n/a"))
+                channel.setDelayText(self.delay_values.get(pulser, "n/a"))
                 channel.setBurstText(self.burst_values.get(pulser, "n/a"))
+                # Software-calculated duty from user width setting.
+                width_us = _coerce_float(getattr(channel, "value", 0.0), 0.0)
+                if period_us > 0 and width_us > 0:
+                    channel.setDutyText(f"{width_us / period_us * 100:.1f}")
+                else:
+                    channel.setDutyText("0.0")
+                channel.setFreqText(f"{freq_khz:.1f}")
             else:
                 channel.monitor = np.nan
                 channel.setWidthText("n/a")
+                channel.setDelayText("n/a")
                 channel.setBurstText("n/a")
+                channel.setDutyText("n/a")
+                channel.setFreqText("n/a")
 
     def toggleOn(self) -> None:
         target_on = bool(getattr(self.controllerParent, "isOn", lambda: False)())
@@ -2192,11 +2328,18 @@ class AMXController(DeviceController):
                     if device is None:
                         self._restore_off_ui_state()
                         return
-                    startup_kwargs = self._startup_kwargs()
-                    if startup_kwargs:
-                        device.initialize(timeout_s=timeout_s, **startup_kwargs)
-                    elif not getattr(device, "connected", False):
-                        device.connect(timeout_s=timeout_s)
+                    initialize = getattr(device, "initialize", None)
+                    if callable(initialize):
+                        initialize(timeout_s=timeout_s, **self._startup_kwargs())
+                    else:
+                        if not getattr(device, "connected", False):
+                            device.connect(timeout_s=timeout_s)
+                        config_index = _coerce_int(
+                            getattr(self.controllerParent, "operating_config", -1),
+                            -1,
+                        )
+                        if config_index >= 0:
+                            device.load_config(config_index, timeout_s=timeout_s)
                     device.set_frequency_khz(
                         float(getattr(self.controllerParent, "frequency_khz", 2.0)),
                         timeout_s=timeout_s,
