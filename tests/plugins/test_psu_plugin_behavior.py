@@ -517,3 +517,53 @@ def test_toggle_on_uses_config_startup_only():
         ("initialize", 9.0, {"standby_config": 1, "operating_config": 2}),
         ("collect_housekeeping", 5.0),
     ]
+
+
+def test_run_initialization_disables_process_backend_for_plugin_runtime(monkeypatch):
+    module = _load_module()
+    captured_kwargs = {}
+
+    class FakeDevice:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            self._process_backend_disabled_reason = ""
+
+        def connect(self, timeout_s=None):
+            captured_kwargs["connect_timeout_s"] = timeout_s
+            return True
+
+        def list_configs(self, timeout_s=None):
+            captured_kwargs["list_configs_timeout_s"] = timeout_s
+            return []
+
+        def collect_housekeeping(self, timeout_s=None):
+            captured_kwargs["collect_housekeeping_timeout_s"] = timeout_s
+            return {
+                "main_state": {"name": "ST_STBY"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "device_enabled": False,
+                "output_enabled": (False, False),
+                "channels": [],
+            }
+
+    monkeypatch.setattr(module, "_get_psu_driver_class", lambda: FakeDevice)
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        com=3,
+        baudrate=230400,
+        connect_timeout_s=5.0,
+        getChannels=lambda: [],
+        _sync_channels=lambda: None,
+        main_state="",
+        output_summary="",
+        available_configs_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.runInitialization()
+
+    assert captured_kwargs["device_id"] == "psu_com3"
+    assert captured_kwargs["logger"] is not None
+    assert captured_kwargs["allow_process_backend"] is False
+    assert captured_kwargs["connect_timeout_s"] == 5.0

@@ -157,6 +157,29 @@ def test_psu_uses_process_backend_when_supported(monkeypatch):
     assert psu._backend.closed is True
 
 
+def test_psu_can_disable_process_backend_explicitly(monkeypatch):
+    monkeypatch.setattr("cgc.psu.psu_base.sys.platform", "win32")
+    monkeypatch.setattr(
+        "cgc.psu.psu_base.ctypes.WinDLL",
+        lambda _path: Mock(),
+        raising=False,
+    )
+    created = []
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):
+            created.append((args, kwargs))
+
+    monkeypatch.setattr("cgc._driver_common.RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr("cgc._driver_common.ControllerProcessProxy", FakeProxy)
+
+    psu = PSU("psu_inline", com=6, allow_process_backend=False)
+
+    assert psu._backend_mode == "inline"
+    assert created == []
+    assert psu._process_backend_disabled_reason == ""
+
+
 def test_connect_rolls_back_when_baud_rate_fails(monkeypatch):
     psu, dll = make_psu(monkeypatch)
     dll.COM_HVPSU2D_Open.return_value = PSUBase.NO_ERR

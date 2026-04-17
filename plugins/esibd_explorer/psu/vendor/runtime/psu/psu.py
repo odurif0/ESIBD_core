@@ -1083,6 +1083,8 @@ class PSU(ProcessIsolatedClientMixin):
         thread_lock: Optional[threading.Lock] = None,
         dll_path: Optional[str] = None,
         log_dir: Optional[Path] = None,
+        allow_process_backend: bool = True,
+        process_backend_disabled_reason: str = "",
         **kwargs,
     ):
         backend_kwargs = {
@@ -1102,4 +1104,6 @@ class PSU(ProcessIsolatedClientMixin):
                 "logger": logger,
                 "thread_lock": thread_lock,
             },
+            allow_process_backend=allow_process_backend,
+            process_backend_disabled_reason=process_backend_disabled_reason,
         )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -1653,6 +1654,8 @@ class PSUController(DeviceController):
                 device_id=f"{self.controllerParent.name.lower()}_com{int(self.controllerParent.com)}",
                 com=int(self.controllerParent.com),
                 baudrate=int(self.controllerParent.baudrate),
+                logger=logging.getLogger(f"esibd.plugins.{self.controllerParent.name.lower()}"),
+                allow_process_backend=False,
             )
             backend_reason = str(
                 getattr(self.device, "_process_backend_disabled_reason", "")
