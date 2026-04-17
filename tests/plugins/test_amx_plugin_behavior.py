@@ -392,6 +392,24 @@ def test_controller_defaults_standby_and_shutdown_to_slot_zero_when_available():
     }
 
 
+def test_controller_ignores_slot_zero_when_it_is_not_a_standby_config():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        standby_config=-1,
+        operating_config=9,
+        shutdown_config=-1,
+    )
+    controller = module.AMXController(parent)
+    controller.available_configs = [
+        {"index": 0, "name": "Static:Out0-3=Hi-Z", "active": True, "valid": True},
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+
+    assert controller._startup_kwargs() == {"operating_config": 9}
+    assert controller._shutdown_kwargs() == {}
+
+
 def test_controller_skips_implicit_slot_zero_when_unavailable():
     module = _load_module()
 
@@ -407,6 +425,36 @@ def test_controller_skips_implicit_slot_zero_when_unavailable():
 
     assert controller._startup_kwargs() == {"operating_config": 9}
     assert controller._shutdown_kwargs() == {}
+
+
+def test_controller_load_now_is_rejected_while_amx_is_off():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.load_calls = []
+
+        def load_config(self, config_index, timeout_s=None):
+            self.load_calls.append((config_index, timeout_s))
+
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        operating_config=9,
+        isOn=lambda: False,
+    )
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    messages = []
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+
+    controller.loadOperatingConfigNow()
+
+    assert controller.device.load_calls == []
+    assert messages == [
+        ("Cannot load AMX config while the AMX is OFF.", module.PRINT.WARNING)
+    ]
 
 
 def test_controller_close_communication_syncs_after_device_is_disposed():

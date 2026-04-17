@@ -763,6 +763,7 @@ def test_status_widgets_summarize_global_amx_state():
     device.main_state = "Disconnected"
     device.device_enabled_state = "OFF"
     device.available_configs_text = "0:Standby; 1:Operate"
+    device.loaded_config_text = "n/a"
     device.controller = types.SimpleNamespace(
         device_state_summary="OK",
         controller_state_summary="CTRL_READY",
@@ -774,7 +775,7 @@ def test_status_widgets_summarize_global_amx_state():
     assert device.statusBadgeLabel.text == "Disconnected"
     assert (
         device.statusSummaryLabel.text
-        == "Device: OFF | Faults: OK | Configs: 0:Standby +1"
+        == "Device: OFF | Faults: OK | Loaded: n/a"
     )
     tooltip = device.statusBadgeLabel.tooltips[-1]
     assert "State: Disconnected" in tooltip
@@ -826,6 +827,7 @@ def test_status_widgets_relabel_fpga_disabled_off_state_as_standby():
     device.main_state = "STATE_ERR_FPGA_DIS"
     device.device_enabled_state = "OFF"
     device.available_configs_text = "0:Standby"
+    device.loaded_config_text = "0:Standby [memory]"
     device.controller = types.SimpleNamespace(
         device_state_summary="DEVST_FPGA_DIS",
         controller_state_summary="CTRL_READY",
@@ -836,7 +838,7 @@ def test_status_widgets_relabel_fpga_disabled_off_state_as_standby():
     assert device.statusBadgeLabel.text == "Standby"
     assert (
         device.statusSummaryLabel.text
-        == "Device: OFF | Faults: Standby / FPGA off | Configs: 0:Standby"
+        == "Device: OFF | Faults: Standby / FPGA off | Loaded: 0:Standby [memory]"
     )
     tooltip = device.statusBadgeLabel.tooltips[-1]
     assert "State: Standby" in tooltip
@@ -1089,6 +1091,7 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     device.standby_config = -1
     device.operating_config = 9
     device.shutdown_config = 0
+    device.isOn = lambda: True
     device.controller = types.SimpleNamespace(
         device=object(),
         initialized=True,
@@ -1220,6 +1223,7 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
     device.standby_config = -1
     device.operating_config = 9
     device.shutdown_config = -1
+    device.isOn = lambda: False
     device.controller = types.SimpleNamespace(
         device=None,
         initialized=False,
@@ -1234,5 +1238,122 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
 
     assert device.loadOperatingConfigButton.enabled is False
     assert "Currently unavailable: device disconnected." in (
+        device.loadOperatingConfigButton.tooltips[-1]
+    )
+
+
+def test_config_controls_disable_load_now_when_amx_is_off():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeSignal:
+        def __init__(self):
+            self.callbacks = []
+
+        def connect(self, callback):
+            self.callbacks.append(callback)
+
+    class FakeCombo:
+        def __init__(self):
+            self.items = []
+            self._current_index = -1
+            self.tooltips = []
+            self.currentIndexChanged = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setMaxVisibleItems(self, _count):
+            return None
+
+        def setSizeAdjustPolicy(self, _policy):
+            return None
+
+        def clear(self):
+            self.items = []
+
+        def addItem(self, text, value=None):
+            self.items.append((text, value))
+
+        def findData(self, value):
+            for index, item in enumerate(self.items):
+                if item[1] == value:
+                    return index
+            return -1
+
+        def itemData(self, index):
+            return self.items[index][1]
+
+        def setCurrentIndex(self, index):
+            self._current_index = index
+
+        def currentIndex(self):
+            return self._current_index
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def blockSignals(self, _blocked):
+            return None
+
+    class FakeButton:
+        def __init__(self, text):
+            self.text = text
+            self.enabled = None
+            self.tooltips = []
+            self.clicked = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+    class FakeLabel:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+
+        def setText(self, text):
+            self.text = text
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+    class FakeTitleBar:
+        def insertWidget(self, _before, _widget):
+            return None
+
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.titleBar = FakeTitleBar()
+    device.titleBarLabel = FakeLabel()
+    device.stretchAction = object()
+    device.available_configs = [{"index": 9, "name": "Operate", "active": True, "valid": True}]
+    device.available_configs_text = "9:Operate"
+    device.loaded_config_text = "n/a"
+    device.standby_config = -1
+    device.operating_config = 9
+    device.shutdown_config = -1
+    device.isOn = lambda: False
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initialized=True,
+        initializing=False,
+        transitioning=False,
+    )
+    device._update_status_widgets = lambda: None
+    device._create_config_selector_widget = lambda: FakeCombo()
+    device._create_config_button_widget = lambda text: FakeButton(text)
+
+    module.AMXDevice._ensure_config_controls(device)
+
+    assert device.loadOperatingConfigButton.enabled is False
+    assert "Currently unavailable: AMX is OFF." in (
         device.loadOperatingConfigButton.tooltips[-1]
     )
