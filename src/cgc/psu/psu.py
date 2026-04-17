@@ -274,8 +274,11 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
 
         The sequence connects to the controller, loads a standby configuration,
         reads back the device and output enable state, and optionally loads an
-        operating configuration. By default, initialize() refuses to continue if
-        the standby configuration leaves either HV output enabled.
+        operating configuration. By default, initialize() guarantees that the
+        standby stage leaves both HV outputs disabled before it continues. If a
+        saved standby configuration brings one of the outputs up, initialize()
+        forces both outputs back OFF, verifies the readback, and only then
+        proceeds or raises.
         """
         timeout_s = self._resolve_io_timeout(timeout_s)
         was_connected = self.connected
@@ -302,10 +305,25 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             }
 
             if require_standby_outputs_disabled and output_enabled != (False, False):
-                raise RuntimeError(
-                    "PSU standby configuration left outputs enabled: "
-                    f"{output_enabled}. Refusing to continue initialization."
+                initialization_state["standby_output_enabled_before_recovery"] = output_enabled
+                self.logger.warning(
+                    "PSU standby configuration %s left outputs enabled %s; "
+                    "forcing both outputs OFF before continuing.",
+                    standby_config,
+                    output_enabled,
                 )
+                self.set_output_enabled(False, False, timeout_s=timeout_s)
+                output_enabled = self.get_output_enabled(timeout_s=timeout_s)
+                initialization_state["output_enabled"] = output_enabled
+                initialization_state["standby_outputs_recovered"] = (
+                    output_enabled == (False, False)
+                )
+                if output_enabled != (False, False):
+                    raise RuntimeError(
+                        "PSU standby configuration left outputs enabled even after "
+                        f"forcing them OFF: {output_enabled}. Refusing to continue "
+                        "initialization."
+                    )
 
             if operating_config is not None:
                 self.load_config(operating_config, timeout_s=timeout_s)

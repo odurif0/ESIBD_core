@@ -33,8 +33,10 @@ apply device enable, PSU enable, range and output setpoints.
 
 `initialize()` connects to the controller, loads the standby configuration,
 checks the device and output enable state, and optionally loads an operating
-configuration. By default it refuses to continue if the standby configuration
-leaves either HV output enabled.
+configuration. By default it guarantees that the standby phase leaves both HV
+outputs OFF before it continues. If the saved standby slot brings one output
+up, `initialize()` forces both outputs back OFF, verifies the readback, and
+only then proceeds or raises.
 
 `shutdown()` drives both channel current and voltage setpoints to `0` before
 disabling the outputs and the device.
@@ -105,6 +107,8 @@ startup_state = psu.initialize(
     operating_config=OPERATING_CONFIG,
 )
 print(startup_state)
+# If standby slot 1 briefly leaves an HV output enabled, initialize() forces
+# both outputs back OFF before it continues to the operating slot.
 try:
     psu.set_channel_voltage(0, 25.0)
     psu.set_channel_current(0, 0.5)

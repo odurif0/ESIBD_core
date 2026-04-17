@@ -11,6 +11,9 @@ def main():
         operating_config=OPERATING_CONFIG,
     )
     print("Startup state:", startup_state)
+    # initialize() now forces both HV outputs back OFF if the saved standby
+    # slot briefly leaves one enabled, then verifies the readback before it
+    # continues to the operating slot.
     # Optional deeper startup check for maintenance or troubleshooting:
     # print("Snapshot:", psu.collect_housekeeping())
     try:
