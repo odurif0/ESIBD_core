@@ -343,7 +343,59 @@ def test_initialize_can_stop_after_standby_checks(monkeypatch):
     ]
 
 
-def test_initialize_rejects_standby_configs_that_leave_outputs_enabled(monkeypatch):
+def test_initialize_forces_standby_outputs_off_before_continuing(monkeypatch):
+    psu, _dll = make_psu(monkeypatch)
+    backend = object.__getattribute__(psu, "_backend")
+    calls = []
+
+    def fake_connect(timeout_s=5.0):
+        backend.connected = True
+        calls.append(("connect", timeout_s))
+        return True
+
+    monkeypatch.setattr(backend, "connect", fake_connect)
+    monkeypatch.setattr(
+        backend,
+        "load_config",
+        lambda config_number, timeout_s=None: calls.append(
+            ("load_config", config_number, timeout_s)
+        ),
+    )
+    monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: True)
+    output_reads = iter(((True, False), (False, False)))
+    monkeypatch.setattr(
+        backend,
+        "get_output_enabled",
+        lambda timeout_s=None: calls.append(("get_output_enabled", timeout_s))
+        or next(output_reads),
+    )
+    monkeypatch.setattr(
+        backend,
+        "set_output_enabled",
+        lambda psu0, psu1, timeout_s=None: calls.append(
+            ("set_output_enabled", psu0, psu1, timeout_s)
+        ),
+    )
+
+    result = backend.initialize(timeout_s=2.0, standby_config=1)
+
+    assert result == {
+        "standby_config": 1,
+        "device_enabled": True,
+        "output_enabled": (False, False),
+        "standby_output_enabled_before_recovery": (True, False),
+        "standby_outputs_recovered": True,
+    }
+    assert calls == [
+        ("connect", 2.0),
+        ("load_config", 1, 2.0),
+        ("get_output_enabled", 2.0),
+        ("set_output_enabled", False, False, 2.0),
+        ("get_output_enabled", 2.0),
+    ]
+
+
+def test_initialize_rejects_standby_configs_that_stay_enabled_after_recovery(monkeypatch):
     psu, _dll = make_psu(monkeypatch)
     backend = object.__getattribute__(psu, "_backend")
 
@@ -355,12 +407,15 @@ def test_initialize_rejects_standby_configs_that_leave_outputs_enabled(monkeypat
     monkeypatch.setattr(backend, "load_config", lambda config_number, timeout_s=None: None)
     monkeypatch.setattr(backend, "get_device_enabled", lambda timeout_s=None: True)
     monkeypatch.setattr(
-        backend, "get_output_enabled", lambda timeout_s=None: (True, False)
+        backend,
+        "get_output_enabled",
+        lambda timeout_s=None: (True, False),
     )
+    monkeypatch.setattr(backend, "set_output_enabled", lambda *args, **kwargs: None)
     shutdown = Mock(return_value=True)
     monkeypatch.setattr(backend, "shutdown", shutdown)
 
-    with pytest.raises(RuntimeError, match="left outputs enabled"):
+    with pytest.raises(RuntimeError, match="even after forcing them OFF"):
         backend.initialize(timeout_s=2.0, standby_config=1)
 
     shutdown.assert_called_once_with(timeout_s=2.0)
