@@ -1032,6 +1032,7 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                 "sequence."
             )
 
+        standby_loaded = False
         if self.connected and standby_config is not None:
             try:
                 self._call_with_optional_timeout(
@@ -1039,11 +1040,15 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
                     standby_config,
                     timeout_s=timeout_s,
                 )
+                standby_loaded = True
             except Exception as exc:  # noqa: BLE001
                 self._append_shutdown_error(
                     errors, f"load_config({standby_config})", exc
                 )
-        if self.connected and disable_device:
+        should_disable_device = disable_device or (
+            standby_config is not None and not standby_loaded
+        )
+        if self.connected and should_disable_device:
             try:
                 self._call_with_optional_timeout(
                     self.set_device_enabled,

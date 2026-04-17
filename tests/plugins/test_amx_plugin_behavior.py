@@ -307,9 +307,13 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
             self.initialize_calls = []
             self.frequency_calls = []
             self.enable_calls = []
+            self.load_calls = []
 
         def initialize(self, timeout_s=None, **kwargs):
             self.initialize_calls.append((timeout_s, kwargs))
+
+        def load_config(self, config_index, timeout_s=None):
+            self.load_calls.append((config_index, timeout_s))
 
         def set_frequency_khz(self, value, timeout_s=None):
             self.frequency_calls.append((value, timeout_s))
@@ -355,10 +359,14 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
     controller = module.AMXController(parent)
     controller.device = FakeDevice()
     controller.initialized = True
+    controller.available_configs = [
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
 
     controller.toggleOn()
 
     assert controller.device.initialize_calls == [(7.5, {"operating_config": 9})]
+    assert controller.device.load_calls == []
     assert controller.device.frequency_calls == [(2.0, 7.5)]
     assert controller.device.enable_calls == [(True, 7.5)]
     assert controller.loaded_config_text == "9:Operate [memory]"
@@ -366,6 +374,137 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
     assert controller.main_state == "ST_ON"
     assert parent.main_state == "ST_ON"
     assert sync_calls
+
+
+def test_controller_toggle_on_waits_for_state_on_after_enable():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.initialize_calls = []
+            self.load_calls = []
+            self.frequency_calls = []
+            self.enable_calls = []
+            self.snapshot_calls = 0
+
+        def initialize(self, timeout_s=None, **kwargs):
+            self.initialize_calls.append((timeout_s, kwargs))
+
+        def load_config(self, config_index, timeout_s=None):
+            self.load_calls.append((config_index, timeout_s))
+
+        def set_frequency_khz(self, value, timeout_s=None):
+            self.frequency_calls.append((value, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            self.enable_calls.append((enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            self.snapshot_calls += 1
+            if self.snapshot_calls == 1:
+                return {
+                    "device_enabled": False,
+                    "main_state": {"name": "STATE_ERR_FPGA_DIS"},
+                    "device_state": {"flags": ["DEVST_FPGA_DIS"]},
+                    "controller_state": {"flags": []},
+                    "oscillator": {"period": 100000},
+                    "pulsers": [],
+                }
+            return {
+                "device_enabled": True,
+                "main_state": {"name": "STATE_ON"},
+                "device_state": {"flags": ["DEVST_OK"]},
+                "controller_state": {"flags": []},
+                "oscillator": {"period": 100000},
+                "pulsers": [],
+            }
+
+        def get_status(self):
+            return {
+                "memory_config": 9,
+                "memory_config_name": "Operate",
+                "memory_config_source": "memory",
+            }
+
+    messages = []
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        poll_timeout_s=2.5,
+        frequency_khz=2.0,
+        operating_config=9,
+        standby_config=-1,
+        getChannels=lambda: [],
+        isOn=lambda: True,
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+        loaded_config_text="",
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.available_configs = [
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+    original_sleep = module.time.sleep
+    module.time.sleep = lambda _seconds: None
+
+    try:
+        controller.toggleOn()
+    finally:
+        module.time.sleep = original_sleep
+
+    assert controller.device.initialize_calls == [(7.5, {"operating_config": 9})]
+    assert controller.device.load_calls == []
+    assert controller.device.frequency_calls == [(2.0, 7.5)]
+    assert controller.device.enable_calls == [(True, 7.5)]
+    assert messages == [("AMX timing enabled.", None)]
+    assert controller.main_state == "STATE_ON"
+    assert controller.device_enabled_state == "ON"
+
+
+def test_controller_toggle_on_requires_operating_config():
+    module = _load_module()
+
+    class FakeDevice:
+        def initialize(self, timeout_s=None, **kwargs):
+            raise AssertionError("initialize should not run without an operating config")
+
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        poll_timeout_s=2.5,
+        frequency_khz=2.0,
+        operating_config=-1,
+        standby_config=-1,
+        getChannels=lambda: [],
+        isOn=lambda: True,
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    restored = []
+    messages = []
+    controller._restore_off_ui_state = lambda: restored.append(True)
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+
+    controller.toggleOn()
+
+    assert restored == [True]
+    assert messages == [
+        (
+            "Cannot start AMX: select an AMX config first.",
+            module.PRINT.WARNING,
+        )
+    ]
 
 
 def test_controller_defaults_standby_to_slot_zero_when_available():
@@ -385,14 +524,17 @@ def test_controller_defaults_standby_to_slot_zero_when_available():
         "standby_config": 0,
         "operating_config": 9,
     }
-    assert controller._shutdown_kwargs() == {}
+    assert controller._shutdown_kwargs() == {
+        "standby_config": 0,
+        "disable_device": False,
+    }
 
 
-def test_controller_shutdown_kwargs_are_always_empty():
+def test_controller_shutdown_kwargs_use_explicit_standby_slot_when_valid():
     module = _load_module()
 
     parent = types.SimpleNamespace(
-        standby_config=-1,
+        standby_config=0,
         operating_config=9,
     )
     controller = module.AMXController(parent)
@@ -401,7 +543,10 @@ def test_controller_shutdown_kwargs_are_always_empty():
         {"index": 9, "name": "Operate", "active": True, "valid": True},
     ]
 
-    assert controller._shutdown_kwargs() == {}
+    assert controller._shutdown_kwargs() == {
+        "standby_config": 0,
+        "disable_device": False,
+    }
 
 
 def test_controller_ignores_slot_zero_when_it_is_not_a_standby_config():
@@ -467,6 +612,47 @@ def test_controller_load_now_is_rejected_while_amx_is_off():
     ]
 
 
+def test_controller_load_now_requires_operating_config():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        operating_config=-1,
+        isOn=lambda: True,
+    )
+    controller = module.AMXController(parent)
+    controller.device = object()
+    controller.initialized = True
+    messages = []
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+
+    controller.loadOperatingConfigNow()
+
+    assert messages == [
+        (
+            "Cannot load AMX config: select an AMX config first.",
+            module.PRINT.WARNING,
+        )
+    ]
+
+
+def test_amx_acquisition_readiness_accepts_state_on():
+    module = _load_module()
+
+    device = object.__new__(module.AMXDevice)
+    device.isOn = lambda: True
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=True,
+        transitioning=False,
+        main_state="STATE_ON",
+    )
+
+    assert module.AMXDevice._acquisition_readiness(device) == (True, "")
+
+
 def test_controller_close_communication_syncs_after_device_is_disposed():
     module = _load_module()
 
@@ -529,6 +715,52 @@ def test_controller_shutdown_uses_full_software_shutdown():
 
     assert controller.device is None
     assert device.shutdown_calls == [(7.5, {})]
+
+
+def test_controller_shutdown_parks_standby_before_disconnect_when_available():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.shutdown_calls = []
+
+        def shutdown(self, timeout_s=None, **kwargs):
+            self.shutdown_calls.append((timeout_s, kwargs))
+            return True
+
+        def disconnect(self):
+            return None
+
+        def close(self):
+            return None
+
+    messages = []
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        standby_config=-1,
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+    controller = module.AMXController(parent)
+    controller.available_configs = [
+        {"index": 0, "name": "Standby", "active": True, "valid": True},
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+
+    controller.shutdownCommunication()
+
+    assert controller.device is None
+    assert messages[:2] == [
+        ("Starting AMX shutdown sequence.", None),
+        ("Parking AMX in standby config 0 before disconnect.", None),
+    ]
+    assert messages[-1] == ("AMX shutdown sequence completed.", None)
+    assert controller.device is None
+    assert controller.initialized is False
 
 
 def test_amx_controller_lock_section_uses_raw_lock_and_propagates_errors():

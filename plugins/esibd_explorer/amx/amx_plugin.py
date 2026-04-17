@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from threading import Thread
 from typing import Any, cast
@@ -127,6 +128,11 @@ def _status_requires_operator_attention(state: Any) -> bool:
         token in normalized
         for token in ("err", "error", "fail", "fault", "lost", "overload", "timeout", "unknown")
     )
+
+
+def _state_is_on(state: Any) -> bool:
+    normalized = _normalize_runtime_state(state).strip().upper()
+    return normalized in {"ST_ON", "STATE_ON"}
 
 
 def _action_label(action: Any) -> str:
@@ -1320,8 +1326,9 @@ class AMXDevice(Device):
             minimum=-1,
             maximum=255,
             toolTip=(
-                "AMX config used for normal operation. Use -1 to drive the AMX directly "
-                "from software without loading a stored controller config."
+                "AMX config used for normal operation. Use -1 to keep the controller "
+                "connected but leave the AMX in standby until a valid operating "
+                "config is selected."
             ),
             parameterType=PARAMETERTYPE.INT,
             attr="operating_config",
@@ -1443,7 +1450,7 @@ class AMXDevice(Device):
         if not callable(is_on) or not bool(is_on()):
             return False, "device is OFF"
         main_state = str(getattr(controller, "main_state", "Disconnected") or "Disconnected")
-        if main_state != "ST_ON":
+        if not _state_is_on(main_state):
             return False, f"state is {main_state}"
         return True, ""
 
@@ -2004,7 +2011,23 @@ class AMXController(DeviceController):
         return kwargs
 
     def _shutdown_kwargs(self) -> dict[str, Any]:
-        return {}
+        standby_config = self._resolved_safety_config("standby_config")
+        if standby_config < 0:
+            return {}
+
+        entry = self._config_entry_by_index(standby_config)
+        if entry is not None:
+            if not _coerce_bool(entry.get("valid"), True):
+                return {}
+            if not self._config_entry_is_standby_like(entry):
+                return {}
+        elif self.available_configs:
+            return {}
+
+        return {
+            "standby_config": standby_config,
+            "disable_device": False,
+        }
 
     def _resolved_safety_config(self, attr_name: str) -> int:
         config_index = _coerce_int(getattr(self.controllerParent, attr_name, -1), -1)
@@ -2080,6 +2103,137 @@ class AMXController(DeviceController):
 
         self.loaded_config_text = _format_loaded_config_text(status)
 
+    def _selected_operating_config_index(self) -> int:
+        return _coerce_int(
+            getattr(self.controllerParent, "operating_config", -1),
+            -1,
+        )
+
+    def _config_entry_by_index(self, config_index: int) -> dict[str, Any] | None:
+        for entry in self.available_configs:
+            if _coerce_int(entry.get("index"), -1) == config_index:
+                return entry
+        return None
+
+    def _config_entry_is_standby_like(self, entry: dict[str, Any] | None) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        name = str(entry.get("name", "") or "").strip().lower()
+        return bool(name) and "standby" in name
+
+    def _operating_config_ready(self) -> tuple[bool, str, int]:
+        config_index = self._selected_operating_config_index()
+        if config_index < 0:
+            return False, "select an AMX config first", config_index
+
+        entry = self._config_entry_by_index(config_index)
+        if entry is not None:
+            if not _coerce_bool(entry.get("valid"), True):
+                return (
+                    False,
+                    f"config {config_index} is marked invalid on the controller",
+                    config_index,
+                )
+            if not _coerce_bool(entry.get("active"), True):
+                return (
+                    False,
+                    f"config {config_index} is inactive on the controller",
+                    config_index,
+                )
+            if self._config_entry_is_standby_like(entry):
+                return False, f"config {config_index} is a standby slot", config_index
+        elif self.available_configs:
+            return (
+                False,
+                f"config {config_index} is not reported by the controller",
+                config_index,
+            )
+
+        return True, "", config_index
+
+    def _apply_runtime_settings(self, timeout_s: float) -> None:
+        device = self.device
+        if device is None:
+            return
+        device.set_frequency_khz(
+            float(getattr(self.controllerParent, "frequency_khz", 2.0)),
+            timeout_s=timeout_s,
+        )
+        for channel in self.controllerParent.getChannels():
+            self._apply_channel_timing(channel, timeout_s)
+
+    def _startup_snapshot_timeout_s(self) -> float:
+        return float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+
+    def _collect_startup_snapshot(self) -> dict[str, Any]:
+        device = self.device
+        if device is None:
+            raise RuntimeError("AMX device disconnected.")
+        return device.collect_housekeeping(timeout_s=self._startup_snapshot_timeout_s())
+
+    def _startup_snapshot_ready(self, snapshot: dict[str, Any]) -> bool:
+        state = str(snapshot.get("main_state", {}).get("name", "") or "")
+        return bool(snapshot.get("device_enabled", False)) and _state_is_on(state)
+
+    def _startup_failure_message(
+        self,
+        *,
+        config_index: int,
+        snapshot: dict[str, Any],
+    ) -> str:
+        state = str(snapshot.get("main_state", {}).get("name", "Unknown") or "Unknown")
+        flags = snapshot.get("device_state", {}).get("flags", [])
+        flags_text = ", ".join(str(flag) for flag in flags) if flags else "n/a"
+        device_enabled = "ON" if bool(snapshot.get("device_enabled", False)) else "OFF"
+        return (
+            f"AMX did not reach STATE_ON after loading config {config_index}: "
+            f"state={state}, device={device_enabled}, flags={flags_text}."
+        )
+
+    def _wait_for_startup_ready_snapshot(
+        self,
+        *,
+        config_index: int,
+        settle_timeout_s: float,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + max(float(settle_timeout_s), 0.1)
+        latest_snapshot: dict[str, Any] | None = None
+        while True:
+            snapshot = self._collect_startup_snapshot()
+            latest_snapshot = snapshot
+            self._apply_snapshot(snapshot)
+            if self._startup_snapshot_ready(snapshot):
+                return snapshot
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    self._startup_failure_message(
+                        config_index=config_index,
+                        snapshot=latest_snapshot,
+                    )
+                )
+            time.sleep(0.1)
+
+    def _enable_after_config_load(
+        self,
+        *,
+        config_index: int,
+        timeout_s: float,
+        load_config_first: bool,
+    ) -> dict[str, Any]:
+        device = self.device
+        if device is None:
+            raise RuntimeError("AMX device disconnected.")
+
+        if load_config_first:
+            device.load_config(config_index, timeout_s=timeout_s)
+            self._refresh_loaded_config_status()
+        self._apply_runtime_settings(timeout_s)
+        device.set_device_enabled(True, timeout_s=timeout_s)
+        return self._wait_for_startup_ready_snapshot(
+            config_index=config_index,
+            settle_timeout_s=timeout_s,
+        )
+
     def loadOperatingConfigNowFromThread(self, parallel: bool = True) -> None:
         if parallel:
             Thread(
@@ -2106,13 +2260,10 @@ class AMXController(DeviceController):
             )
             return
 
-        config_index = _coerce_int(
-            getattr(self.controllerParent, "operating_config", -1),
-            -1,
-        )
-        if config_index < 0:
+        ready, reason, config_index = self._operating_config_ready()
+        if not ready:
             self.print(
-                f"Cannot load {self.controllerParent.name} config: select a valid slot first.",
+                f"Cannot load {self.controllerParent.name} config: {reason}.",
                 flag=PRINT.WARNING,
             )
             return
@@ -2125,16 +2276,11 @@ class AMXController(DeviceController):
                 device = self.device
                 if device is None:
                     return
-                device.load_config(config_index, timeout_s=timeout_s)
-                self._refresh_loaded_config_status()
-                if bool(getattr(self.controllerParent, "isOn", lambda: False)()):
-                    device.set_frequency_khz(
-                        float(getattr(self.controllerParent, "frequency_khz", 2.0)),
-                        timeout_s=timeout_s,
-                    )
-                    for channel in self.controllerParent.getChannels():
-                        self._apply_channel_timing(channel, timeout_s)
-                    device.set_device_enabled(True, timeout_s=timeout_s)
+                self._enable_after_config_load(
+                    config_index=config_index,
+                    timeout_s=timeout_s,
+                    load_config_first=True,
+                )
             self._update_state()
             self.print(f"Loaded AMX config {config_index}.")
         except TimeoutError:
@@ -2351,6 +2497,14 @@ class AMXController(DeviceController):
 
         try:
             if target_on:
+                ready, reason, config_index = self._operating_config_ready()
+                if not ready:
+                    self._restore_off_ui_state()
+                    self.print(
+                        f"Cannot start {self.controllerParent.name}: {reason}.",
+                        flag=PRINT.WARNING,
+                    )
+                    return
                 with self._controller_lock_section(
                     "Could not acquire lock to start the AMX."
                 ):
@@ -2364,19 +2518,13 @@ class AMXController(DeviceController):
                     else:
                         if not getattr(device, "connected", False):
                             device.connect(timeout_s=timeout_s)
-                        config_index = _coerce_int(
-                            getattr(self.controllerParent, "operating_config", -1),
-                            -1,
-                        )
                         if config_index >= 0:
                             device.load_config(config_index, timeout_s=timeout_s)
-                    device.set_frequency_khz(
-                        float(getattr(self.controllerParent, "frequency_khz", 2.0)),
+                    self._enable_after_config_load(
+                        config_index=config_index,
                         timeout_s=timeout_s,
+                        load_config_first=False,
                     )
-                    for channel in self.controllerParent.getChannels():
-                        self._apply_channel_timing(channel, timeout_s)
-                    device.set_device_enabled(True, timeout_s=timeout_s)
                     self._refresh_loaded_config_status()
                 self._update_state()
                 start_acquisition = getattr(self, "startAcquisition", None)
@@ -2409,10 +2557,16 @@ class AMXController(DeviceController):
             stop_acquisition()
             self.acquiring = False
         self.print("Starting AMX shutdown sequence.")
+        shutdown_kwargs = self._shutdown_kwargs()
+        standby_config = shutdown_kwargs.get("standby_config")
+        if isinstance(standby_config, int) and standby_config >= 0:
+            self.print(
+                f"Parking AMX in standby config {standby_config} before disconnect."
+            )
         try:
             device.shutdown(
                 timeout_s=float(getattr(self.controllerParent, "startup_timeout_s", 10.0)),
-                **self._shutdown_kwargs(),
+                **shutdown_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
