@@ -31,16 +31,14 @@ including the PSU driver files and vendor DLL.
 - `Connect timeout (s)`: timeout used to establish the transport.
 - `Startup timeout (s)`: timeout used for ON/OFF startup and shutdown sequences.
 - `Poll timeout (s)`: timeout used for periodic housekeeping reads.
-- `Standby config`: standby slot loaded on ON. Use `-1` to skip.
-- `Operating config`: optional operating slot loaded after standby. Use `-1` to skip.
-- `Shutdown config`: optional slot loaded on OFF. Use `-1` to use software shutdown.
+- `Standby config`: advanced standby slot loaded on ON. Use `-1` to skip.
+- `Operating config`: PSU config exposed directly in the plugin toolbar.
+- `Shutdown config`: advanced slot loaded on OFF. Use `-1` to use software shutdown.
 - `Available configs`: live list of config slots reported by the connected PSU.
 
 Toolbar notes:
 
-- `Available`: list of config slots currently reported by the controller.
-- `Standby`: selector for the slot loaded first during `ON`.
-- `Operating`: selector for the optional slot loaded after standby.
+- `Config`: main PSU config selector shown directly in the toolbar.
 - `HV outputs`: CH0/CH1 enable readback, not the measured voltage value.
 - `Device flags`: low-level PSU state flags reported by the controller.
 
@@ -48,7 +46,7 @@ The plugin keeps a fixed 2-channel layout matching the physical PSU outputs.
 It is intentionally not a free-form PSU editor. The normal workflow is:
 
 1. press `ON`
-2. the plugin runs `initialize()` with the configured standby/operating slots
+2. the plugin runs `initialize()` with the advanced standby slot plus the selected toolbar config
 3. the UI displays controller readbacks only
 4. press `OFF` to run `shutdown()`
 

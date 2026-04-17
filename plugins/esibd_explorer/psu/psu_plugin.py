@@ -851,7 +851,7 @@ class PSUDevice(Device):
         if (
             getattr(self, "titleBar", None) is None
             or getattr(self, "titleBarLabel", None) is None
-            or hasattr(self, "availableConfigsValueLabel")
+            or hasattr(self, "operatingConfigCombo")
         ):
             return
 
@@ -861,26 +861,11 @@ class PSUDevice(Device):
             "stretchAction",
             None,
         )
-        self.availableConfigsLabel = label_type("Available:")
-        self.availableConfigsValueLabel = label_type("")
-        self.standbyConfigLabel = label_type("Standby:")
-        self.standbyConfigCombo = self._create_config_selector_widget()
-        self.operatingConfigLabel = label_type("Operating:")
+        self.operatingConfigLabel = label_type("Config:")
         self.operatingConfigCombo = self._create_config_selector_widget()
-        if hasattr(self.availableConfigsLabel, "setObjectName"):
-            self.availableConfigsLabel.setObjectName(f"{self.name}ConfigsLabel")
-        if hasattr(self.availableConfigsValueLabel, "setObjectName"):
-            self.availableConfigsValueLabel.setObjectName(f"{self.name}ConfigsValue")
-        if hasattr(self.availableConfigsValueLabel, "setStyleSheet"):
-            self.availableConfigsValueLabel.setStyleSheet("QLabel { padding-left: 4px; }")
-        self._connect_config_selector(self.standbyConfigCombo, "standby_config")
         self._connect_config_selector(self.operatingConfigCombo, "operating_config")
         if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
             for attr_name, widget in (
-                ("availableConfigsAction", self.availableConfigsLabel),
-                ("availableConfigsValueAction", self.availableConfigsValueLabel),
-                ("standbyConfigAction", self.standbyConfigLabel),
-                ("standbyConfigComboAction", self.standbyConfigCombo),
                 ("operatingConfigAction", self.operatingConfigLabel),
                 ("operatingConfigComboAction", self.operatingConfigCombo),
             ):
@@ -891,39 +876,18 @@ class PSUDevice(Device):
                 )
         elif hasattr(self.titleBar, "addWidget"):
             for attr_name, widget in (
-                ("availableConfigsAction", self.availableConfigsLabel),
-                ("availableConfigsValueAction", self.availableConfigsValueLabel),
-                ("standbyConfigAction", self.standbyConfigLabel),
-                ("standbyConfigComboAction", self.standbyConfigCombo),
                 ("operatingConfigAction", self.operatingConfigLabel),
                 ("operatingConfigComboAction", self.operatingConfigCombo),
             ):
                 setattr(self, attr_name, self.titleBar.addWidget(widget))
         else:
-            self.availableConfigsAction = None
-            self.availableConfigsValueAction = None
-            self.standbyConfigAction = None
-            self.standbyConfigComboAction = None
             self.operatingConfigAction = None
             self.operatingConfigComboAction = None
 
         self._update_config_selectors()
 
     def _update_config_selectors(self) -> None:
-        label = getattr(self, "availableConfigsLabel", None)
-        value_label = getattr(self, "availableConfigsValueLabel", None)
-        if value_label is not None:
-            text = self._config_list_text()
-            tooltip = self._config_list_tooltip_text()
-            if hasattr(value_label, "setText"):
-                value_label.setText(text)
-            if hasattr(value_label, "setToolTip"):
-                value_label.setToolTip(tooltip)
-            if label is not None and hasattr(label, "setToolTip"):
-                label.setToolTip(tooltip)
-
         for attr_name, combo_attr, label_attr in (
-            ("standby_config", "standbyConfigCombo", "standbyConfigLabel"),
             ("operating_config", "operatingConfigCombo", "operatingConfigLabel"),
         ):
             combo = getattr(self, combo_attr, None)
@@ -956,14 +920,11 @@ class PSUDevice(Device):
                     block_signals(False)
 
     def _config_selector_changed(self, attr_name: str) -> None:
-        combo = getattr(
-            self,
-            {
-                "standby_config": "standbyConfigCombo",
-                "operating_config": "operatingConfigCombo",
-            }[attr_name],
-            None,
-        )
+        combo_attr = {
+            "standby_config": "standbyConfigCombo",
+            "operating_config": "operatingConfigCombo",
+        }.get(attr_name)
+        combo = getattr(self, combo_attr, None) if combo_attr is not None else None
         if combo is None:
             return
         if self._set_config_setting_value(attr_name, self._combo_current_value(combo)):
@@ -1288,13 +1249,14 @@ class PSUDevice(Device):
             toolTip="Startup standby config index. Use -1 to skip config loading.",
             parameterType=PARAMETERTYPE.INT,
             attr="standby_config",
+            advanced=True,
             event=self._update_config_selectors,
         )
         settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
             value=-1,
             minimum=_PSU_FLOAT_SENTINEL,
             maximum=255,
-            toolTip="Optional operating config index applied after standby. Use -1 to skip.",
+            toolTip="PSU config exposed in the plugin toolbar. Applied after standby during ON. Use -1 to skip.",
             parameterType=PARAMETERTYPE.INT,
             attr="operating_config",
             event=self._update_config_selectors,
@@ -1306,6 +1268,7 @@ class PSUDevice(Device):
             toolTip="Optional shutdown config index. Use -1 to disable config-based shutdown.",
             parameterType=PARAMETERTYPE.INT,
             attr="shutdown_config",
+            advanced=True,
             event=self._update_config_selectors,
         )
         settings[f"{self.name}/{self.STATE}"] = parameterDict(

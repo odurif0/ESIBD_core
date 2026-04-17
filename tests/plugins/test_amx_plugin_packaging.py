@@ -212,7 +212,7 @@ def test_amx_plugin_exposes_expected_metadata():
         assert image.size == (128, 128)
 
 
-def test_amx_plugin_defaults_to_direct_software_drive_without_operating_config():
+def test_amx_plugin_defaults_to_standby_until_operating_config_is_selected():
     _clear_test_modules()
     _install_esibd_stubs()
 
@@ -234,9 +234,8 @@ def test_amx_plugin_defaults_to_direct_software_drive_without_operating_config()
             module.Device.getDefaultSettings = original_settings
 
     assert settings["AMX/Operating config"][module.Parameter.VALUE] == -1
-    assert "without loading a stored controller config" in settings["AMX/Operating config"][
-        module.Parameter.TOOLTIP
-    ]
+    tooltip = settings["AMX/Operating config"][module.Parameter.TOOLTIP]
+    assert "leave the AMX in standby" in tooltip or "leave the controller connected" in tooltip
     assert settings["AMX/Available configs"][module.Parameter.VALUE] == "n/a"
     assert "reported by the controller after connect" in settings["AMX/Available configs"][
         module.Parameter.TOOLTIP

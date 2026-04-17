@@ -727,28 +727,15 @@ def test_config_controls_show_available_configs():
 
     module.PSUDevice._ensure_config_selectors(device)
 
-    assert len(device.titleBar.inserted) == 6
-    assert device.availableConfigsLabel.text == "Available:"
-    assert device.availableConfigsValueLabel.text == "1:Standby; 7:Operate 5 kV"
-    assert device.standbyConfigLabel.text == "Standby:"
-    assert device.standbyConfigCombo.items == [
-        ("Skip (-1)", -1),
-        ("1:Standby", 1),
-        ("7:Operate 5 kV", 7),
-    ]
-    assert device.standbyConfigCombo.currentIndex() == 1
-    assert device.operatingConfigLabel.text == "Operating:"
+    assert len(device.titleBar.inserted) == 2
+    assert device.operatingConfigLabel.text == "Config:"
     assert device.operatingConfigCombo.items == [
         ("Skip (-1)", -1),
         ("1:Standby", 1),
         ("7:Operate 5 kV", 7),
     ]
     assert device.operatingConfigCombo.currentIndex() == 2
-    assert (
-        device.availableConfigsValueLabel.tooltips[-1]
-        == "Available PSU configs:\n1:Standby; 7:Operate 5 kV"
-    )
-    assert "Available PSU configs:" in device.standbyConfigCombo.tooltips[-1]
+    assert "Available PSU configs:" in device.operatingConfigCombo.tooltips[-1]
 
 
 def test_psu_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):

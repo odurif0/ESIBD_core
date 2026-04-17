@@ -617,6 +617,21 @@ def test_shutdown_can_load_explicit_standby_config_without_disable_step(monkeypa
     amx.disconnect.assert_called_once()
 
 
+def test_shutdown_falls_back_to_disable_device_when_standby_load_fails(monkeypatch):
+    amx, _dll = make_amx(monkeypatch)
+    amx.connected = True
+    monkeypatch.setattr(amx, "load_config", Mock(side_effect=RuntimeError("boom")))
+    monkeypatch.setattr(amx, "set_device_enabled", Mock())
+    monkeypatch.setattr(amx, "disconnect", Mock(return_value=True))
+
+    with pytest.raises(RuntimeError, match="load_config\\(5\\): boom"):
+        amx.shutdown(standby_config=5, disable_device=False)
+
+    amx.load_config.assert_called_once_with(5)
+    amx.set_device_enabled.assert_called_once_with(False)
+    amx.disconnect.assert_called_once()
+
+
 def test_amx_critical_operations_use_timeout_safe_wrapper(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     backend = object.__getattribute__(amx, "_backend")
