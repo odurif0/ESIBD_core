@@ -204,6 +204,31 @@ def _invoke_gui_callback(callback: Any) -> None:
         callback()
 
 
+def _disable_spinbox_wheel(widget: Any) -> None:
+    """Prevent accidental mouse-wheel edits on hardware-facing spinboxes."""
+    install_filter = getattr(widget, "installEventFilter", None)
+    if not callable(install_filter) or getattr(widget, "_esibd_wheel_event_blocker", None):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QEvent
+    except ImportError:
+        return
+
+    class _WheelEventBlocker(QObject):
+        def eventFilter(self, watched: Any, event: Any) -> bool:
+            event_type = getattr(event, "type", None)
+            if callable(event_type) and event_type() == QEvent.Type.Wheel:
+                ignore = getattr(event, "ignore", None)
+                if callable(ignore):
+                    ignore()
+                return True
+            return False
+
+    blocker = _WheelEventBlocker(widget)
+    install_filter(blocker)
+    setattr(widget, "_esibd_wheel_event_blocker", blocker)
+
+
 def _state_is_on(state: Any) -> bool:
     normalized = _normalize_runtime_state(state).strip().upper()
     return normalized in {"ST_ON", "STATE_ON"}
@@ -757,6 +782,7 @@ class AMXDevice(Device):
         widget.setAccelerated(True)
         widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
         widget.setStyleSheet(_AMX_FREQUENCY_SPINBOX_STYLE)
+        _disable_spinbox_wheel(widget)
         return widget
 
     def _combo_clear(self, combo: Any) -> None:
@@ -1981,7 +2007,22 @@ class AMXChannel(Channel):
         self._upgrade_toggle_widget(self.ACTIVE, "Manual", 72)
         self._sync_enabled_toggle_widget()
         self._sync_monitor_feedback()
+        self._disable_value_wheel()
         self.scalingChanged()
+
+    def _disable_value_wheel(self) -> None:
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        try:
+            parameter = getter(getattr(self, "VALUE", "Value"))
+        except Exception:
+            return
+        if parameter is None:
+            return
+        get_widget = getattr(parameter, "getWidget", None)
+        widget = get_widget() if callable(get_widget) else getattr(parameter, "check", None)
+        _disable_spinbox_wheel(widget)
 
     def scalingChanged(self) -> None:
         super().scalingChanged()
