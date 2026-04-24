@@ -52,6 +52,7 @@ _AMX_MONITOR_NEUTRAL_STYLE = ""
 _AMX_MONITOR_OK_RELATIVE_TOLERANCE = 0.01
 _AMX_MONITOR_WARN_RELATIVE_TOLERANCE = 0.10
 _AMX_MONITOR_RELATIVE_FLOOR_DUTY = 1.0
+_AMX_NUMERIC_DEBOUNCE_MS = 250
 _AMX_FREQUENCY_SPINBOX_STYLE = (
     "QDoubleSpinBox {"
     " background-color: #0f172a;"
@@ -986,10 +987,11 @@ class AMXDevice(Device):
 
     def _frequency_widget_changed(self, value: float) -> None:
         if self._set_frequency_setting_value(float(value)):
-            self.frequencyChanged()
+            self.frequencyChanged(debounce=True)
             self._update_status_widgets()
 
     def loadOperatingConfigNow(self) -> None:
+        self._cancel_runtime_apply_timers()
         controller = getattr(self, "controller", None)
         if controller is None:
             return
@@ -1521,7 +1523,7 @@ class AMXDevice(Device):
         settings[f"{self.name}/{self.MAXDATAPOINTS}"][Parameter.VALUE] = 100000
         return settings
 
-    def frequencyChanged(self) -> None:
+    def frequencyChanged(self, *, debounce: bool = False) -> None:
         self._update_width_bounds()
         controller = getattr(self, "controller", None)
         if (
@@ -1531,9 +1533,60 @@ class AMXDevice(Device):
             or not getattr(self, "isOn", lambda: False)()
         ):
             return
+        if debounce:
+            self._schedule_global_settings_apply()
+            return
+        self._cancel_global_settings_apply()
+        self._apply_global_settings_now()
+
+    def _apply_global_settings_now(self) -> None:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return
+        apply_global = getattr(controller, "applyGlobalSettingsFromThread", None)
+        if callable(apply_global):
+            apply_global(parallel=True)
+            return
         apply_global = getattr(controller, "applyGlobalSettings", None)
         if callable(apply_global):
             apply_global()
+
+    def _global_settings_apply_timer(self) -> Any | None:
+        timer = getattr(self, "_globalSettingsApplyTimer", None)
+        if timer is not None:
+            return timer
+        try:
+            from PyQt6.QtCore import QTimer
+        except Exception:
+            return None
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._apply_global_settings_now)
+        self._globalSettingsApplyTimer = timer
+        return timer
+
+    def _schedule_global_settings_apply(self) -> None:
+        timer = self._global_settings_apply_timer()
+        if timer is None:
+            self._apply_global_settings_now()
+            return
+        timer.start(_AMX_NUMERIC_DEBOUNCE_MS)
+
+    def _cancel_global_settings_apply(self) -> None:
+        timer = getattr(self, "_globalSettingsApplyTimer", None)
+        stop = getattr(timer, "stop", None)
+        if callable(stop):
+            stop()
+
+    def _cancel_runtime_apply_timers(self) -> None:
+        self._cancel_global_settings_apply()
+        channels = []
+        with contextlib.suppress(Exception):
+            channels = list(self.getChannels() or [])
+        for channel in channels:
+            cancel_apply = getattr(channel, "_cancel_value_apply", None)
+            if callable(cancel_apply):
+                cancel_apply()
 
     def _update_width_bounds(self) -> None:
         """Update Width (us) max bound on all channels based on current frequency."""
@@ -2052,9 +2105,8 @@ class AMXChannel(Channel):
             base_handler()
         self._update_duty_label()
         self._sync_monitor_feedback()
-        apply_value = getattr(self, "applyValue", None)
-        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
-            apply_value(apply=True)
+        if not getattr(self.channelParent, "loading", False):
+            self._schedule_value_apply()
 
     def enabledChanged(self) -> None:
         base_handler = getattr(super(), "enabledChanged", None)
@@ -2064,9 +2116,46 @@ class AMXChannel(Channel):
             self.monitor = np.nan
         self._sync_enabled_toggle_widget()
         self._sync_monitor_feedback()
+        self._cancel_value_apply()
+        self._apply_value_now()
+
+    def _apply_value_now(self) -> None:
         apply_value = getattr(self, "applyValue", None)
-        if callable(apply_value) and not getattr(self.channelParent, "loading", False):
-            apply_value(apply=True)
+        if not callable(apply_value) or getattr(self.channelParent, "loading", False):
+            return
+        controller = getattr(getattr(self, "channelParent", None), "controller", None)
+        apply_thread = getattr(controller, "applyValueFromThread", None)
+        if callable(apply_thread):
+            apply_thread(self, parallel=True)
+            return
+        apply_value(apply=True)
+
+    def _value_apply_timer(self) -> Any | None:
+        timer = getattr(self, "_valueApplyTimer", None)
+        if timer is not None:
+            return timer
+        try:
+            from PyQt6.QtCore import QTimer
+        except Exception:
+            return None
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._apply_value_now)
+        self._valueApplyTimer = timer
+        return timer
+
+    def _schedule_value_apply(self) -> None:
+        timer = self._value_apply_timer()
+        if timer is None:
+            self._apply_value_now()
+            return
+        timer.start(_AMX_NUMERIC_DEBOUNCE_MS)
+
+    def _cancel_value_apply(self) -> None:
+        timer = getattr(self, "_valueApplyTimer", None)
+        stop = getattr(timer, "stop", None)
+        if callable(stop):
+            stop()
 
     def _update_duty_label(self) -> None:
         """Recalculate Duty (%) from current Width (us) and device frequency."""
@@ -2165,6 +2254,12 @@ class AMXController(DeviceController):
         self.transitioning = False
         self.transition_target_on: bool | None = None
         self._transition_lock = Lock()
+        self._global_apply_state_lock = Lock()
+        self._global_apply_pending = False
+        self._global_apply_worker_running = False
+        self._channel_apply_state_lock = Lock()
+        self._channel_apply_pending: dict[int, AMXChannel] = {}
+        self._channel_apply_worker_running = False
         self.values: dict[int, float] = {}
         self.width_us_values: dict[int, str] = {}
         self.width_values: dict[int, str] = {}
@@ -2568,6 +2663,7 @@ class AMXController(DeviceController):
             )
             return
 
+        self._discard_pending_runtime_applies()
         timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
         try:
             self._start_operating_mode(
@@ -2632,6 +2728,69 @@ class AMXController(DeviceController):
                 f"Failed to apply AMX global settings: {self._format_exception(exc)}",
                 flag=PRINT.ERROR,
             )
+
+    def applyGlobalSettingsFromThread(self, parallel: bool = True) -> None:
+        if parallel:
+            self._queue_global_settings_apply()
+            return
+        self.applyGlobalSettings()
+
+    def _queue_global_settings_apply(self) -> None:
+        with self._global_apply_state_lock:
+            self._global_apply_pending = True
+            if self._global_apply_worker_running:
+                return
+            self._global_apply_worker_running = True
+            Thread(
+                target=self._global_settings_apply_worker,
+                name=f"{self.controllerParent.name} applyGlobalSettingsThread",
+                daemon=True,
+            ).start()
+
+    def _global_settings_apply_worker(self) -> None:
+        while True:
+            with self._global_apply_state_lock:
+                if not self._global_apply_pending:
+                    self._global_apply_worker_running = False
+                    return
+                self._global_apply_pending = False
+            self.applyGlobalSettings()
+
+    def applyValueFromThread(self, channel: AMXChannel, parallel: bool = True) -> None:
+        if parallel:
+            self._queue_channel_timing_apply(channel)
+            return
+        self.applyValue(channel)
+
+    def _queue_channel_timing_apply(self, channel: AMXChannel) -> None:
+        pulser = channel.pulser_number()
+        with self._channel_apply_state_lock:
+            self._channel_apply_pending[pulser] = channel
+            if self._channel_apply_worker_running:
+                return
+            self._channel_apply_worker_running = True
+            Thread(
+                target=self._channel_timing_apply_worker,
+                name=f"{self.controllerParent.name} applyChannelTimingThread",
+                daemon=True,
+            ).start()
+
+    def _channel_timing_apply_worker(self) -> None:
+        while True:
+            with self._channel_apply_state_lock:
+                pending = dict(self._channel_apply_pending)
+                self._channel_apply_pending.clear()
+                if not pending:
+                    self._channel_apply_worker_running = False
+                    return
+            for _pulser, channel in sorted(pending.items()):
+                self.applyValue(channel)
+
+    def _discard_pending_runtime_applies(self) -> None:
+        with self._global_apply_state_lock:
+            self._global_apply_pending = False
+        with self._channel_apply_state_lock:
+            self._channel_apply_pending.clear()
 
     def readNumbers(self) -> None:
         if self.device is None or not getattr(self, "initialized", False):
@@ -2785,6 +2944,7 @@ class AMXController(DeviceController):
             self._end_transition()
             return
 
+        self._discard_pending_runtime_applies()
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
             stop_acquisition()
@@ -2832,6 +2992,7 @@ class AMXController(DeviceController):
             self.closeCommunication()
             return True
 
+        self._discard_pending_runtime_applies()
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
             stop_acquisition()
@@ -2896,6 +3057,7 @@ class AMXController(DeviceController):
         self.available_configs = []
         self.available_configs_text = "n/a"
         self.loaded_config_text = "n/a"
+        self._discard_pending_runtime_applies()
         self._dispose_device()
         self.initialized = False
         self._sync_status_to_gui()

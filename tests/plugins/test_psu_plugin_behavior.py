@@ -718,6 +718,13 @@ def test_manual_panel_sync_updates_controls_without_live_apply():
     module = _load_module()
     emitted = []
 
+    class FakeTimer:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
     class FakeControl:
         def __init__(self, *, checked=False, value=0.0):
             self.checked = checked
@@ -744,6 +751,7 @@ def test_manual_panel_sync_updates_controls_without_live_apply():
             return self._value
 
     device = object.__new__(module.PSUDevice)
+    device._manualPanelApplyTimer = FakeTimer()
     device.controller = types.SimpleNamespace(
         output_enabled_by_channel={0: True, 1: False},
         full_range_by_channel={0: True, 1: False},
@@ -767,6 +775,7 @@ def test_manual_panel_sync_updates_controls_without_live_apply():
 
     module.PSUDevice._sync_manual_panel_from_controller(device)
 
+    assert device._manualPanelApplyTimer.stopped is True
     assert emitted == []
     assert device.manualPanelControls[0]["output_enabled"].isChecked() is True
     assert device.manualPanelControls[1]["output_enabled"].isChecked() is False
@@ -781,6 +790,13 @@ def test_manual_panel_sync_updates_controls_without_live_apply():
 def test_manual_panel_change_applies_values_immediately():
     module = _load_module()
     calls = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
 
     class FakeControl:
         def __init__(self, *, checked=False, value=0.0):
@@ -805,6 +821,7 @@ def test_manual_panel_change_applies_values_immediately():
     )
     device = object.__new__(module.PSUDevice)
     device.controller = controller
+    device._manualPanelApplyTimer = FakeTimer()
     device.manualPanelControls = {
         0: {
             "output_enabled": FakeControl(checked=True),
@@ -822,6 +839,7 @@ def test_manual_panel_change_applies_values_immediately():
 
     module.PSUDevice._manual_panel_changed(device)
 
+    assert device._manualPanelApplyTimer.stopped is True
     assert calls == [
         (
             {
@@ -833,6 +851,119 @@ def test_manual_panel_change_applies_values_immediately():
             True,
         )
     ]
+
+
+def test_manual_panel_numeric_change_is_debounced_until_timer_fires():
+    module = _load_module()
+    calls = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.starts = []
+
+        def start(self, timeout_ms):
+            self.starts.append(timeout_ms)
+
+    class FakeControl:
+        def __init__(self, *, checked=False, value=0.0):
+            self.checked = checked
+            self._value = value
+
+        def isChecked(self):
+            return self.checked
+
+        def value(self):
+            return self._value
+
+    controller = types.SimpleNamespace(
+        device=object(),
+        initialized=True,
+        initializing=False,
+        transitioning=False,
+        full_range_supported_by_channel={0: True, 1: True},
+        applyManualStateFromThread=lambda state, parallel=True: calls.append(
+            (state, parallel)
+        ),
+    )
+    device = object.__new__(module.PSUDevice)
+    device.controller = controller
+    device._manualPanelApplyTimer = FakeTimer()
+    device.manualPanelControls = {
+        0: {
+            "output_enabled": FakeControl(checked=True),
+            "full_range": FakeControl(checked=True),
+            "voltage": FakeControl(value=10.0),
+            "current_limit": FakeControl(value=0.1),
+        },
+        1: {
+            "output_enabled": FakeControl(checked=False),
+            "full_range": FakeControl(checked=False),
+            "voltage": FakeControl(value=20.0),
+            "current_limit": FakeControl(value=0.2),
+        },
+    }
+
+    module.PSUDevice._manual_panel_changed(device, debounce=True)
+
+    assert calls == []
+    assert device._manualPanelApplyTimer.starts == [
+        module._PSU_MANUAL_NUMERIC_DEBOUNCE_MS,
+    ]
+
+    module.PSUDevice._apply_manual_panel_state(device)
+
+    assert calls == [
+        (
+            {
+                "output_enabled": {0: True, 1: False},
+                "full_range_enabled": {0: True, 1: False},
+                "voltage_values": {0: 10.0, 1: 20.0},
+                "current_limit_values": {0: 0.1, 1: 0.2},
+            },
+            True,
+        )
+    ]
+
+
+def test_manual_apply_queue_keeps_only_latest_pending_state(monkeypatch):
+    module = _load_module()
+    created_threads = []
+    applied = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            created_threads.append(self)
+
+        def start(self):
+            return None
+
+    parent = types.SimpleNamespace(name="PSU", getChannels=lambda: [])
+    controller = module.PSUController(parent)
+    controller.applyManualState = lambda state: applied.append(state)
+    monkeypatch.setattr(module, "Thread", FakeThread)
+
+    controller.applyManualStateFromThread(
+        {"voltage_values": {0: 1.0}},
+        parallel=True,
+    )
+    controller.applyManualStateFromThread(
+        {"voltage_values": {0: 2.0}},
+        parallel=True,
+    )
+    controller.applyManualStateFromThread(
+        {"voltage_values": {0: 3.0}},
+        parallel=True,
+    )
+
+    assert len(created_threads) == 1
+
+    created_threads[0].target()
+
+    assert applied == [{"voltage_values": {0: 3.0}}]
+    assert controller._manual_apply_worker_running is False
 
 
 def test_toggle_on_uses_config_startup_only():
@@ -1430,6 +1561,7 @@ def test_load_operating_config_now_loads_selected_psu_config():
         {"index": 1, "name": "Standby", "active": True, "valid": True},
         {"index": 7, "name": "Operate 5 kV", "active": True, "valid": True},
     ]
+    controller._manual_apply_pending_state = {"voltage_values": {0: 99.0}}
     parent._sync_manual_panel_from_controller = lambda: sync_calls.append(
         (
             dict(controller.voltage_setpoint_values),
@@ -1447,6 +1579,7 @@ def test_load_operating_config_now_loads_selected_psu_config():
     assert sync_calls == [
         ({0: 12.5, 1: 22.5}, {0: 0.125, 1: 0.25}),
     ]
+    assert controller._manual_apply_pending_state is None
     assert printed == [("Loaded PSU config 7.", None)]
 
 

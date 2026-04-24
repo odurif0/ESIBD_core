@@ -1283,7 +1283,7 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
         loadOperatingConfigNowFromThread=lambda parallel=True: load_calls.append(parallel),
     )
     device._update_status_widgets = lambda: None
-    device.frequencyChanged = lambda: frequency_changes.append(device.frequency_khz)
+    device.frequencyChanged = lambda **_kwargs: frequency_changes.append(device.frequency_khz)
     device._create_config_selector_widget = lambda: FakeCombo()
     device._create_config_button_widget = lambda text: FakeButton(text)
     device._create_frequency_widget = lambda: FakeFrequency()
