@@ -348,7 +348,7 @@ class ProcessIsolatedClientMixin:
         return backend.call_method(
             method_name,
             *args,
-            timeout_s=self._rpc_timeout_for(method_name, kwargs),
+            rpc_timeout_s=self._rpc_timeout_for(method_name, kwargs),
             **kwargs,
         )
 

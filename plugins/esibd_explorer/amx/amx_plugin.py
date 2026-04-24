@@ -8,7 +8,7 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, cast
 
 import numpy as np
@@ -44,6 +44,34 @@ _AMX_PULSER_ON_LABEL = "ON"
 _AMX_PULSER_OFF_LABEL = "OFF"
 _AMX_PULSER_TOGGLE_MIN_WIDTH = 48
 _AMX_MIN_ROW_HEIGHT = 28
+_AMX_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
+_AMX_MONITOR_OK_STYLE = "background-color: #2f855a; color: #ffffff; margin:0px;"
+_AMX_MONITOR_WARN_STYLE = "background-color: #dd6b20; color: #ffffff; margin:0px;"
+_AMX_MONITOR_ERROR_STYLE = "background-color: #c53030; color: #ffffff; margin:0px;"
+_AMX_MONITOR_NEUTRAL_STYLE = ""
+_AMX_MONITOR_OK_RELATIVE_TOLERANCE = 0.01
+_AMX_MONITOR_WARN_RELATIVE_TOLERANCE = 0.10
+_AMX_MONITOR_RELATIVE_FLOOR_DUTY = 1.0
+_AMX_FREQUENCY_SPINBOX_STYLE = (
+    "QDoubleSpinBox {"
+    " background-color: #0f172a;"
+    " color: #f8fafc;"
+    " border: 1px solid #64748b;"
+    " border-radius: 4px;"
+    " padding: 2px 20px 2px 6px;"
+    " selection-background-color: #2563eb;"
+    "}"
+    "QDoubleSpinBox:disabled {"
+    " background-color: #1f2937;"
+    " color: #94a3b8;"
+    " border-color: #475569;"
+    "}"
+    "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {"
+    " background-color: #475569;"
+    " border: 1px solid #94a3b8;"
+    " width: 18px;"
+    "}"
+)
 
 
 def _is_nan(value: Any) -> bool:
@@ -128,6 +156,51 @@ def _status_requires_operator_attention(state: Any) -> bool:
         token in normalized
         for token in ("err", "error", "fail", "fault", "lost", "overload", "timeout", "unknown")
     )
+
+
+def _invoke_gui_callback(callback: Any) -> None:
+    """Run GUI updates directly in tests and queue them on the Qt GUI thread."""
+    if not callable(callback):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:
+        callback()
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        callback()
+        return
+
+    try:
+        if QThread.currentThread() == app.thread():
+            callback()
+            return
+
+        dispatcher = getattr(_invoke_gui_callback, "_dispatcher", None)
+        if dispatcher is None:
+            class _CallbackDispatcher(QObject):
+                callbackRequested = pyqtSignal(object)
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.callbackRequested.connect(
+                        self._run,
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+
+                def _run(self, queued_callback: Any) -> None:
+                    if callable(queued_callback):
+                        queued_callback()
+
+            dispatcher = _CallbackDispatcher()
+            dispatcher.moveToThread(app.thread())
+            setattr(_invoke_gui_callback, "_dispatcher", dispatcher)
+        dispatcher.callbackRequested.emit(callback)
+    except Exception:
+        callback()
 
 
 def _state_is_on(state: Any) -> bool:
@@ -481,7 +554,7 @@ class AMXDevice(Device):
 
     name = "AMX"
     version = "0.1.0"
-    supportedVersion = "0.8"
+    supportedVersion = "1.0.1"
     pluginType = PLUGINTYPE.INPUTDEVICE
     unit = "%"
     useMonitors = True
@@ -635,6 +708,7 @@ class AMXDevice(Device):
         setting = self._setting(setting_name)
         tooltip = str(getattr(setting, "toolTip", "") or "").strip() if setting is not None else ""
         lines = [tooltip] if tooltip else []
+        lines.append("Choose the saved AMX signal/routing shape to load.")
         lines.append("Available AMX configs:")
         available = str(getattr(self, "available_configs_text", "") or "n/a")
         for entry in available.split(";"):
@@ -669,6 +743,20 @@ class AMXDevice(Device):
         button = QPushButton(text)
         button.setMinimumWidth(96)
         return button
+
+    def _create_frequency_widget(self) -> Any:
+        from PyQt6.QtWidgets import QAbstractSpinBox, QDoubleSpinBox
+
+        widget = QDoubleSpinBox()
+        widget.setRange(0.001, 10000.0)
+        widget.setDecimals(3)
+        widget.setSingleStep(0.1)
+        widget.setSuffix(" kHz")
+        widget.setMinimumWidth(112)
+        widget.setAccelerated(True)
+        widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        widget.setStyleSheet(_AMX_FREQUENCY_SPINBOX_STYLE)
+        return widget
 
     def _combo_clear(self, combo: Any) -> None:
         clear = getattr(combo, "clear", None)
@@ -723,6 +811,12 @@ class AMXDevice(Device):
         if callable(connect):
             connect(callback)
 
+    def _connect_frequency_widget(self, widget: Any) -> None:
+        signal = getattr(widget, "valueChanged", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(lambda value: self._frequency_widget_changed(value))
+
     def _ensure_config_controls(self) -> None:
         if (
             getattr(self, "titleBar", None) is None
@@ -736,12 +830,15 @@ class AMXDevice(Device):
 
         self.loadedConfigLabel = label_type("Loaded:")
         self.loadedConfigValueLabel = label_type("")
-        self.operatingConfigLabel = label_type("Config:")
+        self.operatingConfigLabel = label_type("Signal:")
         self.operatingConfigCombo = self._create_config_selector_widget()
         self.loadOperatingConfigButton = self._create_config_button_widget("Load now")
+        self.frequencyLabel = label_type("Freq:")
+        self.frequencyWidget = self._create_frequency_widget()
 
         self._connect_config_selector(self.operatingConfigCombo, "operating_config")
         self._connect_config_button(self.loadOperatingConfigButton, self.loadOperatingConfigNow)
+        self._connect_frequency_widget(self.frequencyWidget)
 
         widgets = (
             self.loadedConfigLabel,
@@ -749,6 +846,8 @@ class AMXDevice(Device):
             self.operatingConfigLabel,
             self.operatingConfigCombo,
             self.loadOperatingConfigButton,
+            self.frequencyLabel,
+            self.frequencyWidget,
         )
         for widget in widgets:
             if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
@@ -803,6 +902,10 @@ class AMXDevice(Device):
     def _update_config_controls(self) -> None:
         self._update_config_selector(getattr(self, "standbyConfigCombo", None), "standby_config")
         self._update_config_selector(getattr(self, "operatingConfigCombo", None), "operating_config")
+        signal_label = getattr(self, "operatingConfigLabel", None)
+        signal_tooltip = self._config_selector_tooltip_text("operating_config")
+        if signal_label is not None and hasattr(signal_label, "setToolTip"):
+            signal_label.setToolTip(signal_tooltip)
 
         loaded_text = str(getattr(self, "loaded_config_text", "") or "n/a")
         loaded_tooltip = self._loaded_config_tooltip_text()
@@ -827,6 +930,28 @@ class AMXDevice(Device):
                 tooltip = f"{tooltip}\nCurrently unavailable: {reason}."
             button.setToolTip(tooltip)
 
+        frequency_widget = getattr(self, "frequencyWidget", None)
+        if frequency_widget is not None:
+            block_signals = getattr(frequency_widget, "blockSignals", None)
+            if callable(block_signals):
+                block_signals(True)
+            try:
+                set_value = getattr(frequency_widget, "setValue", None)
+                if callable(set_value):
+                    set_value(float(getattr(self, "frequency_khz", 2.0)))
+            finally:
+                if callable(block_signals):
+                    block_signals(False)
+            frequency_tooltip = (
+                "Oscillator frequency applied to the selected AMX signal. "
+                "Changes are applied immediately while the AMX is ON."
+            )
+            if hasattr(frequency_widget, "setToolTip"):
+                frequency_widget.setToolTip(frequency_tooltip)
+            frequency_label = getattr(self, "frequencyLabel", None)
+            if frequency_label is not None and hasattr(frequency_label, "setToolTip"):
+                frequency_label.setToolTip(frequency_tooltip)
+
     def _config_selector_changed(self, attr_name: str) -> None:
         combo = getattr(
             self,
@@ -840,6 +965,28 @@ class AMXDevice(Device):
             return
         if self._set_config_setting_value(attr_name, self._combo_current_value(combo)):
             self._update_config_controls()
+            self._update_status_widgets()
+
+    def _set_frequency_setting_value(self, value: float) -> bool:
+        value = float(value)
+        setting = self._setting(self.FREQUENCY_KHZ)
+        if setting is not None:
+            current = _coerce_float(getattr(setting, "value", value), value)
+            if current == value:
+                self.frequency_khz = value
+                return False
+            setting.value = value
+            self.frequency_khz = value
+            return True
+        current = _coerce_float(getattr(self, "frequency_khz", value), value)
+        if current == value:
+            return False
+        self.frequency_khz = value
+        return True
+
+    def _frequency_widget_changed(self, value: float) -> None:
+        if self._set_frequency_setting_value(float(value)):
+            self.frequencyChanged()
             self._update_status_widgets()
 
     def loadOperatingConfigNow(self) -> None:
@@ -1308,27 +1455,13 @@ class AMXDevice(Device):
             parameterType=PARAMETERTYPE.FLOAT,
             attr="poll_timeout_s",
         )
-        settings[f"{self.name}/{self.STANDBY_CONFIG}"] = parameterDict(
-            value=-1,
-            minimum=-1,
-            maximum=255,
-            toolTip=(
-                "Advanced standby config index. Use -1 to auto-use slot 0 when it exists, "
-                "otherwise skip standby loading."
-            ),
-            parameterType=PARAMETERTYPE.INT,
-            attr="standby_config",
-            advanced=True,
-            event=self._update_config_controls,
-        )
         settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
             value=-1,
             minimum=-1,
             maximum=255,
             toolTip=(
-                "AMX config used for normal operation. Use -1 to keep the controller "
-                "connected but leave the AMX in standby until a valid operating "
-                "config is selected."
+                "AMX config used for normal operation. Use -1 to connect "
+                "without enabling the AMX until a valid config is selected."
             ),
             parameterType=PARAMETERTYPE.INT,
             attr="operating_config",
@@ -1366,7 +1499,7 @@ class AMXDevice(Device):
             value="n/a",
             toolTip=(
                 "AMX configuration slots reported by the controller after connect. "
-                "Use these indices for standby, operating, and shutdown config settings."
+                "Use these indices to select the operator-facing Signal config."
             ),
             parameterType=PARAMETERTYPE.LABEL,
             attr="available_configs_text",
@@ -1431,6 +1564,7 @@ class AMXDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._sync_toolbar_communication_controls()
         self._update_status_widgets()
 
     def _acquisition_readiness(self) -> tuple[bool, str]:
@@ -1461,7 +1595,18 @@ class AMXDevice(Device):
         if hasattr(action, "setEnabled"):
             action.setEnabled(enabled)
             return
-        setattr(action, "enabled", enabled)
+        with contextlib.suppress(AttributeError):
+            setattr(action, "enabled", enabled)
+
+    def _set_action_visible(self, action: Any | None, visible: bool) -> None:
+        """Update QAction-like visibility while tolerating lightweight test doubles."""
+        if action is None:
+            return
+        if hasattr(action, "setVisible"):
+            action.setVisible(visible)
+            return
+        with contextlib.suppress(AttributeError):
+            setattr(action, "visible", visible)
 
     def _force_recording_action_state(self, state: bool) -> None:
         """Force the acquisition action state without re-entering its callbacks."""
@@ -1511,19 +1656,49 @@ class AMXDevice(Device):
                 setattr(live_display, "initCommunicationAction", action)
         return close_action, init_action
 
+    def _communication_open(self) -> bool:
+        """Return whether a transport/driver exists, even after a partial startup failure."""
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False
+        if getattr(controller, "device", None) is not None:
+            return True
+        return bool(getattr(controller, "initialized", False))
+
     def _sync_display_communication_controls(self) -> None:
         """Enable display-side communication actions only when applicable."""
         close_action, init_action = self._display_communication_actions()
         controller = getattr(self, "controller", None)
-        initializing = bool(getattr(controller, "initializing", False))
-        initialized = bool(getattr(controller, "initialized", False))
-        self._set_action_enabled(close_action, initialized and not initializing)
-        self._set_action_enabled(init_action, (not initialized) and (not initializing))
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        communication_open = self._communication_open()
+        self._set_action_enabled(close_action, communication_open and not busy)
+        self._set_action_enabled(init_action, (not communication_open) and (not busy))
+
+    def _sync_toolbar_communication_controls(self) -> None:
+        """Expose a disconnect action when communication is open but the local ON action is OFF."""
+        close_action = getattr(self, "closeCommunicationAction", None)
+        if close_action is None:
+            return
+        controller = getattr(self, "controller", None)
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        can_close = self._communication_open() and not busy
+        is_on = False
+        is_on_fn = getattr(self, "isOn", None)
+        if callable(is_on_fn):
+            is_on = bool(is_on_fn())
+        has_local_on_action = getattr(self, "onAction", None) is not None
+        self._set_action_enabled(close_action, can_close)
+        self._set_action_visible(close_action, can_close and (not has_local_on_action or not is_on))
 
     def _sync_acquisition_controls(self) -> None:
         """Disable manual acquisition controls until the AMX is actually ready."""
         ready, _reason = self._acquisition_readiness()
         self._sync_display_communication_controls()
+        self._sync_toolbar_communication_controls()
         self._set_action_enabled(getattr(self, "recordingAction", None), ready)
         self._set_action_enabled(
             getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
@@ -1567,12 +1742,19 @@ class AMXDevice(Device):
         self._update_status_widgets()
 
     def shutdownCommunication(self) -> None:
-        if self.useOnOffLogic and hasattr(self, "onAction"):
-            self.onAction.state = False
-            self._sync_local_on_action()
+        shutdown_confirmed = True
         controller = getattr(self, "controller", None)
         if controller:
-            controller.shutdownCommunication()
+            shutdown_confirmed = bool(controller.shutdownCommunication())
+        if self.useOnOffLogic and hasattr(self, "onAction"):
+            self.onAction.state = False if shutdown_confirmed else True
+            self._sync_local_on_action()
+        if not shutdown_confirmed:
+            self.print(
+                "AMX shutdown could not be confirmed; UI remains ON until "
+                "the hardware state is verified.",
+                flag=PRINT.WARNING,
+            )
         self._update_status_widgets()
 
     def setOn(self, on: "bool | None" = None) -> None:
@@ -1745,6 +1927,7 @@ class AMXChannel(Channel):
         )
         self._upgrade_toggle_widget(self.ACTIVE, "Manual", 72)
         self._sync_enabled_toggle_widget()
+        self._sync_monitor_feedback()
         self.scalingChanged()
 
     def scalingChanged(self) -> None:
@@ -1860,11 +2043,15 @@ class AMXChannel(Channel):
         if callable(real_changed):
             real_changed()
 
+    def monitorChanged(self) -> None:
+        self._sync_monitor_feedback()
+
     def valueChanged(self) -> None:
         base_handler = getattr(super(), "valueChanged", None)
         if callable(base_handler):
             base_handler()
         self._update_duty_label()
+        self._sync_monitor_feedback()
         apply_value = getattr(self, "applyValue", None)
         if callable(apply_value) and not getattr(self.channelParent, "loading", False):
             apply_value(apply=True)
@@ -1876,6 +2063,7 @@ class AMXChannel(Channel):
         if not getattr(self, "enabled", False):
             self.monitor = np.nan
         self._sync_enabled_toggle_widget()
+        self._sync_monitor_feedback()
         apply_value = getattr(self, "applyValue", None)
         if callable(apply_value) and not getattr(self.channelParent, "loading", False):
             apply_value(apply=True)
@@ -1889,6 +2077,58 @@ class AMXChannel(Channel):
             self.setDutyText(f"{width_us / period_us * 100:.1f}")
         else:
             self.setDutyText("0.0")
+
+    def _monitor_feedback_state(self) -> str:
+        """Classify duty monitor accuracy relative to the current duty setpoint."""
+        if not getattr(self, "enabled", False) or not getattr(self, "real", True):
+            return "default"
+
+        channel_parent = getattr(self, "channelParent", None)
+        controller = getattr(channel_parent, "controller", None)
+        if controller is None or not getattr(controller, "acquiring", False):
+            return "default"
+        if not callable(getattr(channel_parent, "isOn", None)) or not channel_parent.isOn():
+            return "default"
+
+        monitor_value = _coerce_float(getattr(self, "monitor", np.nan), np.nan)
+        target_value = _coerce_float(getattr(self, "duty_text", np.nan), np.nan)
+        if _is_nan(monitor_value) or _is_nan(target_value):
+            return "default"
+
+        reference = max(abs(target_value), _AMX_MONITOR_RELATIVE_FLOOR_DUTY)
+        relative_error = abs(monitor_value - target_value) / reference
+        if relative_error <= _AMX_MONITOR_OK_RELATIVE_TOLERANCE:
+            return "ok"
+        if relative_error <= _AMX_MONITOR_WARN_RELATIVE_TOLERANCE:
+            return "warn"
+        return "error"
+
+    def _sync_monitor_feedback(self) -> None:
+        """Apply green/orange/red background on Duty (Monitor) like AMPR."""
+        getter = getattr(self, "getParameterByName", None)
+        if not callable(getter):
+            return
+        try:
+            parameter = getter(getattr(self, "MONITOR", "Monitor"))
+        except Exception:  # noqa: BLE001
+            return
+        widget_getter = getattr(parameter, "getWidget", None)
+        widget = widget_getter() if callable(widget_getter) else getattr(parameter, "widget", None)
+        if widget is None or not hasattr(widget, "setStyleSheet"):
+            return
+
+        state = self._monitor_feedback_state()
+        if state == "ok":
+            style = _AMX_MONITOR_OK_STYLE
+        elif state == "warn":
+            style = _AMX_MONITOR_WARN_STYLE
+        elif state == "error":
+            style = _AMX_MONITOR_ERROR_STYLE
+        else:
+            style = _AMX_MONITOR_NEUTRAL_STYLE
+
+        widget.setStyleSheet(style)
+        self.warningState = state in {"warn", "error"}
 
     def setWidthText(self, text: str) -> None:
         self._set_parameter_value_without_events(self.WIDTH_TICKS, text)
@@ -1924,6 +2164,7 @@ class AMXController(DeviceController):
         self.initialized = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
+        self._transition_lock = Lock()
         self.values: dict[int, float] = {}
         self.width_us_values: dict[int, str] = {}
         self.width_values: dict[int, str] = {}
@@ -1962,21 +2203,7 @@ class AMXController(DeviceController):
         self.initialized = False
         self._dispose_device()
         try:
-            driver_class = _get_amx_driver_class()
-            self.device = driver_class(
-                device_id=f"{self.controllerParent.name.lower()}_com{int(self.controllerParent.com)}",
-                com=int(self.controllerParent.com),
-                baudrate=int(self.controllerParent.baudrate),
-            )
-            backend_reason = str(
-                getattr(self.device, "_process_backend_disabled_reason", "")
-            ).strip()
-            if backend_reason:
-                self.print(backend_reason, flag=PRINT.WARNING)
-            self.device.connect(timeout_s=float(self.controllerParent.connect_timeout_s))
-            self._refresh_available_configs()
-            self._refresh_loaded_config_status()
-            self._update_state()
+            self._initialize_transport_session()
             self.signalComm.initCompleteSignal.emit()
         except Exception as exc:  # noqa: BLE001
             self._restore_off_ui_state()
@@ -1990,25 +2217,35 @@ class AMXController(DeviceController):
             self.initializing = False
 
     def initComplete(self) -> None:
+        self._finalize_transport_initialization()
+        self._resume_pending_on_request_after_transport_ready()
+
+    def _initialize_transport_session(self) -> None:
+        """Create the AMX driver and open transport-only communication."""
+        driver_class = _get_amx_driver_class()
+        self.device = driver_class(
+            device_id=f"{self.controllerParent.name.lower()}_com{int(self.controllerParent.com)}",
+            com=int(self.controllerParent.com),
+            baudrate=int(self.controllerParent.baudrate),
+        )
+        backend_reason = str(
+            getattr(self.device, "_process_backend_disabled_reason", "")
+        ).strip()
+        if backend_reason:
+            self.print(backend_reason, flag=PRINT.WARNING)
+        self.device.connect(timeout_s=float(self.controllerParent.connect_timeout_s))
+        self._refresh_available_configs()
+        self._refresh_loaded_config_status()
+        self._update_state()
+
+    def _finalize_transport_initialization(self) -> None:
+        """Sync transport state to the GUI after communication becomes ready."""
         if self.device is not None:
             self.controllerParent._sync_channels()
         self.initializeValues(reset=True)
         self.initialized = True
         self.super_init_complete_called = True
         self._sync_status_to_gui()
-
-    def _startup_kwargs(self) -> dict[str, Any]:
-        standby_config = self._resolved_safety_config("standby_config")
-        operating_config = _coerce_int(
-            getattr(self.controllerParent, "operating_config", -1),
-            -1,
-        )
-        kwargs: dict[str, Any] = {}
-        if standby_config >= 0:
-            kwargs["standby_config"] = standby_config
-        if operating_config >= 0:
-            kwargs["operating_config"] = operating_config
-        return kwargs
 
     def _shutdown_kwargs(self) -> dict[str, Any]:
         standby_config = self._resolved_safety_config("standby_config")
@@ -2028,6 +2265,25 @@ class AMXController(DeviceController):
             "standby_config": standby_config,
             "disable_device": False,
         }
+
+    def _resume_pending_on_request_after_transport_ready(self) -> None:
+        """Continue a pending ON request once communication is initialized.
+
+        When the operator clicks ON while the AMX is disconnected, the device UI
+        first goes through initializeCommunication(). Once the transport is
+        ready, resume the actual config-load/enable sequence automatically so
+        the first ON click reaches STATE_ON without requiring a manual Load now.
+        """
+        is_on = getattr(self.controllerParent, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            return
+        if self.transitioning or not self._begin_transition(True):
+            return
+        toggle_thread = getattr(self, "toggleOnFromThread", None)
+        if callable(toggle_thread):
+            toggle_thread(parallel=True)
+            return
+        self.toggleOn()
 
     def _resolved_safety_config(self, attr_name: str) -> int:
         config_index = _coerce_int(getattr(self.controllerParent, attr_name, -1), -1)
@@ -2213,7 +2469,7 @@ class AMXController(DeviceController):
                 )
             time.sleep(0.1)
 
-    def _enable_after_config_load(
+    def _load_operating_config_and_enable_device(
         self,
         *,
         config_index: int,
@@ -2233,6 +2489,50 @@ class AMXController(DeviceController):
             config_index=config_index,
             settle_timeout_s=timeout_s,
         )
+
+    def _ensure_transport_connected(self, timeout_s: float) -> Any:
+        """Ensure the AMX transport is connected before runtime commands."""
+        device = self.device
+        if device is None:
+            raise RuntimeError("AMX device disconnected.")
+        if getattr(device, "connected", False):
+            return device
+
+        connect = getattr(device, "connect", None)
+        if not callable(connect):
+            raise RuntimeError(
+                "AMX communication is not connected and the driver does not expose "
+                "connect()."
+            )
+        connect(timeout_s=timeout_s)
+        self._refresh_available_configs()
+        self._refresh_loaded_config_status()
+        return device
+
+    def _start_operating_mode(
+        self,
+        *,
+        config_index: int,
+        timeout_s: float,
+        lock_message: str,
+        success_message: str | None = None,
+        restart_acquisition: bool = False,
+    ) -> None:
+        """Load the selected operating config, apply runtime settings, and enable AMX."""
+        with self._controller_lock_section(lock_message):
+            self._ensure_transport_connected(timeout_s)
+            self._load_operating_config_and_enable_device(
+                config_index=config_index,
+                timeout_s=timeout_s,
+                load_config_first=True,
+            )
+        self._update_state()
+        if restart_acquisition:
+            start_acquisition = getattr(self, "startAcquisition", None)
+            if callable(start_acquisition):
+                start_acquisition()
+        if success_message:
+            self.print(success_message)
 
     def loadOperatingConfigNowFromThread(self, parallel: bool = True) -> None:
         if parallel:
@@ -2270,19 +2570,12 @@ class AMXController(DeviceController):
 
         timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
         try:
-            with self._controller_lock_section(
-                "Could not acquire lock to load the AMX config."
-            ):
-                device = self.device
-                if device is None:
-                    return
-                self._enable_after_config_load(
-                    config_index=config_index,
-                    timeout_s=timeout_s,
-                    load_config_first=True,
-                )
-            self._update_state()
-            self.print(f"Loaded AMX config {config_index}.")
+            self._start_operating_mode(
+                config_index=config_index,
+                timeout_s=timeout_s,
+                lock_message="Could not acquire lock to load the AMX config.",
+                success_message=f"Loaded AMX config {config_index}.",
+            )
         except TimeoutError:
             return
         except Exception as exc:  # noqa: BLE001
@@ -2346,16 +2639,21 @@ class AMXController(DeviceController):
             return
 
         timeout_s = float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+        lock_timeout_message = "Could not acquire lock to read AMX housekeeping."
         try:
             with self._controller_lock_section(
-                "Could not acquire lock to read AMX housekeeping.",
-                already_acquired=True,
+                lock_timeout_message,
+                timeout_s=0.0,
+                log_timeout=False,
             ):
                 device = self.device
                 if device is None:
                     return
                 snapshot = device.collect_housekeeping(timeout_s=timeout_s)
-        except TimeoutError:
+                self._apply_snapshot(snapshot)
+        except TimeoutError as exc:
+            if str(exc) == lock_timeout_message:
+                return
             self.errorCount += 1
             self.print("Timed out while polling AMX housekeeping.", flag=PRINT.ERROR)
             self.initializeValues(reset=True)
@@ -2369,9 +2667,8 @@ class AMXController(DeviceController):
             self.initializeValues(reset=True)
             return
 
-        self._apply_snapshot(snapshot)
-
     def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
+        device = self.device
         self.main_state = str(snapshot.get("main_state", {}).get("name", "Unknown"))
         self.device_enabled_state = (
             "ON" if bool(snapshot.get("device_enabled", False)) else "OFF"
@@ -2387,10 +2684,10 @@ class AMXController(DeviceController):
             snapshot.get("oscillator", {}).get("period"),
             0,
         )
-        osc_offset = _coerce_int(getattr(self.device, "OSC_OFFSET", 2), 2)
-        width_offset = _coerce_int(getattr(self.device, "PULSER_WIDTH_OFFSET", 2), 2)
+        osc_offset = _coerce_int(getattr(device, "OSC_OFFSET", 2), 2)
+        width_offset = _coerce_int(getattr(device, "PULSER_WIDTH_OFFSET", 2), 2)
         total_ticks = oscillator_period + osc_offset
-        ticks_per_us = getattr(self.device, "CLOCK", 100e6) / 1e6  # 100 ticks/us
+        ticks_per_us = getattr(device, "CLOCK", 100e6) / 1e6  # 100 ticks/us
 
         new_values: dict[int, float] = {}
         new_width_us: dict[int, str] = {}
@@ -2505,34 +2802,17 @@ class AMXController(DeviceController):
                         flag=PRINT.WARNING,
                     )
                     return
-                with self._controller_lock_section(
-                    "Could not acquire lock to start the AMX."
-                ):
-                    device = self.device
-                    if device is None:
-                        self._restore_off_ui_state()
-                        return
-                    initialize = getattr(device, "initialize", None)
-                    if callable(initialize):
-                        initialize(timeout_s=timeout_s, **self._startup_kwargs())
-                    else:
-                        if not getattr(device, "connected", False):
-                            device.connect(timeout_s=timeout_s)
-                        if config_index >= 0:
-                            device.load_config(config_index, timeout_s=timeout_s)
-                    self._enable_after_config_load(
-                        config_index=config_index,
-                        timeout_s=timeout_s,
-                        load_config_first=False,
-                    )
-                    self._refresh_loaded_config_status()
-                self._update_state()
-                start_acquisition = getattr(self, "startAcquisition", None)
-                if callable(start_acquisition):
-                    start_acquisition()
-                self.print("AMX timing enabled.")
+                self._start_operating_mode(
+                    config_index=config_index,
+                    timeout_s=timeout_s,
+                    lock_message="Could not acquire lock to start the AMX.",
+                    success_message="AMX timing enabled.",
+                    restart_acquisition=True,
+                )
             else:
-                self.shutdownCommunication()
+                shutdown_confirmed = self.shutdownCommunication()
+                if not shutdown_confirmed:
+                    self._restore_on_ui_state()
                 return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
@@ -2546,11 +2826,11 @@ class AMXController(DeviceController):
             self._end_transition()
             self._sync_status_to_gui()
 
-    def shutdownCommunication(self) -> None:
+    def shutdownCommunication(self) -> bool:
         device = self.device
         if device is None:
             self.closeCommunication()
-            return
+            return True
 
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
@@ -2563,13 +2843,24 @@ class AMXController(DeviceController):
             self.print(
                 f"Parking AMX in standby config {standby_config} before disconnect."
             )
+        shutdown_confirmed = False
+        confirmation_reason = "shutdown confirmation was not completed"
         try:
-            device.shutdown(
-                timeout_s=float(getattr(self.controllerParent, "startup_timeout_s", 10.0)),
-                **shutdown_kwargs,
-            )
+            with self._controller_lock_section(
+                "Could not acquire lock to shut down the AMX."
+            ):
+                device = self.device
+                if device is None:
+                    shutdown_confirmed = True
+                else:
+                    shutdown_result = device.shutdown(
+                        timeout_s=float(getattr(self.controllerParent, "startup_timeout_s", 10.0)),
+                        **shutdown_kwargs,
+                    )
+                    shutdown_confirmed = shutdown_result is not False
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
+            confirmation_reason = self._format_exception(exc)
             self.print(
                 f"AMX shutdown failed: {self._format_exception(exc)}",
                 flag=PRINT.ERROR,
@@ -2577,16 +2868,31 @@ class AMXController(DeviceController):
         else:
             self.print("AMX shutdown sequence completed.")
         finally:
-            self.closeCommunication()
+            if not shutdown_confirmed:
+                self.print(
+                    "AMX shutdown could not be confirmed before disconnect: "
+                    f"{confirmation_reason}.",
+                    flag=PRINT.ERROR,
+                )
+            self.closeCommunication(
+                final_state=(
+                    "Disconnected"
+                    if shutdown_confirmed
+                    else _AMX_SHUTDOWN_UNCONFIRMED_STATE
+                )
+            )
+        return shutdown_confirmed
 
-    def closeCommunication(self) -> None:
+    def closeCommunication(self, *, final_state: str | None = None) -> None:
         base_close = getattr(super(), "closeCommunication", None)
         if callable(base_close):
             base_close()
-        self.main_state = "Disconnected"
-        self.device_enabled_state = "OFF"
-        self.device_state_summary = "n/a"
-        self.controller_state_summary = "n/a"
+        resolved_final_state = str(final_state or "Disconnected")
+        is_disconnected = resolved_final_state == "Disconnected"
+        self.main_state = resolved_final_state
+        self.device_enabled_state = "OFF" if is_disconnected else "Unknown"
+        self.device_state_summary = "n/a" if is_disconnected else "Unknown"
+        self.controller_state_summary = "n/a" if is_disconnected else "Unknown"
         self.available_configs = []
         self.available_configs_text = "n/a"
         self.loaded_config_text = "n/a"
@@ -2604,9 +2910,20 @@ class AMXController(DeviceController):
             return
 
         try:
-            snapshot = device.collect_housekeeping(
-                timeout_s=float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
-            )
+            with self._controller_lock_section(
+                "Could not acquire lock to refresh the AMX state."
+            ):
+                device = self.device
+                if device is None:
+                    self.main_state = "Disconnected"
+                    self.device_enabled_state = "OFF"
+                    self.device_state_summary = "n/a"
+                    self.controller_state_summary = "n/a"
+                    return
+                snapshot = device.collect_housekeeping(
+                    timeout_s=float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+                )
+                self._apply_snapshot(snapshot)
         except Exception:
             try:
                 self.main_state = str(device.get_status().get("connected", False))
@@ -2615,9 +2932,7 @@ class AMXController(DeviceController):
             self.device_enabled_state = "Unknown"
             self.device_state_summary = "Unknown"
             self.controller_state_summary = "Unknown"
-            return
 
-        self._apply_snapshot(snapshot)
 
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
@@ -2625,19 +2940,29 @@ class AMXController(DeviceController):
         self.controllerParent.available_configs = list(self.available_configs)
         self.controllerParent.available_configs_text = self.available_configs_text
         self.controllerParent.loaded_config_text = self.loaded_config_text
-        sync_acquisition_controls = getattr(
-            self.controllerParent,
-            "_sync_acquisition_controls",
-            None,
-        )
-        if callable(sync_acquisition_controls):
-            sync_acquisition_controls()
-        update_config_controls = getattr(self.controllerParent, "_update_config_controls", None)
-        if callable(update_config_controls):
-            update_config_controls()
-        update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
-        if callable(update_status_widgets):
-            update_status_widgets()
+        def _refresh_gui() -> None:
+            sync_acquisition_controls = getattr(
+                self.controllerParent,
+                "_sync_acquisition_controls",
+                None,
+            )
+            if callable(sync_acquisition_controls):
+                sync_acquisition_controls()
+            update_config_controls = getattr(self.controllerParent, "_update_config_controls", None)
+            if callable(update_config_controls):
+                update_config_controls()
+            update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
+            if callable(update_status_widgets):
+                update_status_widgets()
+
+        _invoke_gui_callback(_refresh_gui)
+
+    def _transition_guard(self) -> Lock:
+        lock = getattr(self, "_transition_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._transition_lock = lock
+        return lock
 
     def _dispose_device(self) -> None:
         device = self.device
@@ -2661,21 +2986,36 @@ class AMXController(DeviceController):
         if hasattr(self.controllerParent, "onAction"):
             self.controllerParent.onAction.state = False
 
+    def _restore_on_ui_state(self) -> None:
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(True)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = True
+
     @contextlib.contextmanager
     def _controller_lock_section(
         self,
         timeout_message: str,
         *,
         already_acquired: bool = False,
+        timeout_s: float = 1.0,
+        log_timeout: bool = True,
     ):
-        acquire = getattr(self.lock, "acquire", None)
-        release = getattr(self.lock, "release", None)
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            lock = Lock()
+            self.lock = lock
+        acquire = getattr(lock, "acquire", None)
+        release = getattr(lock, "release", None)
         if callable(acquire) and callable(release):
             if already_acquired:
                 yield
                 return
-            if not acquire(timeout=1):
-                self.print(timeout_message, flag=PRINT.ERROR)
+            if not acquire(timeout=float(timeout_s)):
+                if log_timeout:
+                    self.print(timeout_message, flag=PRINT.ERROR)
                 raise TimeoutError(timeout_message)
             try:
                 yield
@@ -2683,14 +3023,16 @@ class AMXController(DeviceController):
                 release()
             return
 
-        acquire_timeout = getattr(self.lock, "acquire_timeout", None)
+        acquire_timeout = getattr(lock, "acquire_timeout", None)
         if callable(acquire_timeout):
             with acquire_timeout(
-                1,
-                timeoutMessage=timeout_message,
+                float(timeout_s),
+                timeoutMessage=timeout_message if log_timeout else "",
                 already_acquired=already_acquired,
             ) as lock_acquired:
                 if not lock_acquired:
+                    if log_timeout:
+                        self.print(timeout_message, flag=PRINT.ERROR)
                     raise TimeoutError(timeout_message)
                 yield
             return
@@ -2700,15 +3042,17 @@ class AMXController(DeviceController):
         )
 
     def _begin_transition(self, target_on: bool) -> bool:
-        if self.transitioning:
-            return False
-        self.transitioning = True
-        self.transition_target_on = bool(target_on)
-        return True
+        with self._transition_guard():
+            if self.transitioning:
+                return False
+            self.transitioning = True
+            self.transition_target_on = bool(target_on)
+            return True
 
     def _end_transition(self) -> None:
-        self.transitioning = False
-        self.transition_target_on = None
+        with self._transition_guard():
+            self.transitioning = False
+            self.transition_target_on = None
 
     def _format_exception(self, exc: Exception) -> str:
         return str(exc).strip()

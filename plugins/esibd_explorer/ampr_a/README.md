@@ -7,7 +7,7 @@ including the AMPR driver files and vendor DLL.
 
 ## Requirements
 
-- ESIBD Explorer `0.8.x`
+- ESIBD Explorer `1.0.1`
 - Windows for real hardware communication
 - No separate `ESIBD_core` installation is required for the plugin itself
 

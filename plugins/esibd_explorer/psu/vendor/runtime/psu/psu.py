@@ -265,17 +265,18 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         self,
         timeout_s: float = 5.0,
         *,
-        standby_config: int = 1,
+        standby_config: Optional[int] = None,
         operating_config: Optional[int] = None,
         require_standby_outputs_disabled: bool = True,
     ) -> dict:
         """
         Run the routine PSU startup sequence.
 
-        The sequence connects to the controller, loads a standby configuration,
-        reads back the device and output enable state, and optionally loads an
-        operating configuration. By default, initialize() guarantees that the
-        standby stage leaves both HV outputs disabled before it continues. If a
+        The sequence connects to the controller, optionally loads a standby
+        configuration, reads back the device and output enable state when a
+        standby stage is requested, and optionally loads an operating
+        configuration. When a standby configuration is requested, initialize()
+        verifies that both HV outputs are disabled before it continues. If a
         saved standby configuration brings one of the outputs up, initialize()
         forces both outputs back OFF, verifies the readback, and only then
         proceeds or raises.
@@ -283,8 +284,12 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         timeout_s = self._resolve_io_timeout(timeout_s)
         was_connected = self.connected
         self.logger.info(
-            f"Initializing PSU device {self.device_id} with standby config "
-            f"{standby_config}"
+            f"Initializing PSU device {self.device_id}"
+            + (
+                f" with standby config {standby_config}"
+                if standby_config is not None
+                else ""
+            )
             + (
                 f" and operating config {operating_config}"
                 if operating_config is not None
@@ -294,36 +299,37 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
 
         try:
             self.connect(timeout_s=timeout_s)
-            self.load_config(standby_config, timeout_s=timeout_s)
-
-            device_enabled = self.get_device_enabled(timeout_s=timeout_s)
-            output_enabled = self.get_output_enabled(timeout_s=timeout_s)
-            initialization_state = {
-                "standby_config": int(standby_config),
-                "device_enabled": device_enabled,
-                "output_enabled": output_enabled,
-            }
-
-            if require_standby_outputs_disabled and output_enabled != (False, False):
-                initialization_state["standby_output_enabled_before_recovery"] = output_enabled
-                self.logger.warning(
-                    "PSU standby configuration %s left outputs enabled %s; "
-                    "forcing both outputs OFF before continuing.",
-                    standby_config,
-                    output_enabled,
-                )
-                self.set_output_enabled(False, False, timeout_s=timeout_s)
+            initialization_state = {}
+            if standby_config is not None:
+                self.load_config(standby_config, timeout_s=timeout_s)
+                device_enabled = self.get_device_enabled(timeout_s=timeout_s)
                 output_enabled = self.get_output_enabled(timeout_s=timeout_s)
-                initialization_state["output_enabled"] = output_enabled
-                initialization_state["standby_outputs_recovered"] = (
-                    output_enabled == (False, False)
-                )
-                if output_enabled != (False, False):
-                    raise RuntimeError(
-                        "PSU standby configuration left outputs enabled even after "
-                        f"forcing them OFF: {output_enabled}. Refusing to continue "
-                        "initialization."
+                initialization_state = {
+                    "standby_config": int(standby_config),
+                    "device_enabled": device_enabled,
+                    "output_enabled": output_enabled,
+                }
+
+                if require_standby_outputs_disabled and output_enabled != (False, False):
+                    initialization_state["standby_output_enabled_before_recovery"] = output_enabled
+                    self.logger.warning(
+                        "PSU standby configuration %s left outputs enabled %s; "
+                        "forcing both outputs OFF before continuing.",
+                        standby_config,
+                        output_enabled,
                     )
+                    self.set_output_enabled(False, False, timeout_s=timeout_s)
+                    output_enabled = self.get_output_enabled(timeout_s=timeout_s)
+                    initialization_state["output_enabled"] = output_enabled
+                    initialization_state["standby_outputs_recovered"] = (
+                        output_enabled == (False, False)
+                    )
+                    if output_enabled != (False, False):
+                        raise RuntimeError(
+                            "PSU standby configuration left outputs enabled even after "
+                            f"forcing them OFF: {output_enabled}. Refusing to continue "
+                            "initialization."
+                        )
 
             if operating_config is not None:
                 self.load_config(operating_config, timeout_s=timeout_s)
@@ -525,6 +531,83 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         )
         self._raise_on_status(status, f"load_current_config({config_number})")
 
+    def save_config(
+        self,
+        config_number: int,
+        *,
+        name: str | None = None,
+        active: bool | None = None,
+        valid: bool | None = None,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Save the current PSU state into one configuration slot."""
+        self._require_connected()
+        self.logger.info(f"Saving PSU config {config_number}")
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.save_current_config,
+            timeout_s,
+            "save_current_config",
+            self,
+            config_number,
+        )
+        self._raise_on_status(status, f"save_current_config({config_number})")
+        if name is not None:
+            self.set_config_name(config_number, name, timeout_s=timeout_s)
+        if active is not None or valid is not None:
+            active_value = True if active is None else bool(active)
+            valid_value = True if valid is None else bool(valid)
+            self.set_config_flags(
+                config_number,
+                active=active_value,
+                valid=valid_value,
+                timeout_s=timeout_s,
+            )
+
+    def set_config_name(
+        self,
+        config_number: int,
+        name: str,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Set the human-readable name of one PSU configuration slot."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_config_name,
+            timeout_s,
+            "set_config_name",
+            self,
+            config_number,
+            name,
+        )
+        self._raise_on_status(status, f"set_config_name({config_number}, {name!r})")
+
+    def set_config_flags(
+        self,
+        config_number: int,
+        *,
+        active: bool,
+        valid: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Set the active/valid flags of one PSU configuration slot."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_config_flags,
+            timeout_s,
+            "set_config_flags",
+            self,
+            config_number,
+            active,
+            valid,
+        )
+        self._raise_on_status(
+            status,
+            f"set_config_flags({config_number}, active={active}, valid={valid})",
+        )
+
     def set_device_enabled(
         self,
         enable: bool,
@@ -582,6 +665,56 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             self._get_output_enabled_unlocked,
             timeout_s,
             "get_output_enabled",
+        )
+
+    def _get_output_full_range_unlocked(self) -> tuple[bool, bool]:
+        status, psu0, psu1 = PSUBase.get_psu_full_range(self)
+        if status == self.NO_ERR:
+            return psu0, psu1
+        if self._is_optional_command_failure(status):
+            state_status, state = PSUBase.get_psu_state(self)
+            self._raise_on_status(state_status, "get_psu_state")
+            self.logger.warning(
+                "PSU get_psu_full_range is unavailable on this controller; "
+                "falling back to get_psu_state range bits."
+            )
+            return (
+                bool(state & self.PSU_STATE_PSU0_FULL_ACT),
+                bool(state & self.PSU_STATE_PSU1_FULL_ACT),
+            )
+        self._raise_on_status(status, "get_psu_full_range")
+        return False, False
+
+    def set_output_full_range(
+        self,
+        psu0: bool,
+        psu1: bool,
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        """Set the full-range state for the two PSU channels."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        status = self._call_locked_with_timeout(
+            PSUBase.set_psu_full_range,
+            timeout_s,
+            "set_psu_full_range",
+            self,
+            psu0,
+            psu1,
+        )
+        self._raise_on_status(status, f"set_psu_full_range({psu0}, {psu1})")
+
+    def get_output_full_range(
+        self,
+        timeout_s: Optional[float] = None,
+    ) -> tuple[bool, bool]:
+        """Return the full-range state for the two PSU channels."""
+        self._require_connected()
+        timeout_s = self._resolve_io_timeout(timeout_s)
+        return self._call_locked_with_timeout(
+            self._get_output_full_range_unlocked,
+            timeout_s,
+            "get_output_full_range",
         )
 
     def set_interlock_enabled(
@@ -775,9 +908,22 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
         self._raise_on_status(main_status, "get_main_state")
         device_state_status, device_state_hex, device_state_flags = PSUBase.get_device_state(self)
         self._raise_on_status(device_state_status, "get_device_state")
+        psu_state_status, psu_state = PSUBase.get_psu_state(self)
+        self._raise_on_status(psu_state_status, "get_psu_state")
         device_enabled_status, device_enabled = PSUBase.get_device_enable(self)
         self._raise_on_status(device_enabled_status, "get_device_enable")
         output_enabled_raw = self._get_output_enabled_unlocked()
+        full_range_supported_status, full_range0_supported, full_range1_supported = (
+            PSUBase.has_psu_full_range(self)
+        )
+        if full_range_supported_status == self.NO_ERR:
+            full_range_supported = (full_range0_supported, full_range1_supported)
+        elif self._is_optional_command_failure(full_range_supported_status):
+            full_range_supported = (False, False)
+        else:
+            self._raise_on_status(full_range_supported_status, "has_psu_full_range")
+            full_range_supported = (False, False)
+        full_range_raw = self._get_output_full_range_unlocked()
         housekeeping_status, volt_rect, volt_5v0, volt_3v3, temp_cpu = PSUBase.get_housekeeping(self)
         self._raise_on_status(housekeeping_status, "get_housekeeping")
         sensor_status, temperatures = PSUBase.get_sensor_data(self)
@@ -800,6 +946,24 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                 expected_len=self.PSU_NUM,
                 fill_value=False,
                 label="output enabled state",
+            )
+        )
+        full_range = tuple(
+            bool(value)
+            for value in self._normalize_fixed_length_values(
+                full_range_raw,
+                expected_len=self.PSU_NUM,
+                fill_value=False,
+                label="full range state",
+            )
+        )
+        full_range_supported = tuple(
+            bool(value)
+            for value in self._normalize_fixed_length_values(
+                full_range_supported,
+                expected_len=self.PSU_NUM,
+                fill_value=False,
+                label="full range support state",
             )
         )
         temperatures = self._normalize_fixed_length_values(
@@ -870,6 +1034,10 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
                     "channel": channel,
                     "label": self.CHANNEL_LABELS.get(channel, str(channel)),
                     "enabled": output_enabled[channel],
+                    "full_range": {
+                        "supported": full_range_supported[channel],
+                        "enabled": full_range[channel],
+                    },
                     "voltage": {
                         "measured_v": measured_voltage,
                         "set_v": set_voltage,
@@ -908,6 +1076,10 @@ class _PSUController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, PSUBase):
             "device_state": {
                 "hex": device_state_hex,
                 "flags": device_state_flags,
+            },
+            "psu_state": {
+                "hex": hex(psu_state),
+                "current_limit_active": bool(psu_state & self.PSU_STATE_ILIM_ACT),
             },
             "housekeeping": {
                 "volt_rect_v": volt_rect,

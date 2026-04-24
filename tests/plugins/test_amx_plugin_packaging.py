@@ -10,6 +10,7 @@ import types
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 
@@ -204,6 +205,7 @@ def test_amx_plugin_exposes_expected_metadata():
     assert ICON_PATH.exists()
     assert module.providePlugins() == [module.AMXDevice]
     assert module.AMXDevice.name == "AMX"
+    assert module.AMXDevice.supportedVersion == "1.0.1"
     assert module.AMXDevice.unit == "%"
     assert module.AMXDevice.useMonitors is True
     assert module.AMXDevice.useOnOffLogic is True
@@ -212,7 +214,7 @@ def test_amx_plugin_exposes_expected_metadata():
         assert image.size == (128, 128)
 
 
-def test_amx_plugin_defaults_to_standby_until_operating_config_is_selected():
+def test_amx_plugin_exposes_simple_config_settings():
     _clear_test_modules()
     _install_esibd_stubs()
 
@@ -233,13 +235,15 @@ def test_amx_plugin_defaults_to_standby_until_operating_config_is_selected():
         else:
             module.Device.getDefaultSettings = original_settings
 
+    assert "AMX/Standby config" not in settings
     assert settings["AMX/Operating config"][module.Parameter.VALUE] == -1
     tooltip = settings["AMX/Operating config"][module.Parameter.TOOLTIP]
-    assert "leave the AMX in standby" in tooltip or "leave the controller connected" in tooltip
+    assert "without enabling the AMX" in tooltip
     assert settings["AMX/Available configs"][module.Parameter.VALUE] == "n/a"
-    assert "reported by the controller after connect" in settings["AMX/Available configs"][
-        module.Parameter.TOOLTIP
-    ]
+    available_tooltip = settings["AMX/Available configs"][module.Parameter.TOOLTIP]
+    assert "reported by the controller after connect" in available_tooltip
+    assert "Signal config" in available_tooltip
+    assert "shutdown config" not in available_tooltip
 
 
 def test_amx_plugin_loads_driver_from_private_runtime():
@@ -463,6 +467,55 @@ def test_missing_default_config_keeps_amx_empty_until_first_initialization(tmp_p
     assert global_updates == ["IN"]
 
 
+def test_amx_channel_monitor_feedback_uses_relative_color_bands():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeWidget:
+        def __init__(self):
+            self.styles = []
+
+        def setStyleSheet(self, style):
+            self.styles.append(style)
+
+    class FakeParameter:
+        def __init__(self, widget):
+            self.widget = widget
+
+        def getWidget(self):
+            return self.widget
+
+    monitor_widget = FakeWidget()
+    channel = object.__new__(module.AMXChannel)
+    channel.channelParent = types.SimpleNamespace(
+        controller=types.SimpleNamespace(acquiring=True),
+        isOn=lambda: True,
+    )
+    channel.enabled = True
+    channel.real = True
+    channel.duty_text = "50.0"
+    channel.monitor = 50.1
+    channel.warningState = False
+    channel.getParameterByName = lambda name: {"Monitor": FakeParameter(monitor_widget)}[name]
+
+    module.AMXChannel.monitorChanged(channel)
+    assert "#2f855a" in monitor_widget.styles[-1]
+
+    channel.monitor = 53.0
+    module.AMXChannel.monitorChanged(channel)
+    assert "#dd6b20" in monitor_widget.styles[-1]
+
+    channel.monitor = 60.0
+    module.AMXChannel.monitorChanged(channel)
+    assert "#c53030" in monitor_widget.styles[-1]
+
+    channel.monitor = np.nan
+    module.AMXChannel.monitorChanged(channel)
+    assert monitor_widget.styles[-1] == ""
+
+
 def test_estimate_storage_handles_empty_pre_initialization_state():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -671,6 +724,57 @@ def test_amx_set_on_initializes_communication_when_turning_on():
 
     assert init_calls == [True]
     assert toggle_calls == []
+
+
+def test_amx_partial_startup_exposes_toolbar_disconnect_action():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("amx_plugin_test", PLUGIN_PATH)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.visible = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setVisible(self, visible):
+            self.visible = visible
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.closeCommunicationAction = FakeAction()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.liveDisplay = types.SimpleNamespace(recordingAction=FakeAction())
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=False,
+        transitioning=False,
+        main_state="Connected",
+    )
+    device.isOn = lambda: False
+
+    module.AMXDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is True
+    assert device.closeCommunicationAction.visible is True
+    assert device.recordingAction.enabled is False
+    assert device.liveDisplay.recordingAction.enabled is False
+
+    device.controller.device = None
+    device.controller.initialized = False
+    module.AMXDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is False
+    assert device.closeCommunicationAction.visible is False
 
 
 def test_amx_toggle_recording_rejects_disconnected_device():
@@ -1120,6 +1224,22 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
         def click(self):
             self.clicked.emit()
 
+    class FakeFrequency:
+        def __init__(self):
+            self.value = None
+            self.tooltips = []
+            self.blocked = False
+            self.valueChanged = FakeSignal()
+
+        def setValue(self, value):
+            self.value = value
+
+        def blockSignals(self, blocked):
+            self.blocked = blocked
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
     class FakeLabel:
         def __init__(self, text=""):
             self.text = text
@@ -1139,6 +1259,7 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
             self.inserted.append((before, widget))
 
     load_calls = []
+    frequency_changes = []
     device = object.__new__(module.AMXDevice)
     device.name = "AMX"
     device.titleBar = FakeTitleBar()
@@ -1152,6 +1273,7 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     device.loaded_config_text = "9:Static:Out0-3=Hi-Z [memory]"
     device.standby_config = -1
     device.operating_config = 9
+    device.frequency_khz = 2.0
     device.isOn = lambda: True
     device.controller = types.SimpleNamespace(
         device=object(),
@@ -1161,13 +1283,15 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
         loadOperatingConfigNowFromThread=lambda parallel=True: load_calls.append(parallel),
     )
     device._update_status_widgets = lambda: None
+    device.frequencyChanged = lambda: frequency_changes.append(device.frequency_khz)
     device._create_config_selector_widget = lambda: FakeCombo()
     device._create_config_button_widget = lambda text: FakeButton(text)
+    device._create_frequency_widget = lambda: FakeFrequency()
 
     module.AMXDevice._ensure_config_controls(device)
 
-    assert len(device.titleBar.inserted) == 5
-    assert device.operatingConfigLabel.text == "Config:"
+    assert len(device.titleBar.inserted) == 7
+    assert device.operatingConfigLabel.text == "Signal:"
     assert device.loadedConfigValueLabel.text == "9:Static:Out0-3=Hi-Z [memory]"
     assert device.operatingConfigCombo.items == [
         ("Skip (-1)", -1),
@@ -1176,13 +1300,19 @@ def test_config_controls_show_available_slots_loaded_status_and_load_now_action(
     ]
     assert device.operatingConfigCombo.currentIndex() == 2
     assert "Available AMX configs:" in device.operatingConfigCombo.tooltips[-1]
+    assert "signal/routing shape" in device.operatingConfigCombo.tooltips[-1]
     assert "Loaded: 9:Static:Out0-3=Hi-Z [memory]" in device.loadedConfigValueLabel.tooltips[-1]
+    assert device.frequencyLabel.text == "Freq:"
+    assert device.frequencyWidget.value == 2.0
     assert device.loadOperatingConfigButton.enabled is True
     assert not hasattr(device, "standbyConfigCombo")
 
     device.loadOperatingConfigButton.click()
+    device.frequencyWidget.valueChanged.emit(4.0)
 
     assert load_calls == [True]
+    assert device.frequency_khz == 4.0
+    assert frequency_changes == [4.0]
 
 
 def test_config_controls_disable_load_now_until_amx_is_ready():
@@ -1257,6 +1387,21 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
         def setToolTip(self, tooltip):
             self.tooltips.append(tooltip)
 
+    class FakeFrequency:
+        def __init__(self):
+            self.value = None
+            self.tooltips = []
+            self.valueChanged = FakeSignal()
+
+        def setValue(self, value):
+            self.value = value
+
+        def blockSignals(self, _blocked):
+            return None
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
     class FakeLabel:
         def __init__(self, text=""):
             self.text = text
@@ -1282,6 +1427,7 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
     device.loaded_config_text = "n/a"
     device.standby_config = -1
     device.operating_config = 9
+    device.frequency_khz = 2.0
     device.isOn = lambda: False
     device.controller = types.SimpleNamespace(
         device=None,
@@ -1292,6 +1438,7 @@ def test_config_controls_disable_load_now_until_amx_is_ready():
     device._update_status_widgets = lambda: None
     device._create_config_selector_widget = lambda: FakeCombo()
     device._create_config_button_widget = lambda text: FakeButton(text)
+    device._create_frequency_widget = lambda: FakeFrequency()
 
     module.AMXDevice._ensure_config_controls(device)
 
@@ -1373,6 +1520,21 @@ def test_config_controls_disable_load_now_when_amx_is_off():
         def setToolTip(self, tooltip):
             self.tooltips.append(tooltip)
 
+    class FakeFrequency:
+        def __init__(self):
+            self.value = None
+            self.tooltips = []
+            self.valueChanged = FakeSignal()
+
+        def setValue(self, value):
+            self.value = value
+
+        def blockSignals(self, _blocked):
+            return None
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
     class FakeLabel:
         def __init__(self, text=""):
             self.text = text
@@ -1398,6 +1560,7 @@ def test_config_controls_disable_load_now_when_amx_is_off():
     device.loaded_config_text = "n/a"
     device.standby_config = -1
     device.operating_config = 9
+    device.frequency_khz = 2.0
     device.isOn = lambda: False
     device.controller = types.SimpleNamespace(
         device=object(),
@@ -1408,6 +1571,7 @@ def test_config_controls_disable_load_now_when_amx_is_off():
     device._update_status_widgets = lambda: None
     device._create_config_selector_widget = lambda: FakeCombo()
     device._create_config_button_widget = lambda text: FakeButton(text)
+    device._create_frequency_widget = lambda: FakeFrequency()
 
     module.AMXDevice._ensure_config_controls(device)
 

@@ -91,6 +91,11 @@ class PSUBase:
 
     PSU_STATE_PSU0_ENB_CTRL = 1 << 4
     PSU_STATE_PSU1_ENB_CTRL = 1 << 5
+    PSU_STATE_PSU0_FULL_CTRL = 1 << 6
+    PSU_STATE_PSU1_FULL_CTRL = 1 << 7
+    PSU_STATE_ILIM_ACT = 1 << 12
+    PSU_STATE_PSU0_FULL_ACT = 1 << 13
+    PSU_STATE_PSU1_FULL_ACT = 1 << 14
     PSU_STATE_PSU0_ENB_ACT = 1 << 20
     PSU_STATE_PSU1_ENB_ACT = 1 << 21
 
@@ -511,6 +516,19 @@ class PSUBase:
         )
         return status, _decode_vendor_text(name.value)
 
+    def set_config_name(self, config_number: int, name: str) -> int:
+        """Set a PSU configuration name."""
+        config_number = self._validate_config_number(config_number)
+        encoded = str(name or "").encode("ascii", errors="replace")
+        buffer = ctypes.create_string_buffer(self.CONFIG_NAME_SIZE)
+        max_bytes = max(self.CONFIG_NAME_SIZE - 1, 0)
+        buffer.value = encoded[:max_bytes]
+        return self.psu_dll.COM_HVPSU2D_SetConfigName(
+            self.port,
+            config_number,
+            buffer,
+        )
+
     def get_config_flags(self, config_number: int):
         """Get the active/valid flags for one configuration."""
         config_number = self._validate_config_number(config_number)
@@ -520,6 +538,16 @@ class PSUBase:
             self.port, config_number, ctypes.byref(active), ctypes.byref(valid)
         )
         return status, active.value, valid.value
+
+    def set_config_flags(self, config_number: int, active: bool, valid: bool) -> int:
+        """Set the active/valid flags for one configuration."""
+        config_number = self._validate_config_number(config_number)
+        return self.psu_dll.COM_HVPSU2D_SetConfigFlags(
+            self.port,
+            config_number,
+            bool(active),
+            bool(valid),
+        )
 
     def get_config_list(self):
         """Get the full PSU configuration list."""

@@ -1486,10 +1486,16 @@ class _DMMRController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, DMMRBase):
 
         if self.connected and disable_automatic_current:
             status = self.set_automatic_current(False, timeout_s=timeout_s)
+            if status == self.ERR_NOT_CONNECTED:
+                self.connected = False
+                return self.disconnect()
             self._raise_on_status(status, "set_automatic_current(False)")
 
         if self.connected and disable_device:
             status = self.set_enable(False, timeout_s=timeout_s)
+            if status == self.ERR_NOT_CONNECTED:
+                self.connected = False
+                return self.disconnect()
             self._raise_on_status(status, "set_enable(False)")
 
         return self.disconnect()

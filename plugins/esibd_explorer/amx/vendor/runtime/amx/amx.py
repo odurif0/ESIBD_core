@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from pathlib import Path
@@ -156,7 +157,17 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             self.logger.debug(f"Skipping AMX identity probe after connect: {exc}")
             return
 
-        if status != self.NO_ERR or not product_id:
+        try:
+            status_value = int(status)
+        except (TypeError, ValueError):
+            return
+        if status_value != self.NO_ERR:
+            raise RuntimeError(
+                "Connected device did not respond to the AMX identity probe: "
+                f"get_product_id returned {self.format_status(status_value)}. "
+                "Check the COM port and use the matching plugin for that instrument."
+            )
+        if not product_id:
             return
 
         normalized = product_id.upper()
@@ -204,7 +215,20 @@ class _AMXController(DllPortClaimRegistryMixin, TimeoutSafeDllMixin, AMXBase):
             )
             if baud_status == self.NO_ERR:
                 self.connected = True
-                self._warn_if_unexpected_product_id(timeout_s=timeout_s)
+                try:
+                    self._warn_if_unexpected_product_id(timeout_s=timeout_s)
+                except Exception:
+                    if not self._transport_poisoned:
+                        with contextlib.suppress(Exception):
+                            close_status = self._call_locked_with_timeout(
+                                close_port,
+                                timeout_s,
+                                "close_port",
+                            )
+                            if close_status == self.NO_ERR:
+                                self._set_port_claimed(False)
+                    self.connected = False
+                    raise
                 self.logger.info(
                     f"Successfully connected to AMX device {self.device_id} "
                     f"(baud rate: {actual_baud})"
