@@ -315,6 +315,31 @@ def _invoke_gui_callback(callback: Any) -> None:
         callback()
 
 
+def _disable_spinbox_wheel(widget: Any) -> None:
+    """Prevent accidental mouse-wheel edits on hardware-facing spinboxes."""
+    install_filter = getattr(widget, "installEventFilter", None)
+    if not callable(install_filter) or getattr(widget, "_esibd_wheel_event_blocker", None):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QEvent
+    except ImportError:
+        return
+
+    class _WheelEventBlocker(QObject):
+        def eventFilter(self, watched: Any, event: Any) -> bool:
+            event_type = getattr(event, "type", None)
+            if callable(event_type) and event_type() == QEvent.Type.Wheel:
+                ignore = getattr(event, "ignore", None)
+                if callable(ignore):
+                    ignore()
+                return True
+            return False
+
+    blocker = _WheelEventBlocker(widget)
+    install_filter(blocker)
+    setattr(widget, "_esibd_wheel_event_blocker", blocker)
+
+
 def _setpoint_matches(
     actual: Any,
     expected: Any,
@@ -1081,6 +1106,7 @@ class PSUDevice(Device):
         widget.setAccelerated(True)
         widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
         widget.setStyleSheet(_PSU_MANUAL_SPINBOX_STYLE)
+        _disable_spinbox_wheel(widget)
         return widget
 
     def _create_manual_slot_widget(self) -> Any:
@@ -1092,6 +1118,7 @@ class PSUDevice(Device):
         widget.setValue(max(self._config_setting_value("operating_config"), 0))
         widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
         widget.setStyleSheet(_PSU_MANUAL_SPINBOX_STYLE)
+        _disable_spinbox_wheel(widget)
         return widget
 
     def _combo_clear(self, combo: Any) -> None:

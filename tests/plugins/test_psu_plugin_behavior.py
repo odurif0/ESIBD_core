@@ -123,6 +123,62 @@ def _load_module():
     return module
 
 
+def _install_fake_qtcore(monkeypatch):
+    pyqt = types.ModuleType("PyQt6")
+    pyqt.__path__ = []
+    qtcore = types.ModuleType("PyQt6.QtCore")
+
+    class FakeQObject:
+        def __init__(self, parent=None):
+            self.parent = parent
+
+    class FakeQEvent:
+        class Type:
+            Wheel = "wheel"
+
+    qtcore.QObject = FakeQObject
+    qtcore.QEvent = FakeQEvent
+    pyqt.QtCore = qtcore
+    monkeypatch.setitem(sys.modules, "PyQt6", pyqt)
+    monkeypatch.setitem(sys.modules, "PyQt6.QtCore", qtcore)
+    return FakeQEvent
+
+
+def test_spinbox_wheel_events_are_blocked(monkeypatch):
+    module = _load_module()
+    fake_event_class = _install_fake_qtcore(monkeypatch)
+
+    class FakeWidget:
+        def __init__(self):
+            self.filters = []
+
+        def installEventFilter(self, event_filter):
+            self.filters.append(event_filter)
+
+    class FakeEvent:
+        def __init__(self, event_type):
+            self.event_type = event_type
+            self.ignored = False
+
+        def type(self):
+            return self.event_type
+
+        def ignore(self):
+            self.ignored = True
+
+    widget = FakeWidget()
+
+    module._disable_spinbox_wheel(widget)
+    module._disable_spinbox_wheel(widget)
+
+    assert len(widget.filters) == 1
+    wheel_event = FakeEvent(fake_event_class.Type.Wheel)
+    assert widget.filters[0].eventFilter(widget, wheel_event) is True
+    assert wheel_event.ignored is True
+    other_event = FakeEvent("other")
+    assert widget.filters[0].eventFilter(widget, other_event) is False
+
+
 def test_bootstrap_config_is_replaced_with_fixed_channels():
     module = _load_module()
     default_item = {
