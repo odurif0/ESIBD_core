@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import inspect
 import shutil
 import sys
 import types
@@ -175,6 +176,7 @@ def test_dmmr_plugin_exposes_expected_metadata():
     assert ICON_PATH.exists()
     assert module.providePlugins() == [module.DMMRDevice]
     assert module.DMMRDevice.name == "DMMR"
+    assert module.DMMRDevice.supportedVersion == "1.0.1"
     assert module.DMMRDevice.unit == "A"
     assert module.DMMRDevice.useMonitors is True
     assert module.DMMRDevice.useOnOffLogic is True
@@ -236,6 +238,50 @@ def test_dmmr_plugin_runtime_supports_explicit_process_backend_when_supported(mo
     dmmr.close()
 
     assert dmmr._backend.closed is True
+
+
+def test_dmmr_process_backend_calls_methods_with_rpc_timeout(monkeypatch):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_dmmr_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    controller_process = importlib.import_module(f"{runtime_root}._controller_process")
+    calls = []
+
+    signature = inspect.signature(controller_process.ControllerProcessProxy.call_method)
+    assert "rpc_timeout_s" in signature.parameters
+    assert "timeout_s" not in signature.parameters
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def call_method(self, method_name, *args, rpc_timeout_s, **kwargs):
+            calls.append((method_name, args, rpc_timeout_s, kwargs))
+            return "ok"
+
+        def close(self):
+            return None
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            return None
+
+        def connect(self, timeout_s=None):
+            return True
+
+    monkeypatch.setattr(driver_common, "RUNTIME_IS_WINDOWS", True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    dmmr = driver_class("dmmr_process", com=8, process_backend=True)
+    result = dmmr.connect(timeout_s=2.0)
+
+    assert result == "ok"
+    assert calls == [("connect", (), 15.0, {"timeout_s": 2.0})]
 
 
 def test_dmmr_plugin_runtime_defaults_to_inline_backend(monkeypatch):
@@ -341,8 +387,8 @@ def test_dmmr_recording_action_reflects_device_readiness():
     module.DMMRDevice._sync_acquisition_controls(device)
     assert device.recordingAction.enabled is False
     assert device.liveDisplay.recordingAction.enabled is False
-    assert display_close.enabled is False
-    assert display_init.enabled is True
+    assert display_close.enabled is True
+    assert display_init.enabled is False
 
     device.controller.initialized = True
     device.controller.main_state = "ST_ON"
@@ -351,6 +397,57 @@ def test_dmmr_recording_action_reflects_device_readiness():
     assert device.liveDisplay.recordingAction.enabled is True
     assert display_close.enabled is True
     assert display_init.enabled is False
+
+
+def test_dmmr_partial_startup_exposes_toolbar_disconnect_action():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.visible = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setVisible(self, visible):
+            self.visible = visible
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.DMMRDevice)
+    device.name = "DMMR"
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.closeCommunicationAction = FakeAction()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.liveDisplay = types.SimpleNamespace(recordingAction=FakeAction())
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=False,
+        transitioning=False,
+        main_state="Connected",
+    )
+    device.isOn = lambda: False
+
+    module.DMMRDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is True
+    assert device.closeCommunicationAction.visible is True
+    assert device.recordingAction.enabled is False
+    assert device.liveDisplay.recordingAction.enabled is False
+
+    device.controller.device = None
+    device.controller.initialized = False
+    module.DMMRDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is False
+    assert device.closeCommunicationAction.visible is False
 
 
 def test_dmmr_toggle_recording_rejects_unready_device():
@@ -400,6 +497,86 @@ def test_dmmr_toggle_recording_rejects_unready_device():
     assert device.printed == [
         ("Cannot start DMMR data acquisition: state is ST_STBY.", module.PRINT.WARNING)
     ]
+
+
+def test_dmmr_init_gui_hides_table_and_creates_panel():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    super_calls = []
+    original_init_gui = getattr(module.Device, "initGUI", None)
+    original_controller = module.DMMRController
+    module.Device.initGUI = lambda self: super_calls.append("super")
+    module.DMMRController = lambda controllerParent: types.SimpleNamespace(
+        controllerParent=controllerParent
+    )
+    try:
+        device = object.__new__(module.DMMRDevice)
+        hook_calls = []
+        device._hide_channel_table = lambda: hook_calls.append("hide_table")
+        device._hide_channel_table_actions = lambda: hook_calls.append("hide_actions")
+        device._ensure_channel_panel = lambda: hook_calls.append("panel")
+
+        module.DMMRDevice.initGUI(device)
+    finally:
+        if original_init_gui is None:
+            delattr(module.Device, "initGUI")
+        else:
+            module.Device.initGUI = original_init_gui
+        module.DMMRController = original_controller
+
+    assert super_calls == ["super"]
+    assert hook_calls == ["hide_table", "hide_actions", "panel"]
+    assert device.controller.controllerParent is device
+
+
+def test_dmmr_finalize_init_refreshes_panel_hooks():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    super_calls = []
+    original_finalize = getattr(module.Device, "finalizeInit", None)
+    module.Device.finalizeInit = lambda self: super_calls.append("super")
+    try:
+        device = object.__new__(module.DMMRDevice)
+        device.name = "DMMR"
+        tooltip_calls = []
+        device.advancedAction = types.SimpleNamespace(
+            toolTipFalse="",
+            toolTipTrue="",
+            setToolTip=lambda tooltip: tooltip_calls.append(tooltip),
+        )
+        hook_calls = []
+        device._ensure_local_on_action = lambda: hook_calls.append("local_on")
+        device._ensure_status_widgets = lambda: hook_calls.append("status")
+        device._hide_channel_table = lambda: hook_calls.append("hide_table")
+        device._hide_channel_table_actions = lambda: hook_calls.append("hide_actions")
+        device._ensure_channel_panel = lambda: hook_calls.append("panel")
+        device._update_channel_column_visibility = lambda: hook_calls.append("columns")
+        device._sync_acquisition_controls = lambda: hook_calls.append("acquisition")
+
+        module.DMMRDevice.finalizeInit(device)
+    finally:
+        if original_finalize is None:
+            delattr(module.Device, "finalizeInit")
+        else:
+            module.Device.finalizeInit = original_finalize
+
+    assert super_calls == ["super"]
+    assert hook_calls == [
+        "local_on",
+        "status",
+        "hide_table",
+        "hide_actions",
+        "panel",
+        "columns",
+        "acquisition",
+    ]
+    assert tooltip_calls == ["Show expert columns and channel layout actions for DMMR."]
 
 
 def test_dmmr_channel_keeps_active_parameter_for_core_init():
@@ -566,6 +743,124 @@ def test_dmmr_status_badge_keeps_unconfirmed_shutdown_visible_when_ui_is_off():
         module.DMMRDevice._display_main_state(device)
         == module._DMMR_SHUTDOWN_UNCONFIRMED_STATE
     )
+
+
+def test_dmmr_channel_panel_snapshot_formats_live_current():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    enabled_parameter = types.SimpleNamespace(value=True)
+    display_parameter = types.SimpleNamespace(value=True)
+    channel = types.SimpleNamespace(
+        real=True,
+        enabled=True,
+        display=True,
+        ENABLED="Enabled",
+        DISPLAY="Display",
+        module_address=lambda: 3,
+        getParameterByName=lambda name: {
+            "Enabled": enabled_parameter,
+            "Display": display_parameter,
+        }.get(name),
+    )
+
+    device = object.__new__(module.DMMRDevice)
+    device.main_state = "ST_ON"
+    device.isOn = lambda: True
+    device.getChannels = lambda: [channel]
+    device.controller = types.SimpleNamespace(values={3: 2.3e-12})
+
+    snapshot = module.DMMRDevice._channel_panel_snapshot(device, 3)
+
+    assert snapshot["title"] == "Module 3"
+    assert snapshot["state_text"] == "Read"
+    assert snapshot["current_text"] == "2.3 pA"
+    assert snapshot["current_tooltip"] == "2.300000e-12 A"
+    assert snapshot["read_checked"] is True
+    assert snapshot["display_checked"] is True
+    assert "#3182ce" in snapshot["card_style"]
+
+
+def test_dmmr_channel_panel_read_toggle_updates_underlying_channel():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    parameter_updates = []
+    enabled_changed = []
+
+    class FakeParameter:
+        def __init__(self):
+            self.value = True
+
+        def setValueWithoutEvents(self, value):
+            self.value = value
+            parameter_updates.append(value)
+
+    parameter = FakeParameter()
+    channel = types.SimpleNamespace(
+        real=True,
+        enabled=True,
+        ENABLED="Enabled",
+        module_address=lambda: 2,
+        getParameterByName=lambda name: parameter if name == "Enabled" else None,
+        enabledChanged=lambda: enabled_changed.append(True),
+    )
+
+    update_calls = []
+    device = object.__new__(module.DMMRDevice)
+    device.getChannels = lambda: [channel]
+    device._update_channel_panel = lambda: update_calls.append(True)
+
+    module.DMMRDevice._channel_panel_read_toggled(device, 2, False)
+
+    assert parameter_updates == [False]
+    assert channel.enabled is False
+    assert enabled_changed == [True]
+    assert update_calls == [True]
+
+
+def test_dmmr_channel_panel_display_toggle_updates_underlying_channel():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("dmmr_plugin_test", PLUGIN_PATH)
+
+    parameter_updates = []
+    display_changed = []
+
+    class FakeParameter:
+        def __init__(self):
+            self.value = True
+
+        def setValueWithoutEvents(self, value):
+            self.value = value
+            parameter_updates.append(value)
+
+    parameter = FakeParameter()
+    channel = types.SimpleNamespace(
+        real=True,
+        display=True,
+        DISPLAY="Display",
+        module_address=lambda: 2,
+        getParameterByName=lambda name: parameter if name == "Display" else None,
+        displayChanged=lambda: display_changed.append(True),
+    )
+
+    update_calls = []
+    device = object.__new__(module.DMMRDevice)
+    device.getChannels = lambda: [channel]
+    device._update_channel_panel = lambda: update_calls.append(True)
+
+    module.DMMRDevice._channel_panel_display_toggled(device, 2, False)
+
+    assert parameter_updates == [False]
+    assert channel.display is False
+    assert display_changed == [True]
+    assert update_calls == [True]
 
 
 def test_dmmr_device_shutdown_keeps_ui_on_when_shutdown_is_unconfirmed():

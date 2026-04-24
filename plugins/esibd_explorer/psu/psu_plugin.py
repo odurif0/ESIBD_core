@@ -6,8 +6,11 @@ import contextlib
 import importlib
 import importlib.util
 import logging
+import math
 import sys
+import time
 from pathlib import Path
+from threading import Lock, Thread
 from typing import Any, cast
 
 import numpy as np
@@ -51,7 +54,98 @@ _PSU_OUTPUT_ON_STYLE = (
 _PSU_OUTPUT_OFF_STYLE = (
     "background-color: #4a5568; color: #ffffff; margin:0px; padding:0px 6px;"
 )
+_PSU_PANEL_CARD_ON_STYLE = (
+    "QFrame {"
+    " background-color: #162433;"
+    " border: 1px solid #3182ce;"
+    " border-radius: 8px;"
+    " color: #f7fafc;"
+    "}"
+)
+_PSU_PANEL_CARD_OFF_STYLE = (
+    "QFrame {"
+    " background-color: #202938;"
+    " border: 1px solid #64748b;"
+    " border-radius: 8px;"
+    " color: #f7fafc;"
+    "}"
+)
+_PSU_PANEL_CARD_DISCONNECTED_STYLE = (
+    "QFrame {"
+    " background-color: #151b26;"
+    " border: 1px solid #475569;"
+    " border-radius: 8px;"
+    " color: #e2e8f0;"
+    "}"
+)
+_PSU_PANEL_TITLE_STYLE = "color: #f8fafc; font-weight: 700; font-size: 14px;"
+_PSU_PANEL_METRIC_NAME_STYLE = "color: #cbd5e1; font-weight: 600;"
+_PSU_PANEL_METRIC_VALUE_STYLE = "color: #f8fafc; font-weight: 600;"
+_PSU_PANEL_DIAGNOSTICS_STYLE = (
+    "QFrame {"
+    " background-color: #111827;"
+    " border: 1px solid #334155;"
+    " border-radius: 8px;"
+    " color: #e2e8f0;"
+    "}"
+)
+_PSU_PANEL_DIAGNOSTICS_TITLE_STYLE = "color: #cbd5e1; font-weight: 700;"
+_PSU_PANEL_DIAGNOSTICS_TEXT_STYLE = "color: #e2e8f0;"
+_PSU_PANEL_SECTION_HEADER_STYLE = "color: #cbd5e1; font-weight: 700; font-size: 13px;"
+_PSU_PANEL_CARD_MIN_WIDTH = 220
+_PSU_PANEL_CARD_MAX_WIDTH = 300
+_PSU_PANEL_DIAGNOSTICS_MAX_WIDTH = 612
+_PSU_PANEL_OPERATOR_MAX_WIDTH = 820
+_PSU_LIVE_READBACK_REFRESH_PERIOD_S = 0.0
+_PSU_HOUSEKEEPING_REFRESH_PERIOD_S = 2.0
+_PSU_FEEDBACK_OK_STYLE = "background-color: #2f855a; color: #ffffff; margin:0px; padding:0px 4px;"
+_PSU_FEEDBACK_WARN_STYLE = "background-color: #dd6b20; color: #ffffff; margin:0px; padding:0px 4px;"
+_PSU_FEEDBACK_ERROR_STYLE = "background-color: #c53030; color: #ffffff; margin:0px; padding:0px 4px;"
+_PSU_FEEDBACK_NEUTRAL_STYLE = (
+    "background-color: #334155; color: #e2e8f0; margin:0px; padding:0px 4px;"
+)
+_PSU_MANUAL_SPINBOX_STYLE = (
+    "QDoubleSpinBox, QSpinBox {"
+    " background-color: #0f172a;"
+    " color: #f8fafc;"
+    " border: 1px solid #64748b;"
+    " border-radius: 4px;"
+    " padding: 2px 20px 2px 6px;"
+    " selection-background-color: #2563eb;"
+    "}"
+    "QDoubleSpinBox:disabled, QSpinBox:disabled {"
+    " background-color: #1f2937;"
+    " color: #94a3b8;"
+    " border-color: #475569;"
+    "}"
+    "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,"
+    " QSpinBox::up-button, QSpinBox::down-button {"
+    " background-color: #475569;"
+    " border: 1px solid #94a3b8;"
+    " width: 18px;"
+    "}"
+)
+_PSU_RANGE_BADGE_STYLE = (
+    "background-color: #334155; color: #e2e8f0; margin:0px; padding:0px 6px;"
+)
+_PSU_OPERATOR_STATUS_STYLE = "color: #e2e8f0; font-weight: 600;"
+_PSU_OPERATOR_NOTE_STYLE = "color: #94a3b8;"
+_PSU_OPERATOR_HEADER_STYLE = "color: #cbd5e1; font-weight: 700;"
+_PSU_VOLTAGE_OK_ABS_TOLERANCE_V = 0.25
+_PSU_VOLTAGE_WARN_ABS_TOLERANCE_V = 1.0
+_PSU_VOLTAGE_OK_RELATIVE_TOLERANCE = 0.02
+_PSU_VOLTAGE_WARN_RELATIVE_TOLERANCE = 0.05
+_PSU_CURRENT_LIMIT_WARN_RATIO = 0.95
+_PSU_CURRENT_LIMIT_ERROR_RATIO = 1.0
+_PSU_CURRENT_ZERO_OK_ABS_TOLERANCE_A = 0.001
+_PSU_CURRENT_ZERO_WARN_ABS_TOLERANCE_A = 0.01
+_PSU_DROPOUT_WARN_V = 10.0
+_PSU_DROPOUT_ERROR_V = 5.0
+_PSU_SETPOINT_VERIFY_ABS_TOLERANCE_V = 0.01
+_PSU_SETPOINT_VERIFY_ABS_TOLERANCE_A = 0.001
+_PSU_SETPOINT_VERIFY_REL_TOLERANCE = 0.01
 _PSU_FLOAT_SENTINEL = -1
+_PSU_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
 _PSU_MAIN_STATE_ALIASES = {
     "state_on": "ST_ON",
     "state_error": "ST_ERROR",
@@ -161,7 +255,81 @@ def _status_requires_operator_attention(state: Any) -> bool:
     normalized = str(state or "").strip().lower()
     return any(
         token in normalized
-        for token in ("err", "error", "fail", "fault", "lost", "overload", "timeout", "unknown")
+        for token in (
+            "err",
+            "error",
+            "fail",
+            "fault",
+            "lost",
+            "overload",
+            "timeout",
+            "unknown",
+            "unconfirmed",
+        )
+    )
+
+
+def _invoke_gui_callback(callback: Any) -> None:
+    """Run GUI updates directly in tests and queue them on the Qt GUI thread."""
+    if not callable(callback):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:
+        callback()
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        callback()
+        return
+
+    try:
+        if QThread.currentThread() == app.thread():
+            callback()
+            return
+
+        dispatcher = getattr(_invoke_gui_callback, "_dispatcher", None)
+        if dispatcher is None:
+            class _CallbackDispatcher(QObject):
+                callbackRequested = pyqtSignal(object)
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.callbackRequested.connect(
+                        self._run,
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+
+                def _run(self, queued_callback: Any) -> None:
+                    if callable(queued_callback):
+                        queued_callback()
+
+            dispatcher = _CallbackDispatcher()
+            dispatcher.moveToThread(app.thread())
+            setattr(_invoke_gui_callback, "_dispatcher", dispatcher)
+        dispatcher.callbackRequested.emit(callback)
+    except Exception:
+        callback()
+
+
+def _setpoint_matches(
+    actual: Any,
+    expected: Any,
+    *,
+    abs_tolerance: float,
+    rel_tolerance: float = _PSU_SETPOINT_VERIFY_REL_TOLERANCE,
+) -> bool:
+    actual_value = _coerce_float(actual, np.nan)
+    expected_value = _coerce_float(expected, np.nan)
+    if _is_nan(actual_value) or _is_nan(expected_value):
+        return False
+    return math.isclose(
+        actual_value,
+        expected_value,
+        rel_tol=float(rel_tolerance),
+        abs_tol=float(abs_tolerance),
     )
 
 
@@ -230,6 +398,24 @@ def _psu_output_state_badge_style(state: Any) -> str:
     return _PSU_NEUTRAL_WIDGET_STYLE
 
 
+def _psu_panel_card_style(*, connected: bool, output_state: Any) -> str:
+    if not connected:
+        return _PSU_PANEL_CARD_DISCONNECTED_STYLE
+    if str(output_state or "").strip().upper() == "ON":
+        return _PSU_PANEL_CARD_ON_STYLE
+    return _PSU_PANEL_CARD_OFF_STYLE
+
+
+def _psu_feedback_style(state: str) -> str:
+    if state == "ok":
+        return _PSU_FEEDBACK_OK_STYLE
+    if state == "warn":
+        return _PSU_FEEDBACK_WARN_STYLE
+    if state == "error":
+        return _PSU_FEEDBACK_ERROR_STYLE
+    return _PSU_FEEDBACK_NEUTRAL_STYLE
+
+
 def _format_current_text(current_a: Any) -> str:
     value = _coerce_float(current_a, np.nan)
     if _is_nan(value):
@@ -242,6 +428,173 @@ def _format_voltage_text(voltage_v: Any) -> str:
     if _is_nan(value):
         return "n/a"
     return f"{value:.6g} V"
+
+
+def _format_temperature_text(temp_c: Any) -> str:
+    value = _coerce_float(temp_c, np.nan)
+    if _is_nan(value):
+        return "n/a"
+    return f"{value:.6g} C"
+
+
+def _format_full_range_text(*, enabled: Any, supported: Any = True) -> str:
+    if not _coerce_bool(supported, default=True):
+        return "n/a"
+    return "Full" if _coerce_bool(enabled, default=False) else "Half"
+
+
+def _dropout_feedback_state(dropout_v: Any) -> str:
+    value = _coerce_float(dropout_v, np.nan)
+    if _is_nan(value):
+        return "default"
+    if value < _PSU_DROPOUT_ERROR_V:
+        return "error"
+    if value < _PSU_DROPOUT_WARN_V:
+        return "warn"
+    return "ok"
+
+
+def _voltage_feedback_state(
+    *,
+    enabled: Any,
+    measured_v: Any,
+    set_v: Any,
+) -> str:
+    measured = _coerce_float(measured_v, np.nan)
+    target = (
+        _coerce_float(set_v, np.nan)
+        if _coerce_bool(enabled, default=False)
+        else 0.0
+    )
+    if _is_nan(measured) or _is_nan(target):
+        return "default"
+    reference = max(abs(target), 1.0)
+    absolute_error = abs(measured - target)
+    relative_error = absolute_error / reference
+    if (
+        absolute_error <= _PSU_VOLTAGE_OK_ABS_TOLERANCE_V
+        or relative_error <= _PSU_VOLTAGE_OK_RELATIVE_TOLERANCE
+    ):
+        return "ok"
+    if (
+        absolute_error <= _PSU_VOLTAGE_WARN_ABS_TOLERANCE_V
+        or relative_error <= _PSU_VOLTAGE_WARN_RELATIVE_TOLERANCE
+    ):
+        return "warn"
+    return "error"
+
+
+def _current_limit_feedback_state(
+    *,
+    enabled: Any,
+    measured_a: Any,
+    limit_a: Any,
+    current_limit_active: Any = False,
+) -> str:
+    enabled_bool = _coerce_bool(enabled, default=False)
+    if enabled_bool and _coerce_bool(current_limit_active, default=False):
+        return "error"
+    measured = _coerce_float(measured_a, np.nan)
+    if _is_nan(measured):
+        return "default"
+    if not enabled_bool:
+        absolute_current = abs(measured)
+        if absolute_current <= _PSU_CURRENT_ZERO_OK_ABS_TOLERANCE_A:
+            return "ok"
+        if absolute_current <= _PSU_CURRENT_ZERO_WARN_ABS_TOLERANCE_A:
+            return "warn"
+        return "error"
+    limit = _coerce_float(limit_a, np.nan)
+    if _is_nan(limit) or limit <= 0:
+        return "default"
+    ratio = measured / limit
+    if ratio >= _PSU_CURRENT_LIMIT_ERROR_RATIO:
+        return "error"
+    if ratio >= _PSU_CURRENT_LIMIT_WARN_RATIO:
+        return "warn"
+    return "ok"
+
+
+def _format_rail_summary(rails: Any) -> str:
+    if not isinstance(rails, dict):
+        return "n/a"
+    parts: list[str] = []
+    for label, key in (
+        ("24Vp", "volt_24vp_v"),
+        ("12Vp", "volt_12vp_v"),
+        ("12Vn", "volt_12vn_v"),
+        ("Ref", "volt_ref_v"),
+    ):
+        value_text = _format_voltage_text(rails.get(key))
+        if value_text != "n/a":
+            parts.append(f"{label} {value_text}")
+    return ", ".join(parts) if parts else "n/a"
+
+
+def _format_channel_diagnostics_summary(
+    channel_index: int,
+    *,
+    temp_c: Any = None,
+    dropout_v: Any = None,
+    full_range_enabled: Any = None,
+    full_range_supported: Any = True,
+) -> str:
+    parts: list[str] = []
+    full_range_text = _format_full_range_text(
+        enabled=full_range_enabled,
+        supported=full_range_supported,
+    )
+    if full_range_text != "n/a":
+        parts.append(full_range_text)
+    temp_text = _format_temperature_text(temp_c)
+    if temp_text != "n/a":
+        parts.append(f"Tadc {temp_text}")
+    dropout_text = _format_voltage_text(dropout_v)
+    if dropout_text != "n/a":
+        parts.append(f"Dropout {dropout_text}")
+    if not parts:
+        return f"CH{channel_index} n/a"
+    return f"CH{channel_index} " + ", ".join(parts)
+
+
+def _format_channel_runtime_summary(
+    channel_index: int,
+    *,
+    enabled: Any = None,
+    voltage_v: Any = None,
+    current_a: Any = None,
+) -> str:
+    output_state = "ON" if _coerce_bool(enabled, default=False) else "OFF"
+    voltage_text = _format_voltage_text(voltage_v)
+    current_text = _format_current_text(current_a)
+    if voltage_text == "n/a" and current_text == "n/a":
+        return f"CH{channel_index} {output_state}"
+    return f"CH{channel_index} {output_state} {voltage_text} / {current_text}"
+
+
+def _format_channel_temperature_summary(channel_index: int, temp_c: Any) -> str:
+    """Return a compact toolbar summary for one PSU ADC temperature."""
+    return f"CH{channel_index} {_format_temperature_text(temp_c)}"
+
+
+def _set_widget_visible(widget: Any, visible: bool) -> None:
+    """Toggle visibility on Qt widgets and lightweight test doubles."""
+    if widget is None:
+        return
+    set_visible = getattr(widget, "setVisible", None)
+    if callable(set_visible):
+        set_visible(bool(visible))
+        return
+    if visible:
+        show = getattr(widget, "show", None)
+        if callable(show):
+            show()
+            return
+    hide = getattr(widget, "hide", None)
+    if callable(hide):
+        hide()
+        return
+    widget.visible = bool(visible)
 
 
 def _channel_key_from_item(item: dict[str, Any]) -> int:
@@ -495,15 +848,15 @@ def providePlugins() -> "list[type[Plugin]]":
 
 
 class PSUDevice(Device):
-    """Drive the PSU through validated configs and monitor readbacks."""
+    """Drive the PSU through stored configs or manual setpoints and monitor readbacks."""
 
     documentation = (
-        "Loads validated PSU configurations and monitors live voltage/current readbacks."
+        "Loads PSU configurations or applies manual setpoints and monitors live voltage/current readbacks."
     )
 
     name = "PSU"
     version = "0.1.0"
-    supportedVersion = "0.8"
+    supportedVersion = "1.0.1"
     pluginType = PLUGINTYPE.INPUTDEVICE
     unit = "V"
     useMonitors = True
@@ -541,6 +894,10 @@ class PSUDevice(Device):
             self.closeCommunicationAction.setText(shutdown_tooltip)
             self.closeCommunicationAction.setVisible(False)
         self.controller = PSUController(controllerParent=self)
+        self._ensure_bootstrap_channels_present()
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
         self._update_channel_column_visibility()
 
     def finalizeInit(self) -> None:
@@ -548,6 +905,8 @@ class PSUDevice(Device):
         self._ensure_local_on_action()
         self._ensure_status_widgets()
         self._ensure_config_selectors()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
         self._update_channel_column_visibility()
         self._sync_acquisition_controls()
 
@@ -592,6 +951,7 @@ class PSUDevice(Device):
     output_summary: str
     available_configs_text: str
     available_configs: list[dict[str, Any]]
+    loaded_state_text: str
 
     def _current_channel_items(self) -> list[dict[str, Any]]:
         return [channel.asDict() for channel in self.getChannels()]
@@ -694,6 +1054,45 @@ class PSUDevice(Device):
             combo.setSizeAdjustPolicy(type(combo).SizeAdjustPolicy.AdjustToContents)
         return combo
 
+    def _create_config_button_widget(self, text: str) -> Any:
+        from PyQt6.QtWidgets import QPushButton
+
+        button = QPushButton(text)
+        button.setMinimumWidth(96)
+        return button
+
+    def _create_manual_numeric_widget(
+        self,
+        *,
+        suffix: str,
+        decimals: int,
+        step: float,
+        maximum: float,
+    ) -> Any:
+        from PyQt6.QtWidgets import QAbstractSpinBox, QDoubleSpinBox
+
+        widget = QDoubleSpinBox()
+        widget.setRange(0.0, float(maximum))
+        widget.setDecimals(int(decimals))
+        widget.setSingleStep(float(step))
+        widget.setSuffix(f" {suffix}")
+        widget.setMinimumWidth(110)
+        widget.setAccelerated(True)
+        widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        widget.setStyleSheet(_PSU_MANUAL_SPINBOX_STYLE)
+        return widget
+
+    def _create_manual_slot_widget(self) -> Any:
+        from PyQt6.QtWidgets import QAbstractSpinBox, QSpinBox
+
+        widget = QSpinBox()
+        widget.setRange(0, 167)
+        widget.setMinimumWidth(80)
+        widget.setValue(max(self._config_setting_value("operating_config"), 0))
+        widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        widget.setStyleSheet(_PSU_MANUAL_SPINBOX_STYLE)
+        return widget
+
     def _combo_clear(self, combo: Any) -> None:
         clear = getattr(combo, "clear", None)
         if callable(clear):
@@ -741,6 +1140,225 @@ class PSUDevice(Device):
         if callable(connect):
             connect(lambda *_args, attr_name=attr_name: self._config_selector_changed(attr_name))
 
+    def _connect_config_button(self, button: Any, callback: Any) -> None:
+        signal = getattr(button, "clicked", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(callback)
+
+    def _manual_controls_ready(self) -> tuple[bool, str]:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False, "controller unavailable"
+        if getattr(controller, "device", None) is None:
+            return False, "device disconnected"
+        if getattr(controller, "initializing", False):
+            return False, "initialization in progress"
+        if not getattr(controller, "initialized", False):
+            return False, "communication not initialized"
+        if getattr(controller, "transitioning", False):
+            return False, "ON/OFF transition in progress"
+        return True, ""
+
+    def _manual_state_from_panel(self) -> dict[str, Any] | None:
+        controls = getattr(self, "manualPanelControls", None)
+        if not isinstance(controls, dict):
+            return None
+        controller = getattr(self, "controller", None)
+        full_range_supported = getattr(controller, "full_range_supported_by_channel", {}) or {}
+
+        output_enabled: dict[int, bool] = {}
+        full_range_enabled: dict[int, bool] = {}
+        voltage_values: dict[int, float] = {}
+        current_limit_values: dict[int, float] = {}
+        for channel_index, widgets in controls.items():
+            output_widget = widgets.get("output_enabled")
+            range_widget = widgets.get("full_range")
+            voltage_widget = widgets.get("voltage")
+            current_widget = widgets.get("current_limit")
+            output_enabled[channel_index] = bool(output_widget.isChecked())
+            full_range_enabled[channel_index] = (
+                bool(range_widget.isChecked())
+                if _coerce_bool(full_range_supported.get(channel_index, False), False)
+                else False
+            )
+            voltage_values[channel_index] = float(voltage_widget.value())
+            current_limit_values[channel_index] = float(current_widget.value())
+        return {
+            "output_enabled": output_enabled,
+            "full_range_enabled": full_range_enabled,
+            "voltage_values": voltage_values,
+            "current_limit_values": current_limit_values,
+        }
+
+    def _manual_panel_changed(self, *_args: Any) -> None:
+        if getattr(self, "_manualPanelSyncing", False):
+            return
+        ready, _reason = self._manual_controls_ready()
+        if not ready:
+            return
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return
+        state = self._manual_state_from_panel()
+        if state is None:
+            return
+        apply_now = getattr(controller, "applyManualStateFromThread", None)
+        if callable(apply_now):
+            apply_now(state, parallel=True)
+            return
+        controller.applyManualState(state)
+
+    def _sync_manual_panel_from_controller(self) -> None:
+        def _sync() -> None:
+            controls = getattr(self, "manualPanelControls", None)
+            if not isinstance(controls, dict):
+                return
+            controller = getattr(self, "controller", None)
+            if controller is None:
+                return
+            output_enabled = getattr(controller, "output_enabled_by_channel", {}) or {}
+            full_range_enabled = getattr(controller, "full_range_by_channel", {}) or {}
+            voltage_values = getattr(controller, "voltage_setpoint_values", {}) or {}
+            current_limit_values = getattr(controller, "current_limit_values", {}) or {}
+            self._manualPanelSyncing = True
+            try:
+                for channel_index, widgets in controls.items():
+                    self._set_control_checked(
+                        widgets.get("output_enabled"),
+                        bool(output_enabled.get(channel_index, False)),
+                    )
+                    self._set_control_checked(
+                        widgets.get("full_range"),
+                        bool(full_range_enabled.get(channel_index, False)),
+                    )
+                    self._set_control_value(
+                        widgets.get("voltage"),
+                        _coerce_float(voltage_values.get(channel_index), 0.0),
+                    )
+                    self._set_control_value(
+                        widgets.get("current_limit"),
+                        _coerce_float(current_limit_values.get(channel_index), 0.0),
+                    )
+            finally:
+                self._manualPanelSyncing = False
+
+        _invoke_gui_callback(_sync)
+
+    def _set_control_checked(self, widget: Any, checked: bool) -> None:
+        if widget is None:
+            return
+        block_signals = getattr(widget, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_checked = getattr(widget, "setChecked", None)
+            if callable(set_checked):
+                set_checked(bool(checked))
+            else:
+                widget.checked = bool(checked)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _set_control_value(self, widget: Any, value: float) -> None:
+        if widget is None:
+            return
+        block_signals = getattr(widget, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_value = getattr(widget, "setValue", None)
+            if callable(set_value):
+                set_value(float(value))
+            else:
+                widget.value = float(value)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _manual_save_slot_entry(self, config_index: int) -> dict[str, Any] | None:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return None
+        lookup = getattr(controller, "_config_entry_by_index", None)
+        if callable(lookup):
+            return lookup(config_index)
+        for entry in list(getattr(controller, "available_configs", []) or []):
+            if _coerce_int(entry.get("index"), -1) == config_index:
+                return entry
+        return None
+
+    def _manual_save_slot_exists(self, config_index: int) -> bool:
+        return self._manual_save_slot_entry(config_index) is not None
+
+    def _save_manual_panel_config(self) -> None:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return
+        slot_widget = getattr(self, "manualPanelSaveSlotSpin", None)
+        name_widget = getattr(self, "manualPanelSaveNameEdit", None)
+        active_widget = getattr(self, "manualPanelSaveActiveBox", None)
+        valid_widget = getattr(self, "manualPanelSaveValidBox", None)
+        if (
+            slot_widget is None
+            or name_widget is None
+            or active_widget is None
+            or valid_widget is None
+        ):
+            return
+        config_index = int(slot_widget.value())
+        if self._manual_save_slot_exists(config_index):
+            self.print(
+                f"Cannot save PSU config {config_index}: this slot already exists. "
+                "Choose an empty slot.",
+                flag=PRINT.WARNING,
+            )
+            self._update_manual_panel()
+            return
+        config_name = str(name_widget.text() or "").strip() or None
+        save_now = getattr(controller, "saveCurrentConfigFromThread", None)
+        if callable(save_now):
+            save_now(
+                config_index,
+                config_name=config_name,
+                active=bool(active_widget.isChecked()),
+                valid=bool(valid_widget.isChecked()),
+                parallel=True,
+            )
+            return
+        controller.saveCurrentConfig(
+            config_index,
+            config_name=config_name,
+            active=bool(active_widget.isChecked()),
+            valid=bool(valid_widget.isChecked()),
+        )
+
+    def _load_operating_now_ready(self) -> tuple[bool, str]:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False, "controller unavailable"
+        if getattr(controller, "initializing", False):
+            return False, "initialization in progress"
+        if getattr(controller, "transitioning", False):
+            return False, "ON/OFF transition in progress"
+        if getattr(controller, "device", None) is None:
+            return False, "device disconnected"
+        if not getattr(controller, "initialized", False):
+            return False, "communication not initialized"
+        is_on = getattr(self, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            return False, "PSU is OFF"
+
+        config_ready = getattr(controller, "_operating_config_ready", None)
+        if callable(config_ready):
+            ready, reason, _config_index = config_ready()
+            return ready, reason
+
+        if self._config_setting_value("operating_config") < 0:
+            return False, "select a config first"
+        return True, ""
+
     def _bootstrap_channel_items(self) -> list[dict[str, Any]]:
         default_item = self._default_channel_item()
         return [
@@ -751,6 +1369,19 @@ class PSUDevice(Device):
             )
             for channel_id in _PSU_CHANNEL_IDS
         ]
+
+    def _ensure_bootstrap_channels_present(self) -> bool:
+        """Recreate transient CH0/CH1 rows when the table stayed empty.
+
+        Some Explorer startup paths can still leave the PSU table empty even
+        after the missing-INI bootstrap message was emitted. Keep a final local
+        guard so the fixed two-row PSU layout is always visible before the
+        hardware sync runs.
+        """
+        if list(getattr(self, "channels", []) or []):
+            return False
+        self._apply_channel_items(self._bootstrap_channel_items(), persist=False)
+        return True
 
     def _ensure_local_on_action(self) -> None:
         """Expose the global PSU ON/OFF control directly in the plugin toolbar."""
@@ -784,6 +1415,35 @@ class PSUDevice(Device):
         finally:
             action.blockSignals(False)
 
+    def _hide_channel_table(self) -> None:
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return
+        hide = getattr(tree, "hide", None)
+        if callable(hide):
+            hide()
+            return
+        set_visible = getattr(tree, "setVisible", None)
+        if callable(set_visible):
+            set_visible(False)
+
+    def _hide_channel_table_actions(self) -> None:
+        """Hide generic channel-table actions superseded by the PSU panel."""
+        for action_name in (
+            "advancedAction",
+            "importAction",
+            "exportAction",
+            "saveAction",
+            "duplicateChannelAction",
+            "deleteChannelAction",
+            "moveChannelUpAction",
+            "moveChannelDownAction",
+            "copyAction",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None and hasattr(action, "setVisible"):
+                action.setVisible(False)
+
     def _display_main_state(self) -> str:
         """Return the operator-facing state shown in the toolbar badge."""
         raw_state = _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
@@ -809,13 +1469,18 @@ class PSUDevice(Device):
         label_type = type(self.titleBarLabel)
         self.statusBadgeLabel = label_type("")
         self.statusSummaryLabel = label_type("")
+        self.diagnosticsSummaryLabel = label_type("")
 
         if hasattr(self.statusBadgeLabel, "setObjectName"):
             self.statusBadgeLabel.setObjectName(f"{self.name}StatusBadge")
         if hasattr(self.statusSummaryLabel, "setObjectName"):
             self.statusSummaryLabel.setObjectName(f"{self.name}StatusSummary")
+        if hasattr(self.diagnosticsSummaryLabel, "setObjectName"):
+            self.diagnosticsSummaryLabel.setObjectName(f"{self.name}DiagnosticsSummary")
         if hasattr(self.statusSummaryLabel, "setStyleSheet"):
             self.statusSummaryLabel.setStyleSheet("QLabel { padding-left: 6px; }")
+        if hasattr(self.diagnosticsSummaryLabel, "setStyleSheet"):
+            self.diagnosticsSummaryLabel.setStyleSheet("QLabel { padding-left: 6px; color: #cbd5e1; }")
 
         insert_before = getattr(self, "stretchAction", None)
         if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
@@ -827,14 +1492,585 @@ class PSUDevice(Device):
                 insert_before,
                 self.statusSummaryLabel,
             )
+            self.diagnosticsSummaryAction = self.titleBar.insertWidget(
+                insert_before,
+                self.diagnosticsSummaryLabel,
+            )
         elif hasattr(self.titleBar, "addWidget"):
             self.statusBadgeAction = self.titleBar.addWidget(self.statusBadgeLabel)
             self.statusSummaryAction = self.titleBar.addWidget(self.statusSummaryLabel)
+            self.diagnosticsSummaryAction = self.titleBar.addWidget(self.diagnosticsSummaryLabel)
         else:
             self.statusBadgeAction = None
             self.statusSummaryAction = None
+            self.diagnosticsSummaryAction = None
 
         self._update_status_widgets()
+
+    def _ensure_channel_panel(self) -> None:
+        """Replace the generic channel table with a compact PSU operator panel."""
+        if hasattr(self, "channelPanelCards"):
+            self._update_channel_panel()
+            return
+
+        from PyQt6.QtWidgets import (
+            QCheckBox,
+            QDoubleSpinBox,
+            QFrame,
+            QGridLayout,
+            QHBoxLayout,
+            QLabel,
+            QLineEdit,
+            QPushButton,
+            QSizePolicy,
+            QSpinBox,
+            QVBoxLayout,
+            QWidget,
+        )
+
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        cards_row = QWidget()
+        cards_layout = QHBoxLayout(cards_row)
+        cards_layout.setContentsMargins(0, 0, 0, 0)
+        cards_layout.setSpacing(12)
+
+        self.channelPanel = panel
+        self.channelPanelCards: dict[int, dict[str, Any]] = {}
+        self.manualPanelControls: dict[int, dict[str, Any]] = {}
+        cards_layout.addStretch(1)
+        for channel_index in _PSU_CHANNEL_IDS:
+            card = QFrame()
+            card.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Fixed,
+            )
+            card.setMinimumWidth(_PSU_PANEL_CARD_MIN_WIDTH)
+            card.setMaximumWidth(_PSU_PANEL_CARD_MAX_WIDTH)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 12, 12, 12)
+            card_layout.setSpacing(8)
+
+            header_layout = QHBoxLayout()
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(8)
+
+            title_label = QLabel(f"CH{channel_index}")
+            title_label.setStyleSheet(_PSU_PANEL_TITLE_STYLE)
+            display_box = QCheckBox("Display")
+            display_box.toggled.connect(
+                lambda checked, channel_index=channel_index: self._channel_panel_display_toggled(
+                    channel_index,
+                    checked,
+                )
+            )
+
+            header_layout.addWidget(title_label)
+            header_layout.addStretch(1)
+            header_layout.addWidget(display_box)
+            card_layout.addLayout(header_layout)
+
+            control_layout = QGridLayout()
+            control_layout.setContentsMargins(0, 0, 0, 0)
+            control_layout.setHorizontalSpacing(10)
+            control_layout.setVerticalSpacing(6)
+
+            output_label = QLabel("Output")
+            output_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
+            output_box = QCheckBox("ON")
+            output_box.toggled.connect(self._manual_panel_changed)
+            range_label = QLabel("Range")
+            range_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
+            range_box = QCheckBox("Full")
+            range_box.setToolTip(
+                "Full range enables maximum voltage. Half range lowers voltage capability and allows higher current."
+            )
+            range_box.toggled.connect(self._manual_panel_changed)
+            voltage_label = QLabel("Vset")
+            voltage_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
+            voltage_widget = self._create_manual_numeric_widget(
+                suffix="V",
+                decimals=3,
+                step=0.1,
+                maximum=10000.0,
+            )
+            voltage_widget.valueChanged.connect(self._manual_panel_changed)
+            current_label = QLabel("Ilim")
+            current_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
+            current_widget = self._create_manual_numeric_widget(
+                suffix="A",
+                decimals=3,
+                step=0.01,
+                maximum=10000.0,
+            )
+            current_widget.valueChanged.connect(self._manual_panel_changed)
+
+            control_layout.addWidget(output_label, 0, 0)
+            control_layout.addWidget(output_box, 0, 1)
+            control_layout.addWidget(range_label, 1, 0)
+            control_layout.addWidget(range_box, 1, 1)
+            control_layout.addWidget(voltage_label, 2, 0)
+            control_layout.addWidget(voltage_widget, 2, 1)
+            control_layout.addWidget(current_label, 3, 0)
+            control_layout.addWidget(current_widget, 3, 1)
+            card_layout.addLayout(control_layout)
+
+            readback_layout = QGridLayout()
+            readback_layout.setContentsMargins(0, 0, 0, 0)
+            readback_layout.setHorizontalSpacing(10)
+            readback_layout.setVerticalSpacing(6)
+
+            metric_widgets: dict[str, Any] = {}
+            for row, (label_text, key) in enumerate(
+                (
+                    ("Vget", "voltage_monitor"),
+                    ("Iget", "current_monitor"),
+                )
+            ):
+                name_label = QLabel(label_text)
+                name_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
+                value_label = QLabel("n/a")
+                value_label.setStyleSheet(_PSU_PANEL_METRIC_VALUE_STYLE)
+                readback_layout.addWidget(name_label, row, 0)
+                readback_layout.addWidget(value_label, row, 1)
+                metric_widgets[key] = value_label
+
+            card_layout.addLayout(readback_layout)
+            cards_layout.addWidget(card)
+            self.channelPanelCards[channel_index] = {
+                "card": card,
+                "title": title_label,
+                "display_box": display_box,
+                "output_enabled": output_box,
+                "full_range": range_box,
+                "voltage": voltage_widget,
+                "current_limit": current_widget,
+                **metric_widgets,
+            }
+            self.manualPanelControls[channel_index] = {
+                "output_enabled": output_box,
+                "full_range": range_box,
+                "voltage": voltage_widget,
+                "current_limit": current_widget,
+            }
+        cards_layout.addStretch(1)
+        layout.addWidget(cards_row)
+
+        advanced_section = QWidget()
+        advanced_section_layout = QVBoxLayout(advanced_section)
+        advanced_section_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_section_layout.setSpacing(12)
+
+        manual_row = QWidget()
+        manual_layout = QHBoxLayout(manual_row)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
+        manual_layout.setSpacing(0)
+        manual_layout.addStretch(1)
+
+        manual_frame = QFrame()
+        manual_frame.setStyleSheet(_PSU_PANEL_DIAGNOSTICS_STYLE)
+        manual_frame.setMaximumWidth(_PSU_PANEL_OPERATOR_MAX_WIDTH)
+        manual_frame.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        manual_frame_layout = QVBoxLayout(manual_frame)
+        manual_frame_layout.setContentsMargins(12, 10, 12, 10)
+        manual_frame_layout.setSpacing(8)
+
+        save_grid = QGridLayout()
+        save_grid.setContentsMargins(0, 0, 0, 0)
+        save_grid.setHorizontalSpacing(10)
+        save_grid.setVerticalSpacing(6)
+        save_header = QLabel("Save as Config")
+        save_header.setStyleSheet(_PSU_OPERATOR_HEADER_STYLE)
+        save_grid.addWidget(save_header, 0, 0, 1, 6)
+        save_slot_label = QLabel("Slot")
+        save_name_label = QLabel("Name")
+        save_slot_label.setStyleSheet(_PSU_OPERATOR_HEADER_STYLE)
+        save_name_label.setStyleSheet(_PSU_OPERATOR_HEADER_STYLE)
+        save_slot_widget = self._create_manual_slot_widget()
+        save_slot_widget.valueChanged.connect(lambda _value: self._update_manual_panel())
+        save_name_widget = QLineEdit()
+        save_name_widget.setPlaceholderText("Optional config name")
+        save_active_box = QCheckBox("Active")
+        save_active_box.setChecked(True)
+        save_valid_box = QCheckBox("Valid")
+        save_valid_box.setChecked(True)
+        save_button = QPushButton("Save config")
+        save_button.clicked.connect(self._save_manual_panel_config)
+        save_grid.addWidget(save_slot_label, 1, 0)
+        save_grid.addWidget(save_slot_widget, 1, 1)
+        save_grid.addWidget(save_name_label, 1, 2)
+        save_grid.addWidget(save_name_widget, 1, 3)
+        save_grid.addWidget(save_active_box, 1, 4)
+        save_grid.addWidget(save_valid_box, 1, 5)
+        save_grid.addWidget(save_button, 1, 6)
+        manual_frame_layout.addLayout(save_grid)
+
+        manual_layout.addWidget(manual_frame)
+        manual_layout.addStretch(1)
+        advanced_section_layout.addWidget(manual_row)
+
+        self.manualPanelFrame = manual_frame
+        self.manualPanelSaveSlotSpin = save_slot_widget
+        self.manualPanelSaveNameEdit = save_name_widget
+        self.manualPanelSaveActiveBox = save_active_box
+        self.manualPanelSaveValidBox = save_valid_box
+        self.manualPanelSaveButton = save_button
+        self.channelPanelAdvancedSection = advanced_section
+
+        layout.addWidget(advanced_section)
+        _set_widget_visible(advanced_section, False)
+
+        self.addContentWidget(panel)
+        self._sync_manual_panel_from_controller()
+        self._update_channel_panel()
+
+    def _channel_by_number(self, channel_index: int) -> Any | None:
+        for channel in list(getattr(self, "channels", []) or []):
+            channel_no_getter = getattr(channel, "channel_number", None)
+            channel_no = (
+                channel_no_getter()
+                if callable(channel_no_getter)
+                else _coerce_int(getattr(channel, "id", -1), -1)
+            )
+            if channel_no == channel_index and _coerce_bool(getattr(channel, "real", True), True):
+                return channel
+        return None
+
+    def _channel_display_checked(self, channel: Any | None) -> bool:
+        if channel is None:
+            return False
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "DISPLAY", "Display"))
+                if parameter is not None:
+                    return _coerce_bool(
+                        getattr(parameter, "value", getattr(channel, "display", False)),
+                        _coerce_bool(getattr(channel, "display", False), False),
+                    )
+        return _coerce_bool(getattr(channel, "display", False), False)
+
+    def _channel_panel_snapshot(self, channel_index: int) -> dict[str, Any]:
+        controller = getattr(self, "controller", None)
+        channel = self._channel_by_number(channel_index)
+        connected = (
+            _normalize_runtime_state(getattr(self, "main_state", "Disconnected"))
+            != "Disconnected"
+        )
+        output_enabled = getattr(controller, "output_enabled_by_channel", {}) or {}
+        voltage_monitors = getattr(controller, "values", {}) or {}
+        current_monitors = getattr(controller, "current_values", {}) or {}
+        voltage_setpoints = getattr(controller, "voltage_setpoints", {}) or {}
+        current_setpoints = getattr(controller, "current_setpoints", {}) or {}
+
+        output_state = (
+            "ON"
+            if output_enabled.get(channel_index, False)
+            else "OFF"
+            if connected or output_enabled
+            else "n/a"
+        )
+
+        return {
+            "title": f"CH{channel_index}",
+            "output_state": output_state,
+            "output_style": _psu_output_state_badge_style(output_state),
+            "card_style": _psu_panel_card_style(
+                connected=connected,
+                output_state=output_state,
+            ),
+            "display_enabled": channel is not None,
+            "display_checked": self._channel_display_checked(channel),
+            "full_range_text": _format_full_range_text(
+                enabled=getattr(controller, "full_range_by_channel", {}).get(channel_index, False),
+                supported=getattr(controller, "full_range_supported_by_channel", {}).get(
+                    channel_index,
+                    False,
+                ),
+            ),
+            "voltage_set": str(voltage_setpoints.get(channel_index, "n/a") or "n/a"),
+            "voltage_monitor": _format_voltage_text(
+                voltage_monitors.get(channel_index, np.nan)
+            ),
+            "current_set": str(current_setpoints.get(channel_index, "n/a") or "n/a"),
+            "current_monitor": _format_current_text(
+                current_monitors.get(channel_index, np.nan)
+            ),
+            "voltage_monitor_style": _psu_feedback_style(
+                _voltage_feedback_state(
+                    enabled=output_enabled.get(channel_index, False),
+                    measured_v=voltage_monitors.get(channel_index, np.nan),
+                    set_v=getattr(controller, "voltage_setpoint_values", {}).get(
+                        channel_index,
+                        np.nan,
+                    ),
+                )
+            ),
+            "current_monitor_style": _psu_feedback_style(
+                _current_limit_feedback_state(
+                    enabled=output_enabled.get(channel_index, False),
+                    measured_a=current_monitors.get(channel_index, np.nan),
+                    limit_a=getattr(controller, "current_limit_values", {}).get(
+                        channel_index,
+                        np.nan,
+                    ),
+                    current_limit_active=getattr(controller, "current_limit_active", False),
+                )
+            ),
+        }
+
+    def _channel_panel_diagnostics_snapshot(self) -> dict[str, str]:
+        controller = getattr(self, "controller", None)
+        adc_temperatures = getattr(controller, "adc_temperatures", {}) or {}
+        dropout_values = getattr(controller, "dropout_values", {}) or {}
+        rail_summaries = getattr(controller, "rail_summaries", {}) or {}
+        full_range_by_channel = getattr(controller, "full_range_by_channel", {}) or {}
+        full_range_supported = getattr(controller, "full_range_supported_by_channel", {}) or {}
+
+        summaries = [
+            _format_channel_diagnostics_summary(
+                channel_index,
+                temp_c=adc_temperatures.get(channel_index, np.nan),
+                dropout_v=dropout_values.get(channel_index, np.nan),
+                full_range_enabled=full_range_by_channel.get(channel_index, False),
+                full_range_supported=full_range_supported.get(channel_index, False),
+            )
+            for channel_index in _PSU_CHANNEL_IDS
+        ]
+        flags = str(getattr(controller, "device_state_summary", "") or "").strip() or "n/a"
+        tooltip_lines = [f"Device flags: {flags}"]
+        if _coerce_bool(getattr(controller, "current_limit_active", False), False):
+            tooltip_lines.append("Current limit/compliance is currently active.")
+        for channel_index, summary in zip(_PSU_CHANNEL_IDS, summaries):
+            tooltip_lines.append(summary)
+            rail_summary = str(rail_summaries.get(channel_index, "") or "").strip() or "n/a"
+            tooltip_lines.append(f"CH{channel_index} rails: {rail_summary}")
+        return {
+            "text": " | ".join(summaries) if summaries else "n/a",
+            "tooltip": "\n".join(tooltip_lines),
+        }
+
+    def _update_manual_panel(self) -> None:
+        controls = getattr(self, "manualPanelControls", None)
+        if not isinstance(controls, dict):
+            return
+        controller = getattr(self, "controller", None)
+        ready, reason = self._manual_controls_ready()
+        full_range_supported = (
+            getattr(controller, "full_range_supported_by_channel", {}) or {}
+        )
+        save_slot_widget = getattr(self, "manualPanelSaveSlotSpin", None)
+        save_slot_index = (
+            int(save_slot_widget.value())
+            if save_slot_widget is not None and hasattr(save_slot_widget, "value")
+            else -1
+        )
+        save_slot_exists = (
+            save_slot_index >= 0 and self._manual_save_slot_exists(save_slot_index)
+        )
+        save_ready = ready and not save_slot_exists
+        for channel_index, widgets in controls.items():
+            output_widget = widgets.get("output_enabled")
+            if output_widget is not None and hasattr(output_widget, "setEnabled"):
+                output_widget.setEnabled(ready)
+            range_widget = widgets.get("full_range")
+            if range_widget is not None and hasattr(range_widget, "setEnabled"):
+                range_widget.setEnabled(
+                    ready
+                    and _coerce_bool(full_range_supported.get(channel_index, False), False)
+                )
+            for widget_name in ("voltage", "current_limit"):
+                widget = widgets.get(widget_name)
+                if widget is not None and hasattr(widget, "setEnabled"):
+                    widget.setEnabled(ready)
+        for widget_name in (
+            "manualPanelSaveSlotSpin",
+            "manualPanelSaveNameEdit",
+            "manualPanelSaveActiveBox",
+            "manualPanelSaveValidBox",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None and hasattr(widget, "setEnabled"):
+                widget.setEnabled(ready)
+            elif widget is not None:
+                widget.enabled = ready
+        save_button = getattr(self, "manualPanelSaveButton", None)
+        if save_button is not None and hasattr(save_button, "setEnabled"):
+            save_button.setEnabled(save_ready)
+        elif save_button is not None:
+            save_button.enabled = save_ready
+
+        frame = getattr(self, "manualPanelFrame", None)
+        tooltip = (
+            "Manual edits can be applied directly from the CH0/CH1 cards while the PSU communication is initialized."
+        )
+        if not ready and reason:
+            tooltip = f"{tooltip}\nCurrently unavailable: {reason}."
+        if frame is not None and hasattr(frame, "setToolTip"):
+            frame.setToolTip(tooltip)
+        if save_button is not None and hasattr(save_button, "setToolTip"):
+            save_reason = reason if not ready else ""
+            if save_slot_exists:
+                save_reason = f"config {save_slot_index} already exists"
+            save_button.setToolTip(
+                "Save the current PSU output, range, voltage, and current-limit values into an empty config slot."
+                + (
+                    f"\nCurrently unavailable: {save_reason}."
+                    if save_reason
+                    else ""
+                )
+            )
+
+    def _set_channel_panel_checkbox(self, checkbox: Any, *, checked: bool, enabled: bool) -> None:
+        if checkbox is None:
+            return
+        block_signals = getattr(checkbox, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_checked = getattr(checkbox, "setChecked", None)
+            if callable(set_checked):
+                set_checked(bool(checked))
+            else:
+                checkbox.checked = bool(checked)
+            set_enabled = getattr(checkbox, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
+            else:
+                checkbox.enabled = bool(enabled)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _set_channel_panel_numeric(self, widget: Any, *, value: float, enabled: bool) -> None:
+        if widget is None:
+            return
+        block_signals = getattr(widget, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_value = getattr(widget, "setValue", None)
+            if callable(set_value):
+                set_value(float(value))
+            else:
+                widget.value = float(value)
+            set_enabled = getattr(widget, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
+            else:
+                widget.enabled = bool(enabled)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _channel_panel_display_toggled(self, channel_index: int, checked: bool) -> None:
+        channel = self._channel_by_number(channel_index)
+        if channel is None:
+            return
+
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "DISPLAY", "Display"))
+                if parameter is not None:
+                    if hasattr(parameter, "setValueWithoutEvents"):
+                        parameter.setValueWithoutEvents(bool(checked))
+                    else:
+                        parameter.value = bool(checked)
+        channel.display = bool(checked)
+        display_changed = getattr(channel, "displayChanged", None)
+        if callable(display_changed):
+            display_changed()
+        self._update_channel_panel()
+
+    def _toggle_advanced_panel(self, checked: bool) -> None:
+        section = getattr(self, "channelPanelAdvancedSection", None)
+        _set_widget_visible(section, bool(checked))
+        button = getattr(self, "savePanelToggleButton", None)
+        if button is not None and hasattr(button, "setText"):
+            button.setText("Hide Save" if checked else "Save...")
+
+    def _update_channel_panel(self) -> None:
+        cards = getattr(self, "channelPanelCards", None)
+        if not isinstance(cards, dict):
+            return
+
+        for channel_index, widgets in cards.items():
+            snapshot = self._channel_panel_snapshot(channel_index)
+            for key in (
+                "title",
+                "voltage_monitor",
+                "current_monitor",
+            ):
+                widget = widgets.get(key)
+                if widget is not None and hasattr(widget, "setText"):
+                    widget.setText(str(snapshot[key]))
+            card = widgets.get("card")
+            if card is not None and hasattr(card, "setStyleSheet"):
+                card.setStyleSheet(snapshot["card_style"])
+            voltage_monitor = widgets.get("voltage_monitor")
+            if voltage_monitor is not None and hasattr(voltage_monitor, "setStyleSheet"):
+                voltage_monitor.setStyleSheet(snapshot["voltage_monitor_style"])
+            current_monitor = widgets.get("current_monitor")
+            if current_monitor is not None and hasattr(current_monitor, "setStyleSheet"):
+                current_monitor.setStyleSheet(snapshot["current_monitor_style"])
+            tooltip = self._channel_panel_card_tooltip(channel_index)
+            if card is not None and hasattr(card, "setToolTip"):
+                card.setToolTip(tooltip)
+            for widget_name in (
+                "title",
+                "output_enabled",
+                "full_range",
+                "voltage",
+                "current_limit",
+            ):
+                widget = widgets.get(widget_name)
+                if widget is not None and hasattr(widget, "setToolTip"):
+                    widget.setToolTip(tooltip)
+            self._set_channel_panel_checkbox(
+                widgets.get("display_box"),
+                checked=bool(snapshot["display_checked"]),
+                enabled=bool(snapshot["display_enabled"]),
+            )
+        self._update_manual_panel()
+
+    def _channel_panel_card_tooltip(self, channel_index: int) -> str:
+        controller = getattr(self, "controller", None)
+        output_enabled = getattr(controller, "output_enabled_by_channel", {}) or {}
+        full_range_by_channel = getattr(controller, "full_range_by_channel", {}) or {}
+        full_range_supported = getattr(controller, "full_range_supported_by_channel", {}) or {}
+        voltage_monitors = getattr(controller, "values", {}) or {}
+        current_monitors = getattr(controller, "current_values", {}) or {}
+        voltage_set_values = getattr(controller, "voltage_setpoint_values", {}) or {}
+        current_limit_values = getattr(controller, "current_limit_values", {}) or {}
+        adc_temperatures = getattr(controller, "adc_temperatures", {}) or {}
+        dropout_values = getattr(controller, "dropout_values", {}) or {}
+        rail_summaries = getattr(controller, "rail_summaries", {}) or {}
+        diagnostics = _format_channel_diagnostics_summary(
+            channel_index,
+            temp_c=adc_temperatures.get(channel_index, np.nan),
+            dropout_v=dropout_values.get(channel_index, np.nan),
+            full_range_enabled=full_range_by_channel.get(channel_index, False),
+            full_range_supported=full_range_supported.get(channel_index, False),
+        )
+        return "\n".join(
+            (
+                f"CH{channel_index}",
+                f"Output: {'ON' if output_enabled.get(channel_index, False) else 'OFF'}",
+                f"Vset: {_format_voltage_text(voltage_set_values.get(channel_index, np.nan))}",
+                f"Vget: {_format_voltage_text(voltage_monitors.get(channel_index, np.nan))}",
+                f"Ilim: {_format_current_text(current_limit_values.get(channel_index, np.nan))}",
+                f"Iget: {_format_current_text(current_monitors.get(channel_index, np.nan))}",
+                diagnostics,
+                f"Rails: {str(rail_summaries.get(channel_index, '') or 'n/a')}",
+            )
+        )
 
     def _config_list_text(self) -> str:
         return str(getattr(self, "available_configs_text", "") or "").strip() or "n/a"
@@ -863,11 +2099,19 @@ class PSUDevice(Device):
         )
         self.operatingConfigLabel = label_type("Config:")
         self.operatingConfigCombo = self._create_config_selector_widget()
+        self.loadOperatingConfigButton = self._create_config_button_widget("Load now")
+        self.savePanelToggleButton = self._create_config_button_widget("Save...")
+        if hasattr(self.savePanelToggleButton, "setCheckable"):
+            self.savePanelToggleButton.setCheckable(True)
         self._connect_config_selector(self.operatingConfigCombo, "operating_config")
+        self._connect_config_button(self.loadOperatingConfigButton, self.loadOperatingConfigNow)
+        self._connect_config_button(self.savePanelToggleButton, self._save_panel_toggle_clicked)
         if insert_before is not None and hasattr(self.titleBar, "insertWidget"):
             for attr_name, widget in (
                 ("operatingConfigAction", self.operatingConfigLabel),
                 ("operatingConfigComboAction", self.operatingConfigCombo),
+                ("loadOperatingConfigAction", self.loadOperatingConfigButton),
+                ("savePanelToggleAction", self.savePanelToggleButton),
             ):
                 setattr(
                     self,
@@ -878,13 +2122,17 @@ class PSUDevice(Device):
             for attr_name, widget in (
                 ("operatingConfigAction", self.operatingConfigLabel),
                 ("operatingConfigComboAction", self.operatingConfigCombo),
+                ("loadOperatingConfigAction", self.loadOperatingConfigButton),
+                ("savePanelToggleAction", self.savePanelToggleButton),
             ):
                 setattr(self, attr_name, self.titleBar.addWidget(widget))
         else:
             self.operatingConfigAction = None
             self.operatingConfigComboAction = None
+            self.loadOperatingConfigAction = None
+            self.savePanelToggleAction = None
 
-        self._update_config_selectors()
+        self._update_config_controls()
 
     def _update_config_selectors(self) -> None:
         for attr_name, combo_attr, label_attr in (
@@ -919,6 +2167,33 @@ class PSUDevice(Device):
                 if callable(block_signals):
                     block_signals(False)
 
+    def _update_config_controls(self) -> None:
+        self._update_config_selectors()
+        self._update_manual_panel()
+
+        button = getattr(self, "loadOperatingConfigButton", None)
+        ready, reason = self._load_operating_now_ready()
+        self._set_action_enabled(button, ready)
+        if button is not None and hasattr(button, "setToolTip"):
+            tooltip = (
+                "Load the selected PSU config immediately. "
+                "This action is only available while the PSU is ON."
+            )
+            if not ready and reason:
+                tooltip = f"{tooltip}\nCurrently unavailable: {reason}."
+            button.setToolTip(tooltip)
+        save_button = getattr(self, "savePanelToggleButton", None)
+        save_ready, save_reason = self._manual_controls_ready()
+        self._set_action_enabled(save_button, save_ready)
+        if save_button is not None and hasattr(save_button, "setToolTip"):
+            tooltip = "Show or hide PSU config save tools."
+            if not save_ready and save_reason:
+                tooltip = f"{tooltip}\nCurrently unavailable: {save_reason}."
+            save_button.setToolTip(tooltip)
+
+    def _save_panel_toggle_clicked(self, checked: bool = False) -> None:
+        self._toggle_advanced_panel(bool(checked))
+
     def _config_selector_changed(self, attr_name: str) -> None:
         combo_attr = {
             "standby_config": "standbyConfigCombo",
@@ -928,8 +2203,18 @@ class PSUDevice(Device):
         if combo is None:
             return
         if self._set_config_setting_value(attr_name, self._combo_current_value(combo)):
-            self._update_config_selectors()
+            self._update_config_controls()
             self._update_status_widgets()
+
+    def loadOperatingConfigNow(self) -> None:
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return
+        load_now = getattr(controller, "loadOperatingConfigNowFromThread", None)
+        if callable(load_now):
+            load_now(parallel=True)
+            return
+        controller.loadOperatingConfigNow()
 
     def _status_badge_style(self) -> str:
         """Return a compact badge style that reflects the PSU main state."""
@@ -961,15 +2246,31 @@ class PSUDevice(Device):
     def _status_summary_text(self) -> str:
         """Return the compact PSU runtime summary displayed in the toolbar."""
         controller = getattr(self, "controller", None)
-        outputs = _compact_status_text(
-            getattr(self, "output_summary", None),
-            default="n/a",
-        )
-        faults = _compact_status_text(
-            getattr(controller, "device_state_summary", None),
-            default="n/a",
-        )
-        return f"HV outputs: {outputs} | Device flags: {faults}"
+        measured_voltages = getattr(controller, "values", {}) or {}
+        measured_currents = getattr(controller, "current_values", {}) or {}
+        output_enabled = getattr(controller, "output_enabled_by_channel", {}) or {}
+        channel_summaries = [
+            _format_channel_runtime_summary(
+                channel_index,
+                enabled=output_enabled.get(channel_index, False),
+                voltage_v=measured_voltages.get(channel_index, np.nan),
+                current_a=measured_currents.get(channel_index, np.nan),
+            )
+            for channel_index in _PSU_CHANNEL_IDS
+        ]
+        return " | ".join(channel_summaries)
+
+    def _diagnostics_summary_text(self) -> str:
+        controller = getattr(self, "controller", None)
+        adc_temperatures = getattr(controller, "adc_temperatures", {}) or {}
+        parts = [
+            _format_channel_temperature_summary(
+                channel_index,
+                adc_temperatures.get(channel_index, np.nan),
+            )
+            for channel_index in _PSU_CHANNEL_IDS
+        ]
+        return "Temp: " + " | ".join(parts)
 
     def _status_tooltip_text(self) -> str:
         """Return the full PSU status tooltip for the toolbar widgets."""
@@ -990,6 +2291,9 @@ class PSUDevice(Device):
             (
                 f"HV outputs: {getattr(self, 'output_summary', '') or 'n/a'}",
                 f"Device flags: {getattr(controller, 'device_state_summary', '') or 'n/a'}",
+                f"Loaded state: {getattr(self, 'loaded_state_text', '') or 'n/a'}",
+                f"Readbacks: {self._status_summary_text()}",
+                f"Diagnostics: {self._diagnostics_summary_text()}",
                 f"Available configs: {getattr(self, 'available_configs_text', '') or 'n/a'}",
             )
         )
@@ -999,12 +2303,15 @@ class PSUDevice(Device):
         """Refresh the global PSU status labels in the toolbar."""
         badge = getattr(self, "statusBadgeLabel", None)
         summary = getattr(self, "statusSummaryLabel", None)
+        diagnostics = getattr(self, "diagnosticsSummaryLabel", None)
         self._sync_acquisition_controls()
         if badge is None or summary is None:
             return
 
         badge_text = self._display_main_state()
         summary_text = self._status_summary_text()
+        diagnostics_text = self._diagnostics_summary_text()
+        diagnostics_tooltip = self._channel_panel_diagnostics_snapshot().get("tooltip", "")
         tooltip = self._status_tooltip_text()
 
         if hasattr(badge, "setText"):
@@ -1018,6 +2325,11 @@ class PSUDevice(Device):
             summary.setText(summary_text)
         if hasattr(summary, "setToolTip"):
             summary.setToolTip(tooltip)
+        if diagnostics is not None and hasattr(diagnostics, "setText"):
+            diagnostics.setText(diagnostics_text)
+        if diagnostics is not None and hasattr(diagnostics, "setToolTip"):
+            diagnostics.setToolTip(str(diagnostics_tooltip))
+        self._update_channel_panel()
 
     def _set_channel_headers_from_template(self) -> None:
         if self.tree is None:
@@ -1109,6 +2421,7 @@ class PSUDevice(Device):
             if callable(toggle_advanced) and hasattr(self, "advancedAction"):
                 toggle_advanced(advanced=self.advancedAction.state)
             self._update_channel_column_visibility()
+            self._update_channel_panel()
             estimate_storage = getattr(self, "estimateStorage", None)
             if callable(estimate_storage):
                 estimate_storage()
@@ -1242,21 +2555,14 @@ class PSUDevice(Device):
             parameterType=PARAMETERTYPE.FLOAT,
             attr="poll_timeout_s",
         )
-        settings[f"{self.name}/{self.STANDBY_CONFIG}"] = parameterDict(
-            value=1,
-            minimum=_PSU_FLOAT_SENTINEL,
-            maximum=255,
-            toolTip="Startup standby config index. Use -1 to skip config loading.",
-            parameterType=PARAMETERTYPE.INT,
-            attr="standby_config",
-            advanced=True,
-            event=self._update_config_selectors,
-        )
         settings[f"{self.name}/{self.OPERATING_CONFIG}"] = parameterDict(
             value=-1,
             minimum=_PSU_FLOAT_SENTINEL,
             maximum=255,
-            toolTip="PSU config exposed in the plugin toolbar. Applied after standby during ON. Use -1 to skip.",
+            toolTip=(
+                "PSU config exposed in the plugin toolbar. Use -1 to connect "
+                "without enabling outputs until manual values are applied."
+            ),
             parameterType=PARAMETERTYPE.INT,
             attr="operating_config",
             event=self._update_config_selectors,
@@ -1319,6 +2625,7 @@ class PSUDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._sync_toolbar_communication_controls()
         self._update_status_widgets()
 
     def _acquisition_readiness(self) -> tuple[bool, str]:
@@ -1349,7 +2656,18 @@ class PSUDevice(Device):
         if hasattr(action, "setEnabled"):
             action.setEnabled(enabled)
             return
-        setattr(action, "enabled", enabled)
+        with contextlib.suppress(AttributeError):
+            setattr(action, "enabled", enabled)
+
+    def _set_action_visible(self, action: Any | None, visible: bool) -> None:
+        """Update QAction-like visibility while tolerating lightweight test doubles."""
+        if action is None:
+            return
+        if hasattr(action, "setVisible"):
+            action.setVisible(visible)
+            return
+        with contextlib.suppress(AttributeError):
+            setattr(action, "visible", visible)
 
     def _force_recording_action_state(self, state: bool) -> None:
         """Force the acquisition action state without re-entering its callbacks."""
@@ -1399,19 +2717,49 @@ class PSUDevice(Device):
                 setattr(live_display, "initCommunicationAction", action)
         return close_action, init_action
 
+    def _communication_open(self) -> bool:
+        """Return whether a transport/driver exists, even after a partial startup failure."""
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False
+        if getattr(controller, "device", None) is not None:
+            return True
+        return bool(getattr(controller, "initialized", False))
+
     def _sync_display_communication_controls(self) -> None:
         """Enable display-side communication actions only when applicable."""
         close_action, init_action = self._display_communication_actions()
         controller = getattr(self, "controller", None)
-        initializing = bool(getattr(controller, "initializing", False))
-        initialized = bool(getattr(controller, "initialized", False))
-        self._set_action_enabled(close_action, initialized and not initializing)
-        self._set_action_enabled(init_action, (not initialized) and (not initializing))
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        communication_open = self._communication_open()
+        self._set_action_enabled(close_action, communication_open and not busy)
+        self._set_action_enabled(init_action, (not communication_open) and (not busy))
+
+    def _sync_toolbar_communication_controls(self) -> None:
+        """Expose a disconnect action when communication is open but the local ON action is OFF."""
+        close_action = getattr(self, "closeCommunicationAction", None)
+        if close_action is None:
+            return
+        controller = getattr(self, "controller", None)
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        can_close = self._communication_open() and not busy
+        is_on = False
+        is_on_fn = getattr(self, "isOn", None)
+        if callable(is_on_fn):
+            is_on = bool(is_on_fn())
+        has_local_on_action = getattr(self, "onAction", None) is not None
+        self._set_action_enabled(close_action, can_close)
+        self._set_action_visible(close_action, can_close and (not has_local_on_action or not is_on))
 
     def _sync_acquisition_controls(self) -> None:
         """Disable manual acquisition controls until the PSU is actually ready."""
         ready, _reason = self._acquisition_readiness()
         self._sync_display_communication_controls()
+        self._sync_toolbar_communication_controls()
         self._set_action_enabled(getattr(self, "recordingAction", None), ready)
         self._set_action_enabled(
             getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
@@ -1484,6 +2832,7 @@ class PSUDevice(Device):
         if on is not None and hasattr(self, "onAction") and self.onAction.state is not on:
             self.onAction.state = on
         self._sync_local_on_action()
+        self._update_config_controls()
         self._update_status_widgets()
         if getattr(self, "loading", False):
             return
@@ -1560,8 +2909,8 @@ class PSUChannel(Channel):
         channel[self.VALUE][Parameter.HEADER] = "Reference"
         channel[self.VALUE][_PARAMETER_ADVANCED_KEY] = True
         channel[self.VALUE][_PARAMETER_TOOLTIP_KEY] = (
-            "Unused by the PSU plugin. The plugin is config-driven and displays "
-            "controller readbacks instead of applying channel setpoints."
+            "Unused by the PSU plugin. Operator controls live in the fixed PSU panel; "
+            "this hidden table field is kept only for framework compatibility."
         )
         channel[self.ENABLED][_PARAMETER_ADVANCED_KEY] = True
         channel[self.ACTIVE][_PARAMETER_ADVANCED_KEY] = True
@@ -1570,7 +2919,7 @@ class PSUChannel(Channel):
         channel[self.SCALING][Parameter.VALUE] = "normal"
         monitor_name = getattr(self, "MONITOR", "Monitor")
         if monitor_name in channel:
-            channel[monitor_name][Parameter.HEADER] = "Vmon"
+            channel[monitor_name][Parameter.HEADER] = "Vget"
             channel[monitor_name][_PARAMETER_TOOLTIP_KEY] = (
                 "Measured PSU output voltage read back from the controller."
             )
@@ -1605,16 +2954,19 @@ class PSUChannel(Channel):
             parameterType=PARAMETERTYPE.LABEL,
             advanced=False,
             indicator=True,
-            header="Iset",
+            header="Ilim",
             attr="current_set",
-            toolTip="Configured PSU current setpoint read back from the controller.",
+            toolTip=(
+                "Configured PSU current setting read back from the controller. "
+                "In normal constant-voltage operation this acts as the current limit/compliance."
+            ),
         )
         channel[self.CURRENT_MONITOR] = parameterDict(
             value="n/a",
             parameterType=PARAMETERTYPE.LABEL,
             advanced=False,
             indicator=True,
-            header="Imon",
+            header="Iget",
             attr="current_monitor",
             toolTip="Measured PSU output current read back from the controller.",
         )
@@ -1663,6 +3015,12 @@ class PSUChannel(Channel):
             )
         if not hasattr(self, "real"):
             self.real = _coerce_bool(item.get(getattr(self, "REAL", "Real")), True)
+        if not hasattr(self, "value"):
+            self.value = _coerce_float(item.get(getattr(self, "VALUE", "Value")), 0.0)
+        if not hasattr(self, "min"):
+            self.min = _coerce_float(item.get(getattr(self, "MIN", "Min")), 0.0)
+        if not hasattr(self, "max"):
+            self.max = _coerce_float(item.get(getattr(self, "MAX", "Max")), 0.0)
         super().initGUI(item)
         self._sync_output_state_widget()
         self.monitorChanged()
@@ -1850,14 +3208,26 @@ class PSUController(DeviceController):
         self.device_state_summary = "n/a"
         self.available_configs: list[dict[str, Any]] = []
         self.available_configs_text = "n/a"
+        self.loaded_state_text = "n/a"
         self.initialized = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
+        self._transition_lock = Lock()
         self.values: dict[int, float] = {}
         self.current_values: dict[int, float] = {}
         self.output_enabled_by_channel: dict[int, bool] = {}
         self.voltage_setpoints: dict[int, str] = {}
         self.current_setpoints: dict[int, str] = {}
+        self.voltage_setpoint_values: dict[int, float] = {}
+        self.current_limit_values: dict[int, float] = {}
+        self.full_range_by_channel: dict[int, bool] = {}
+        self.full_range_supported_by_channel: dict[int, bool] = {}
+        self.current_limit_active = False
+        self.adc_temperatures: dict[int, float] = {}
+        self.dropout_values: dict[int, float] = {}
+        self.rail_summaries: dict[int, str] = {}
+        self._last_live_readback_refresh_monotonic = 0.0
+        self._last_housekeeping_refresh_monotonic = 0.0
 
     def initializeValues(self, reset: bool = False) -> None:
         if getattr(self, "values", None) is None or reset:
@@ -1886,6 +3256,122 @@ class PSUController(DeviceController):
                 for channel in self.controllerParent.getChannels()
                 if channel.real
             }
+            self.voltage_setpoint_values = {
+                channel.channel_number(): np.nan
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.current_limit_values = {
+                channel.channel_number(): np.nan
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.full_range_by_channel = {
+                channel.channel_number(): False
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.full_range_supported_by_channel = {
+                channel.channel_number(): False
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.current_limit_active = False
+            self.adc_temperatures = {
+                channel.channel_number(): np.nan
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.dropout_values = {
+                channel.channel_number(): np.nan
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self.rail_summaries = {
+                channel.channel_number(): "n/a"
+                for channel in self.controllerParent.getChannels()
+                if channel.real
+            }
+            self._last_live_readback_refresh_monotonic = 0.0
+            self._last_housekeeping_refresh_monotonic = 0.0
+
+    def _format_loaded_config_text(self, config_index: int) -> str:
+        entry = self._config_entry_by_index(config_index)
+        if entry is None:
+            return f"Config {config_index}"
+        config_name = str(entry.get("name", "") or "").strip()
+        if not config_name:
+            return f"Config {config_index}"
+        return f"Config {config_index}: {config_name}"
+
+    def _set_loaded_config_text(self, text: str) -> None:
+        self.loaded_state_text = str(text or "").strip() or "n/a"
+
+    def _real_channel_numbers(self) -> list[int]:
+        return [
+            channel.channel_number()
+            for channel in self.controllerParent.getChannels()
+            if getattr(channel, "real", True)
+        ]
+
+    def _housekeeping_refresh_due(self, now_monotonic: float) -> bool:
+        last_refresh = float(
+            getattr(self, "_last_housekeeping_refresh_monotonic", 0.0) or 0.0
+        )
+        if last_refresh <= 0:
+            return True
+        return (
+            now_monotonic - last_refresh
+        ) >= _PSU_HOUSEKEEPING_REFRESH_PERIOD_S
+
+    def _live_readback_refresh_due(self, now_monotonic: float) -> bool:
+        last_refresh = float(
+            getattr(self, "_last_live_readback_refresh_monotonic", 0.0) or 0.0
+        )
+        if last_refresh <= 0:
+            return True
+        return (
+            now_monotonic - last_refresh
+        ) >= _PSU_LIVE_READBACK_REFRESH_PERIOD_S
+
+    def _read_live_readbacks(self, *, timeout_s: float) -> dict[str, Any] | None:
+        device = self.device
+        if device is None:
+            return None
+
+        get_device_enabled = getattr(device, "get_device_enabled", None)
+        get_output_enabled = getattr(device, "get_output_enabled", None)
+        get_channel_voltage = getattr(device, "get_channel_voltage", None)
+        get_channel_current = getattr(device, "get_channel_current", None)
+        if not (
+            callable(get_device_enabled)
+            and callable(get_output_enabled)
+            and callable(get_channel_voltage)
+            and callable(get_channel_current)
+        ):
+            return None
+
+        device_enabled = bool(get_device_enabled(timeout_s=timeout_s))
+        output_enabled = tuple(
+            bool(value) for value in get_output_enabled(timeout_s=timeout_s)
+        )
+        measured_voltages: dict[int, float] = {}
+        measured_currents: dict[int, float] = {}
+        for channel_no in self._real_channel_numbers():
+            measured_voltages[channel_no] = _coerce_float(
+                get_channel_voltage(channel_no, timeout_s=timeout_s),
+                np.nan,
+            )
+            measured_currents[channel_no] = _coerce_float(
+                get_channel_current(channel_no, timeout_s=timeout_s),
+                np.nan,
+            )
+        return {
+            "device_enabled": device_enabled,
+            "output_enabled": output_enabled,
+            "values": measured_voltages,
+            "current_values": measured_currents,
+        }
 
     def runInitialization(self) -> None:
         self.initialized = False
@@ -1925,6 +3411,7 @@ class PSUController(DeviceController):
         self.initializeValues(reset=True)
         self.initialized = True
         self.super_init_complete_called = True
+        self._set_loaded_config_text("Connected")
         self._sync_status_to_gui()
 
     def _startup_kwargs(self) -> dict[str, Any]:
@@ -1943,18 +3430,54 @@ class PSUController(DeviceController):
             kwargs["operating_config"] = operating_config
         return kwargs
 
-    def _shutdown_kwargs(self) -> dict[str, Any]:
-        shutdown_config = _coerce_int(
+    def _selected_operating_config_index(self) -> int:
+        return _coerce_int(
+            getattr(self.controllerParent, "operating_config", -1),
+            -1,
+        )
+
+    def _config_entry_by_index(self, config_index: int) -> dict[str, Any] | None:
+        for entry in self.available_configs:
+            if _coerce_int(entry.get("index"), -1) == config_index:
+                return entry
+        return None
+
+    def _config_slot_exists(self, config_index: int) -> bool:
+        return self._config_entry_by_index(config_index) is not None
+
+    def _operating_config_ready(self) -> tuple[bool, str, int]:
+        config_index = self._selected_operating_config_index()
+        if config_index < 0:
+            return False, "select a PSU config first", config_index
+
+        entry = self._config_entry_by_index(config_index)
+        if entry is not None:
+            if not _coerce_bool(entry.get("valid"), True):
+                return (
+                    False,
+                    f"config {config_index} is marked invalid on the controller",
+                    config_index,
+                )
+            if not _coerce_bool(entry.get("active"), True):
+                return (
+                    False,
+                    f"config {config_index} is inactive on the controller",
+                    config_index,
+                )
+        elif self.available_configs:
+            return (
+                False,
+                f"config {config_index} is not reported by the controller",
+                config_index,
+            )
+
+        return True, "", config_index
+
+    def _shutdown_config_index(self) -> int:
+        return _coerce_int(
             getattr(self.controllerParent, "shutdown_config", -1),
             -1,
         )
-        if shutdown_config >= 0:
-            return {
-                "standby_config": shutdown_config,
-                "disable_outputs": False,
-                "disable_device": False,
-            }
-        return {}
 
     def _refresh_available_configs(self) -> None:
         device = self.device
@@ -1985,21 +3508,210 @@ class PSUController(DeviceController):
         self.available_configs = list(configs or [])
         self.available_configs_text = _format_available_configs(configs)
 
+    def _start_manual_mode(self, *, timeout_s: float) -> None:
+        device = self.device
+        if device is None:
+            return
+        device.set_output_enabled(False, False, timeout_s=timeout_s)
+        device.set_device_enabled(False, timeout_s=timeout_s)
+        self._set_loaded_config_text("Manual outputs OFF")
+
+    def _verify_manual_state_unlocked(
+        self,
+        *,
+        device: Any,
+        voltage_values: dict[int, Any],
+        current_limit_values: dict[int, Any],
+        full_range_enabled: tuple[bool, bool],
+        timeout_s: float,
+    ) -> list[str]:
+        warnings: list[str] = []
+        get_voltage_limits = getattr(device, "get_channel_voltage_limits", None)
+        if callable(get_voltage_limits):
+            for channel_index in _PSU_CHANNEL_IDS:
+                expected_voltage = _coerce_float(voltage_values.get(channel_index), 0.0)
+                actual_voltage, _voltage_limit = get_voltage_limits(
+                    channel_index,
+                    timeout_s=timeout_s,
+                )
+                if not _setpoint_matches(
+                    actual_voltage,
+                    expected_voltage,
+                    abs_tolerance=_PSU_SETPOINT_VERIFY_ABS_TOLERANCE_V,
+                ):
+                    warnings.append(
+                        f"CH{channel_index} voltage setpoint readback "
+                        f"{_format_voltage_text(actual_voltage)} does not match requested "
+                        f"{_format_voltage_text(expected_voltage)}."
+                    )
+
+        get_current_limits = getattr(device, "get_channel_current_limits", None)
+        if callable(get_current_limits):
+            for channel_index in _PSU_CHANNEL_IDS:
+                expected_current = _coerce_float(current_limit_values.get(channel_index), 0.0)
+                actual_current, _current_limit = get_current_limits(
+                    channel_index,
+                    timeout_s=timeout_s,
+                )
+                if not _setpoint_matches(
+                    actual_current,
+                    expected_current,
+                    abs_tolerance=_PSU_SETPOINT_VERIFY_ABS_TOLERANCE_A,
+                ):
+                    warnings.append(
+                        f"CH{channel_index} current limit readback "
+                        f"{_format_current_text(actual_current)} does not match requested "
+                        f"{_format_current_text(expected_current)}."
+                    )
+
+        get_output_full_range = getattr(device, "get_output_full_range", None)
+        if callable(get_output_full_range):
+            actual_range = tuple(
+                bool(value) for value in get_output_full_range(timeout_s=timeout_s)
+            )
+            if actual_range != tuple(bool(value) for value in full_range_enabled):
+                warnings.append(
+                    "PSU full-range readback does not match the requested state: "
+                    f"requested={full_range_enabled}, actual={actual_range}."
+                )
+        return warnings
+
+    def _verify_output_enable_state_unlocked(
+        self,
+        *,
+        device: Any,
+        any_output_enabled: bool,
+        output_enabled: tuple[bool, bool],
+        timeout_s: float,
+    ) -> None:
+        get_device_enabled = getattr(device, "get_device_enabled", None)
+        if callable(get_device_enabled):
+            actual_device_enabled = bool(get_device_enabled(timeout_s=timeout_s))
+            if actual_device_enabled != bool(any_output_enabled):
+                expected_text = "enabled" if any_output_enabled else "disabled"
+                actual_text = "enabled" if actual_device_enabled else "disabled"
+                raise RuntimeError(
+                    f"PSU device enable readback is {actual_text} after requesting {expected_text}."
+                )
+
+        get_output_enabled = getattr(device, "get_output_enabled", None)
+        if callable(get_output_enabled):
+            actual_output_enabled = tuple(
+                bool(value) for value in get_output_enabled(timeout_s=timeout_s)
+            )
+            if actual_output_enabled != tuple(bool(value) for value in output_enabled):
+                raise RuntimeError(
+                    "PSU output-enable readback does not match the requested state: "
+                    f"requested={output_enabled}, actual={actual_output_enabled}."
+                )
+
+    def _safe_disable_outputs_after_failure(self, *, timeout_s: float) -> None:
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to recover PSU outputs after failure."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                with contextlib.suppress(Exception):
+                    device.set_output_enabled(False, False, timeout_s=timeout_s)
+                with contextlib.suppress(Exception):
+                    device.set_device_enabled(False, timeout_s=timeout_s)
+        except Exception:
+            return
+
+    def _perform_shutdown_sequence_unlocked(self, *, timeout_s: float) -> list[str]:
+        device = self.device
+        if device is None:
+            return ["PSU device is not available."]
+
+        errors: list[str] = []
+        shutdown_config = self._shutdown_config_index()
+        if shutdown_config >= 0:
+            try:
+                device.load_config(shutdown_config, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    f"load_config({shutdown_config}) failed: {self._format_exception(exc)}"
+                )
+
+        for channel_index in _PSU_CHANNEL_IDS:
+            try:
+                device.set_channel_current(channel_index, 0.0, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    "set_channel_current("
+                    f"{channel_index}, 0.0) failed: {self._format_exception(exc)}"
+                )
+            try:
+                device.set_channel_voltage(channel_index, 0.0, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    "set_channel_voltage("
+                    f"{channel_index}, 0.0) failed: {self._format_exception(exc)}"
+                )
+
+        try:
+            device.set_output_enabled(False, False, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"set_output_enabled(False, False) failed: {self._format_exception(exc)}")
+        try:
+            device.set_device_enabled(False, timeout_s=timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"set_device_enabled(False) failed: {self._format_exception(exc)}")
+        return errors
+
+    def _confirm_shutdown_unlocked(self, *, timeout_s: float) -> tuple[bool, str]:
+        device = self.device
+        if device is None:
+            return False, "device disconnected before shutdown confirmation"
+
+        snapshot = device.collect_housekeeping(timeout_s=timeout_s)
+        output_enabled = tuple(
+            bool(value) for value in snapshot.get("output_enabled", (False, False))
+        )
+        if any(output_enabled):
+            summary = ", ".join(
+                f"CH{index}={'ON' if enabled else 'OFF'}"
+                for index, enabled in enumerate(output_enabled)
+            )
+            return False, f"outputs still enabled ({summary})"
+        if _coerce_bool(snapshot.get("device_enabled"), False):
+            return False, "device still enabled"
+        return True, ""
+
     def readNumbers(self) -> None:
         if self.device is None or not getattr(self, "initialized", False):
             self.initializeValues(reset=True)
             return
 
         timeout_s = float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+        now_monotonic = time.monotonic()
+        snapshot: dict[str, Any] | None = None
+        live_readbacks: dict[str, Any] | None = None
         try:
             with self._controller_lock_section(
                 "Could not acquire lock to read PSU housekeeping.",
-                already_acquired=True,
             ):
                 device = self.device
                 if device is None:
                     return
-                snapshot = device.collect_housekeeping(timeout_s=timeout_s)
+                if self._housekeeping_refresh_due(now_monotonic):
+                    snapshot = device.collect_housekeeping(timeout_s=timeout_s)
+                    try:
+                        live_readbacks = self._read_live_readbacks(timeout_s=timeout_s)
+                    except Exception as exc:  # noqa: BLE001
+                        self.print(
+                            "Failed to refresh PSU live readbacks after housekeeping: "
+                            f"{self._format_exception(exc)}",
+                            flag=PRINT.WARNING,
+                        )
+                elif self._live_readback_refresh_due(now_monotonic):
+                    live_readbacks = self._read_live_readbacks(timeout_s=timeout_s)
+                    if live_readbacks is None:
+                        snapshot = device.collect_housekeeping(timeout_s=timeout_s)
+                else:
+                    return
         except TimeoutError:
             self.errorCount += 1
             self.print("Timed out while polling PSU housekeeping.", flag=PRINT.ERROR)
@@ -2015,7 +3727,13 @@ class PSUController(DeviceController):
             return
 
         try:
-            self._apply_snapshot(snapshot)
+            if snapshot is not None:
+                self._apply_snapshot(snapshot, refreshed_at=now_monotonic)
+            if live_readbacks is not None:
+                self._apply_live_readbacks(
+                    live_readbacks,
+                    refreshed_at=now_monotonic,
+                )
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
             self.print(
@@ -2025,7 +3743,61 @@ class PSUController(DeviceController):
             self.initializeValues(reset=True)
             return
 
-    def _apply_snapshot(self, snapshot: dict[str, Any]) -> None:
+    def _apply_live_readbacks(
+        self,
+        readbacks: dict[str, Any],
+        *,
+        refreshed_at: float | None = None,
+    ) -> None:
+        output_enabled = tuple(
+            bool(value) for value in readbacks.get("output_enabled", (False, False))
+        )
+        output_enabled_map = {
+            channel_no: bool(output_enabled[channel_no])
+            for channel_no in self._real_channel_numbers()
+            if 0 <= channel_no < len(output_enabled)
+        }
+        measured_voltages = dict(getattr(self, "values", {}) or {})
+        measured_voltages.update(
+            {
+                channel_no: _coerce_float(value, np.nan)
+                for channel_no, value in (readbacks.get("values", {}) or {}).items()
+            }
+        )
+        measured_currents = dict(getattr(self, "current_values", {}) or {})
+        measured_currents.update(
+            {
+                channel_no: _coerce_float(value, np.nan)
+                for channel_no, value in (
+                    readbacks.get("current_values", {}) or {}
+                ).items()
+            }
+        )
+
+        self.main_state = _harmonize_psu_main_state(
+            getattr(self, "hardware_main_state", "Unknown"),
+            device_enabled=readbacks.get("device_enabled"),
+            output_enabled=output_enabled,
+        )
+        self.output_state_summary = ", ".join(
+            f"CH{index}={'ON' if bool(enabled) else 'OFF'}"
+            for index, enabled in enumerate(output_enabled)
+        )
+        self.values = measured_voltages
+        self.current_values = measured_currents
+        if output_enabled_map:
+            self.output_enabled_by_channel = output_enabled_map
+        self._last_live_readback_refresh_monotonic = (
+            time.monotonic() if refreshed_at is None else float(refreshed_at)
+        )
+        self._sync_status_to_gui()
+
+    def _apply_snapshot(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        refreshed_at: float | None = None,
+    ) -> None:
         self.hardware_main_state = str(
             snapshot.get("main_state", {}).get("name", "Unknown")
         )
@@ -2049,6 +3821,13 @@ class PSUController(DeviceController):
         output_enabled_map: dict[int, bool] = {}
         voltage_setpoints: dict[int, str] = {}
         current_setpoints: dict[int, str] = {}
+        voltage_setpoint_values: dict[int, float] = {}
+        current_limit_values: dict[int, float] = {}
+        full_range_by_channel: dict[int, bool] = {}
+        full_range_supported_by_channel: dict[int, bool] = {}
+        adc_temperatures: dict[int, float] = {}
+        dropout_values: dict[int, float] = {}
+        rail_summaries: dict[int, str] = {}
         for channel_snapshot in snapshot.get("channels", []):
             channel_no = _coerce_int(channel_snapshot.get("channel"), -1)
             if channel_no < 0:
@@ -2062,11 +3841,38 @@ class PSUController(DeviceController):
                 channel_snapshot.get("current", {}).get("measured_a"),
                 np.nan,
             )
+            voltage_setpoint_values[channel_no] = _coerce_float(
+                channel_snapshot.get("voltage", {}).get("set_v"),
+                np.nan,
+            )
             voltage_setpoints[channel_no] = _format_voltage_text(
-                channel_snapshot.get("voltage", {}).get("set_v")
+                voltage_setpoint_values[channel_no]
+            )
+            current_limit_values[channel_no] = _coerce_float(
+                channel_snapshot.get("current", {}).get("set_a"),
+                np.nan,
             )
             current_setpoints[channel_no] = _format_current_text(
-                channel_snapshot.get("current", {}).get("set_a")
+                current_limit_values[channel_no]
+            )
+            full_range_by_channel[channel_no] = _coerce_bool(
+                channel_snapshot.get("full_range", {}).get("enabled"),
+                False,
+            )
+            full_range_supported_by_channel[channel_no] = _coerce_bool(
+                channel_snapshot.get("full_range", {}).get("supported"),
+                False,
+            )
+            adc_temperatures[channel_no] = _coerce_float(
+                channel_snapshot.get("adc", {}).get("temp_adc_c"),
+                np.nan,
+            )
+            dropout_values[channel_no] = _coerce_float(
+                channel_snapshot.get("dropout_v"),
+                np.nan,
+            )
+            rail_summaries[channel_no] = _format_rail_summary(
+                channel_snapshot.get("rails", {})
             )
 
         self.values = measured_voltages
@@ -2074,7 +3880,85 @@ class PSUController(DeviceController):
         self.output_enabled_by_channel = output_enabled_map
         self.voltage_setpoints = voltage_setpoints
         self.current_setpoints = current_setpoints
+        self.voltage_setpoint_values = voltage_setpoint_values
+        self.current_limit_values = current_limit_values
+        self.full_range_by_channel = full_range_by_channel
+        self.full_range_supported_by_channel = full_range_supported_by_channel
+        self.current_limit_active = _coerce_bool(
+            snapshot.get("psu_state", {}).get("current_limit_active"),
+            False,
+        )
+        self.adc_temperatures = adc_temperatures
+        self.dropout_values = dropout_values
+        self.rail_summaries = rail_summaries
+        refresh_time = time.monotonic() if refreshed_at is None else float(refreshed_at)
+        self._last_housekeeping_refresh_monotonic = refresh_time
+        self._last_live_readback_refresh_monotonic = refresh_time
         self._sync_status_to_gui()
+
+    def loadOperatingConfigNowFromThread(self, parallel: bool = True) -> None:
+        if parallel:
+            Thread(
+                target=self.loadOperatingConfigNow,
+                name=f"{self.controllerParent.name} loadOperatingConfigThread",
+                daemon=True,
+            ).start()
+            return
+        self.loadOperatingConfigNow()
+
+    def loadOperatingConfigNow(self) -> None:
+        device = self.device
+        if device is None or not getattr(self, "initialized", False):
+            self.print(
+                f"Cannot load {self.controllerParent.name} config: communication not initialized.",
+                flag=PRINT.WARNING,
+            )
+            return
+        is_on = getattr(self.controllerParent, "isOn", None)
+        if not callable(is_on) or not bool(is_on()):
+            self.print(
+                f"Cannot load {self.controllerParent.name} config while the PSU is OFF.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        ready, reason, config_index = self._operating_config_ready()
+        if not ready:
+            self.print(
+                f"Cannot load {self.controllerParent.name} config: {reason}.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to load the PSU config."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                device.load_config(config_index, timeout_s=timeout_s)
+            self._update_state()
+            self._set_loaded_config_text(self._format_loaded_config_text(config_index))
+            sync_manual = getattr(
+                self.controllerParent,
+                "_sync_manual_panel_from_controller",
+                None,
+            )
+            if callable(sync_manual):
+                sync_manual()
+            self.print(f"Loaded PSU config {config_index}.")
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to load PSU config {config_index}: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        finally:
+            self._sync_status_to_gui()
 
     def updateValues(self) -> None:
         if self.values is None:
@@ -2097,6 +3981,36 @@ class PSUController(DeviceController):
                     channel.ENABLED,
                     self.output_enabled_by_channel.get(channel_no, False),
                 )
+                style_setter = getattr(channel, "_set_parameter_widget_style", None)
+                if callable(style_setter):
+                    output_enabled = self.output_enabled_by_channel.get(channel_no, False)
+                    style_setter(
+                        getattr(channel, "MONITOR", "Monitor"),
+                        _psu_feedback_style(
+                            _voltage_feedback_state(
+                                enabled=output_enabled,
+                                measured_v=self.values.get(channel_no, np.nan),
+                                set_v=self.voltage_setpoint_values.get(
+                                    channel_no,
+                                    np.nan,
+                                ),
+                            )
+                        ),
+                    )
+                    style_setter(
+                        channel.CURRENT_MONITOR,
+                        _psu_feedback_style(
+                            _current_limit_feedback_state(
+                                enabled=output_enabled,
+                                measured_a=self.current_values.get(channel_no, np.nan),
+                                limit_a=self.current_limit_values.get(
+                                    channel_no,
+                                    np.nan,
+                                ),
+                                current_limit_active=self.current_limit_active,
+                            )
+                        ),
+                    )
                 continue
             channel.monitor = np.nan
             channel.setCurrentMonitorText("n/a")
@@ -2104,6 +4018,220 @@ class PSUController(DeviceController):
             channel.setVoltageSetText("n/a")
             channel.setCurrentSetText("n/a")
             channel._set_parameter_value_without_events(channel.ENABLED, False)
+
+    def applyManualStateFromThread(self, manual_state: dict[str, Any], parallel: bool = True) -> None:
+        if parallel:
+            Thread(
+                target=self.applyManualState,
+                args=(manual_state,),
+                name=f"{self.controllerParent.name} applyManualStateThread",
+                daemon=True,
+            ).start()
+            return
+        self.applyManualState(manual_state)
+
+    def applyManualState(self, manual_state: dict[str, Any]) -> None:
+        device = self.device
+        if device is None or not getattr(self, "initialized", False):
+            self.print(
+                f"Cannot apply {self.controllerParent.name} manual values: communication not initialized.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+        output_enabled = tuple(
+            bool((manual_state.get("output_enabled", {}) or {}).get(channel_index, False))
+            for channel_index in _PSU_CHANNEL_IDS
+        )
+        full_range_enabled = tuple(
+            bool((manual_state.get("full_range_enabled", {}) or {}).get(channel_index, False))
+            for channel_index in _PSU_CHANNEL_IDS
+        )
+        voltage_values = manual_state.get("voltage_values", {}) or {}
+        current_limit_values = manual_state.get("current_limit_values", {}) or {}
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to apply PSU manual values."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                device.set_output_enabled(False, False, timeout_s=timeout_s)
+                set_full_range = getattr(device, "set_output_full_range", None)
+                if callable(set_full_range):
+                    set_full_range(
+                        full_range_enabled[0],
+                        full_range_enabled[1],
+                        timeout_s=timeout_s,
+                    )
+                for channel_index in _PSU_CHANNEL_IDS:
+                    device.set_channel_voltage(
+                        channel_index,
+                        _coerce_float(voltage_values.get(channel_index), 0.0),
+                        timeout_s=timeout_s,
+                    )
+                    device.set_channel_current(
+                        channel_index,
+                        _coerce_float(current_limit_values.get(channel_index), 0.0),
+                        timeout_s=timeout_s,
+                    )
+                readback_warnings = self._verify_manual_state_unlocked(
+                    device=device,
+                    voltage_values=voltage_values,
+                    current_limit_values=current_limit_values,
+                    full_range_enabled=full_range_enabled,
+                    timeout_s=timeout_s,
+                )
+                any_output_enabled = any(output_enabled)
+                device.set_device_enabled(any_output_enabled, timeout_s=timeout_s)
+                if any_output_enabled:
+                    device.set_output_enabled(
+                        output_enabled[0],
+                        output_enabled[1],
+                        timeout_s=timeout_s,
+                    )
+                self._verify_output_enable_state_unlocked(
+                    device=device,
+                    any_output_enabled=any_output_enabled,
+                    output_enabled=output_enabled,
+                    timeout_s=timeout_s,
+                )
+            self._update_state()
+            self._set_loaded_config_text("Manual (unsaved)")
+            sync_manual = getattr(
+                self.controllerParent,
+                "_sync_manual_panel_from_controller",
+                None,
+            )
+            if callable(sync_manual):
+                sync_manual()
+            if readback_warnings:
+                self.print(
+                    "Applied PSU manual values with setpoint readback warning(s): "
+                    + " ".join(readback_warnings),
+                    flag=PRINT.WARNING,
+                )
+            self.print("Applied PSU manual values.")
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self._safe_disable_outputs_after_failure(timeout_s=timeout_s)
+            with contextlib.suppress(Exception):
+                self._update_state()
+            self.print(
+                f"Failed to apply PSU manual values: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        finally:
+            self._sync_status_to_gui()
+
+    def saveCurrentConfigFromThread(
+        self,
+        config_index: int,
+        *,
+        config_name: str | None = None,
+        active: bool = True,
+        valid: bool = True,
+        parallel: bool = True,
+    ) -> None:
+        if parallel:
+            Thread(
+                target=self.saveCurrentConfig,
+                kwargs={
+                    "config_index": config_index,
+                    "config_name": config_name,
+                    "active": active,
+                    "valid": valid,
+                },
+                name=f"{self.controllerParent.name} saveConfigThread",
+                daemon=True,
+            ).start()
+            return
+        self.saveCurrentConfig(
+            config_index=config_index,
+            config_name=config_name,
+            active=active,
+            valid=valid,
+        )
+
+    def saveCurrentConfig(
+        self,
+        *,
+        config_index: int,
+        config_name: str | None = None,
+        active: bool = True,
+        valid: bool = True,
+    ) -> None:
+        device = self.device
+        if device is None or not getattr(self, "initialized", False):
+            self.print(
+                f"Cannot save {self.controllerParent.name} config: communication not initialized.",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        save_config = getattr(device, "save_config", None)
+        if not callable(save_config):
+            self.print(
+                f"Cannot save {self.controllerParent.name} config: runtime does not expose save_config().",
+                flag=PRINT.WARNING,
+            )
+            return
+
+        if not callable(getattr(device, "list_configs", None)):
+            self.print(
+                f"Cannot save {self.controllerParent.name} config: runtime does not expose list_configs(), "
+                "so overwrite-safe saving is unavailable.",
+                flag=PRINT.WARNING,
+            )
+            return
+        self._refresh_available_configs()
+        if str(getattr(self, "available_configs_text", "") or "") == "Unavailable":
+            self.print(
+                f"Cannot save {self.controllerParent.name} config: existing config list is unavailable.",
+                flag=PRINT.WARNING,
+            )
+            return
+        if self._config_slot_exists(config_index):
+            self.print(
+                f"Cannot save {self.controllerParent.name} config {config_index}: "
+                "this slot already exists. Choose an empty slot.",
+                flag=PRINT.WARNING,
+            )
+            self._sync_status_to_gui()
+            return
+
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+        try:
+            with self._controller_lock_section(
+                "Could not acquire lock to save the PSU config."
+            ):
+                device = self.device
+                if device is None:
+                    return
+                save_config(
+                    config_index,
+                    name=config_name,
+                    active=active,
+                    valid=valid,
+                    timeout_s=timeout_s,
+                )
+            self._refresh_available_configs()
+            self._set_loaded_config_text(self._format_loaded_config_text(config_index))
+            self._sync_status_to_gui()
+            self.print(f"Saved PSU config {config_index}.")
+        except TimeoutError:
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.errorCount += 1
+            self.print(
+                f"Failed to save PSU config {config_index}: {self._format_exception(exc)}",
+                flag=PRINT.ERROR,
+            )
+        finally:
+            self._sync_status_to_gui()
 
     def toggleOn(self) -> None:
         target_on = bool(getattr(self.controllerParent, "isOn", lambda: False)())
@@ -2129,17 +4257,35 @@ class PSUController(DeviceController):
                         self._restore_off_ui_state()
                         return
                     startup_kwargs = self._startup_kwargs()
-                    if not startup_kwargs:
-                        raise RuntimeError(
-                            "PSU plugin requires a standby and/or operating config. "
-                            "Configure startup slots instead of editing live setpoints."
+                    if startup_kwargs:
+                        device.initialize(timeout_s=timeout_s, **startup_kwargs)
+                        loaded_config = _coerce_int(
+                            startup_kwargs.get("operating_config"),
+                            _coerce_int(startup_kwargs.get("standby_config"), -1),
                         )
-                    device.initialize(timeout_s=timeout_s, **startup_kwargs)
+                        if loaded_config >= 0:
+                            self._set_loaded_config_text(
+                                self._format_loaded_config_text(loaded_config)
+                            )
+                        message = "PSU startup sequence completed from controller configs."
+                    else:
+                        self._start_manual_mode(timeout_s=timeout_s)
+                        message = (
+                            "PSU communication initialized without a startup config. "
+                            "Outputs remain OFF until manual values are applied."
+                        )
                 self._update_state()
+                sync_manual = getattr(
+                    self.controllerParent,
+                    "_sync_manual_panel_from_controller",
+                    None,
+                )
+                if callable(sync_manual):
+                    sync_manual()
                 start_acquisition = getattr(self, "startAcquisition", None)
                 if callable(start_acquisition):
                     start_acquisition()
-                self.print("PSU startup sequence completed from controller configs.")
+                self.print(message)
             else:
                 self.shutdownCommunication()
                 return
@@ -2155,43 +4301,81 @@ class PSUController(DeviceController):
             self._end_transition()
             self._sync_status_to_gui()
 
-    def shutdownCommunication(self) -> None:
+    def shutdownCommunication(self) -> bool:
         device = self.device
         if device is None:
             self.closeCommunication()
-            return
+            return True
 
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
             stop_acquisition()
             self.acquiring = False
         self.print("Starting PSU shutdown sequence.")
+        timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
+        shutdown_errors: list[str] = []
+        shutdown_confirmed = False
+        confirmation_reason = "shutdown confirmation was not completed"
         try:
-            device.shutdown(
-                timeout_s=float(getattr(self.controllerParent, "startup_timeout_s", 10.0)),
-                **self._shutdown_kwargs(),
-            )
+            with self._controller_lock_section(
+                "Could not acquire lock to shut down the PSU."
+            ):
+                shutdown_errors = self._perform_shutdown_sequence_unlocked(
+                    timeout_s=timeout_s
+                )
+                shutdown_confirmed, confirmation_reason = self._confirm_shutdown_unlocked(
+                    timeout_s=float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+                )
+        except TimeoutError:
+            confirmation_reason = "controller lock timeout during shutdown"
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
+            confirmation_reason = self._format_exception(exc)
             self.print(
                 f"PSU shutdown failed: {self._format_exception(exc)}",
                 flag=PRINT.ERROR,
             )
-        else:
+        if shutdown_errors:
+            self.errorCount += 1
+            self.print(
+                "PSU shutdown sequence reported errors: " + "; ".join(shutdown_errors),
+                flag=PRINT.ERROR,
+            )
+        if shutdown_confirmed:
             self.print("PSU shutdown sequence completed.")
-        finally:
-            self.closeCommunication()
+        else:
+            self.errorCount += 1
+            self.print(
+                "PSU shutdown could not be confirmed before disconnect: "
+                f"{confirmation_reason}.",
+                flag=PRINT.ERROR,
+            )
+        self.closeCommunication(
+            final_state=(
+                "Disconnected"
+                if shutdown_confirmed
+                else _PSU_SHUTDOWN_UNCONFIRMED_STATE
+            )
+        )
+        return shutdown_confirmed
 
-    def closeCommunication(self) -> None:
+    def closeCommunication(self, *, final_state: str | None = None) -> None:
         base_close = getattr(super(), "closeCommunication", None)
         if callable(base_close):
             base_close()
-        self.main_state = "Disconnected"
-        self.hardware_main_state = "Disconnected"
-        self.output_state_summary = "CH0=OFF, CH1=OFF"
-        self.device_state_summary = "n/a"
+        resolved_final_state = str(final_state or "Disconnected")
+        is_disconnected = resolved_final_state == "Disconnected"
+        self.main_state = resolved_final_state
+        self.hardware_main_state = (
+            "Disconnected" if is_disconnected else resolved_final_state
+        )
+        self.output_state_summary = (
+            "CH0=OFF, CH1=OFF" if is_disconnected else "Unknown"
+        )
+        self.device_state_summary = "n/a" if is_disconnected else "Unknown"
         self.available_configs = []
         self.available_configs_text = "n/a"
+        self._set_loaded_config_text("n/a")
         self.initializeValues(reset=True)
         self._sync_status_to_gui()
         self._dispose_device()
@@ -2207,8 +4391,9 @@ class PSUController(DeviceController):
             return
 
         try:
+            timeout_s = float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
             snapshot = device.collect_housekeeping(
-                timeout_s=float(getattr(self.controllerParent, "poll_timeout_s", 5.0))
+                timeout_s=timeout_s
             )
         except Exception:
             try:
@@ -2223,6 +4408,11 @@ class PSUController(DeviceController):
             return
 
         self._apply_snapshot(snapshot)
+        live_readbacks = None
+        with contextlib.suppress(Exception):
+            live_readbacks = self._read_live_readbacks(timeout_s=timeout_s)
+        if live_readbacks is not None:
+            self._apply_live_readbacks(live_readbacks)
 
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
@@ -2230,19 +4420,38 @@ class PSUController(DeviceController):
         self.controllerParent.output_summary = self.output_state_summary
         self.controllerParent.available_configs = list(self.available_configs)
         self.controllerParent.available_configs_text = self.available_configs_text
-        sync_acquisition_controls = getattr(
-            self.controllerParent,
-            "_sync_acquisition_controls",
-            None,
-        )
-        if callable(sync_acquisition_controls):
-            sync_acquisition_controls()
-        update_config_selectors = getattr(self.controllerParent, "_update_config_selectors", None)
-        if callable(update_config_selectors):
-            update_config_selectors()
-        update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
-        if callable(update_status_widgets):
-            update_status_widgets()
+        self.controllerParent.loaded_state_text = self.loaded_state_text
+        def _refresh_gui() -> None:
+            sync_acquisition_controls = getattr(
+                self.controllerParent,
+                "_sync_acquisition_controls",
+                None,
+            )
+            if callable(sync_acquisition_controls):
+                sync_acquisition_controls()
+            update_config_controls = getattr(self.controllerParent, "_update_config_controls", None)
+            if callable(update_config_controls):
+                update_config_controls()
+            else:
+                update_config_selectors = getattr(
+                    self.controllerParent,
+                    "_update_config_selectors",
+                    None,
+                )
+                if callable(update_config_selectors):
+                    update_config_selectors()
+            update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
+            if callable(update_status_widgets):
+                update_status_widgets()
+
+        _invoke_gui_callback(_refresh_gui)
+
+    def _transition_guard(self) -> Lock:
+        lock = getattr(self, "_transition_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._transition_lock = lock
+        return lock
 
     def _dispose_device(self) -> None:
         device = self.device
@@ -2305,15 +4514,17 @@ class PSUController(DeviceController):
         )
 
     def _begin_transition(self, target_on: bool) -> bool:
-        if self.transitioning:
-            return False
-        self.transitioning = True
-        self.transition_target_on = bool(target_on)
-        return True
+        with self._transition_guard():
+            if self.transitioning:
+                return False
+            self.transitioning = True
+            self.transition_target_on = bool(target_on)
+            return True
 
     def _end_transition(self) -> None:
-        self.transitioning = False
-        self.transition_target_on = None
+        with self._transition_guard():
+            self.transitioning = False
+            self.transition_target_on = None
 
     def _format_exception(self, exc: Exception) -> str:
         return str(exc).strip()

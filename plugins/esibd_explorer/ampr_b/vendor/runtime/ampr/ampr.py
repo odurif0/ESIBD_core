@@ -450,7 +450,12 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
     def shutdown(self, timeout_s: Optional[float] = None) -> None:
         """Run the recommended AMPR shutdown sequence."""
         timeout_s = self._resolve_io_timeout(timeout_s)
-        modules = self.scan_modules(timeout_s=timeout_s)
+        errors: list[str] = []
+        try:
+            modules = self.scan_modules(timeout_s=timeout_s)
+        except Exception as exc:
+            errors.append(f"scan_modules: {exc}")
+            modules = {}
 
         module_items = (
             modules.items()
@@ -465,26 +470,44 @@ class _AMPRController(TimeoutSafeDllMixin, AMPRBase):
             )
             channel_count = int(capabilities.get("channel_count") or self.CHANNEL_NUM)
             for channel in range(1, channel_count + 1):
-                status = self.set_module_voltage(
-                    module,
-                    channel,
-                    0.0,
-                    timeout_s=timeout_s,
-                )
+                try:
+                    status = self.set_module_voltage(
+                        module,
+                        channel,
+                        0.0,
+                        timeout_s=timeout_s,
+                    )
+                except Exception as exc:
+                    errors.append(
+                        f"set_module_voltage({module}, {channel}, 0.0): {exc}"
+                    )
+                    continue
                 if status != self.NO_ERR:
-                    raise RuntimeError(
-                        "Failed to set AMPR module "
-                        f"{module} channel {channel} to 0 V: {self.format_status(status)}"
+                    errors.append(
+                        "set_module_voltage("
+                        f"{module}, {channel}, 0.0): {self.format_status(status)}"
                     )
 
-        status, _ = self.enable_psu(False, timeout_s=timeout_s)
-        if status != self.NO_ERR:
-            raise RuntimeError(
-                f"AMPR disable_psu failed: {self.format_status(status)}"
-            )
+        try:
+            status, _ = self.enable_psu(False, timeout_s=timeout_s)
+        except Exception as exc:
+            errors.append(f"enable_psu(False): {exc}")
+        else:
+            if status != self.NO_ERR:
+                errors.append(f"enable_psu(False): {self.format_status(status)}")
 
-        if not self.disconnect():
-            raise RuntimeError("AMPR disconnect failed")
+        try:
+            disconnected = self.disconnect()
+        except Exception as exc:
+            errors.append(f"disconnect(): {exc}")
+        else:
+            if not disconnected:
+                errors.append("disconnect(): AMPR disconnect failed")
+
+        if errors:
+            raise RuntimeError(
+                "AMPR shutdown sequence reported errors: " + "; ".join(errors)
+            )
 
     def _hk_worker(self):
         """

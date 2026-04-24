@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import sys
 from pathlib import Path
+from threading import Lock
 from typing import Any, cast
 
 import numpy as np
@@ -46,6 +47,7 @@ _DMMR_MIN_ROW_HEIGHT = 28
 _DMMR_COMMUNICATION_LOST_STATE = "Communication lost"
 _DMMR_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
 _DMMR_ATTENTION_STATE_TOKENS = ("error", "unconfirmed", "lost")
+_DMMR_TRANSPORT_FAILURE_THRESHOLD = 3
 _DMMR_POWER_ON_ICON = "switch-medium_on.png"
 _DMMR_POWER_OFF_ICON = "switch-medium_off.png"
 _DMMR_NEUTRAL_WIDGET_STYLE = (
@@ -62,6 +64,65 @@ _DMMR_TOGGLE_BUTTON_STYLE = (
     "QToolButton { margin: 0px; padding: 0px 6px; }"
     "QToolButton:checked { background-color: #1f2933; color: #ffffff; }"
 )
+_DMMR_PANEL_CARD_ACTIVE_STYLE = (
+    "QFrame {"
+    " background-color: #162433;"
+    " border: 1px solid #3182ce;"
+    " border-radius: 8px;"
+    " color: #f7fafc;"
+    "}"
+)
+_DMMR_PANEL_CARD_MUTED_STYLE = (
+    "QFrame {"
+    " background-color: #202938;"
+    " border: 1px solid #64748b;"
+    " border-radius: 8px;"
+    " color: #f7fafc;"
+    "}"
+)
+_DMMR_PANEL_CARD_DISCONNECTED_STYLE = (
+    "QFrame {"
+    " background-color: #151b26;"
+    " border: 1px solid #475569;"
+    " border-radius: 8px;"
+    " color: #e2e8f0;"
+    "}"
+)
+_DMMR_PANEL_TITLE_STYLE = "color: #f8fafc; font-weight: 700; font-size: 14px;"
+_DMMR_PANEL_CURRENT_LABEL_STYLE = "color: #cbd5e1; font-weight: 600;"
+_DMMR_PANEL_CURRENT_VALUE_STYLE = "color: #f8fafc; font-weight: 700; font-size: 18px;"
+_DMMR_PANEL_BADGE_READ_STYLE = (
+    "background-color: #1f2933; color: #ffffff; margin:0px; padding:0px 6px;"
+)
+_DMMR_PANEL_BADGE_MUTED_STYLE = (
+    "background-color: #4a5568; color: #ffffff; margin:0px; padding:0px 6px;"
+)
+_DMMR_PANEL_BADGE_OFF_STYLE = (
+    "background-color: #718096; color: #ffffff; margin:0px; padding:0px 6px;"
+)
+_DMMR_PANEL_READ_BUTTON_STYLE = (
+    "QPushButton {"
+    " background-color: #334155;"
+    " color: #f8fafc;"
+    " border: 1px solid #475569;"
+    " border-radius: 6px;"
+    " padding: 4px 10px;"
+    "}"
+    "QPushButton:checked {"
+    " background-color: #0f172a;"
+    " color: #ffffff;"
+    " border: 1px solid #94a3b8;"
+    "}"
+    "QPushButton:disabled {"
+    " background-color: #1f2937;"
+    " color: #94a3b8;"
+    " border: 1px solid #374151;"
+    "}"
+)
+_DMMR_PANEL_EMPTY_STYLE = "color: #718096; font-style: italic; padding: 8px 0px;"
+_DMMR_PANEL_CARD_MIN_WIDTH = 220
+_DMMR_PANEL_CARD_MAX_WIDTH = 260
+_DMMR_PANEL_GRID_COLUMNS = 3
 
 
 def _is_nan(value: Any) -> bool:
@@ -117,6 +178,68 @@ def _compact_status_text(value: Any, default: str = "n/a") -> str:
     return f"{parts[0]} +{len(parts) - 1}"
 
 
+def _transport_failure_is_fatal(exc: Exception) -> bool:
+    """Return True when a transport exception clearly indicates a dead backend."""
+    text = str(exc).strip().lower()
+    if not text:
+        return False
+    return any(
+        token in text
+        for token in (
+            "unusable",
+            "transport is unusable",
+            "transport became unusable",
+            "marked unusable",
+            "worker became unusable",
+        )
+    )
+
+
+def _invoke_gui_callback(callback: Any) -> None:
+    """Run GUI updates directly in tests and queue them on the Qt GUI thread."""
+    if not callable(callback):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:
+        callback()
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        callback()
+        return
+
+    try:
+        if QThread.currentThread() == app.thread():
+            callback()
+            return
+
+        dispatcher = getattr(_invoke_gui_callback, "_dispatcher", None)
+        if dispatcher is None:
+            class _CallbackDispatcher(QObject):
+                callbackRequested = pyqtSignal(object)
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.callbackRequested.connect(
+                        self._run,
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+
+                def _run(self, queued_callback: Any) -> None:
+                    if callable(queued_callback):
+                        queued_callback()
+
+            dispatcher = _CallbackDispatcher()
+            dispatcher.moveToThread(app.thread())
+            setattr(_invoke_gui_callback, "_dispatcher", dispatcher)
+        dispatcher.callbackRequested.emit(callback)
+    except Exception:
+        callback()
+
+
 def _action_label(action: Any) -> str:
     """Extract a stable label from QAction-like objects and test doubles."""
     for attr_name in ("toolTip", "text", "objectName"):
@@ -160,6 +283,23 @@ def _state_requires_operator_attention(state: Any) -> bool:
     """Return True when the raw state should stay visible even if the UI toggle is OFF."""
     normalized = str(state or "").strip().lower()
     return any(token in normalized for token in _DMMR_ATTENTION_STATE_TOKENS)
+
+
+def _dmmr_panel_card_style(*, connected: bool, reading: bool) -> str:
+    if not connected:
+        return _DMMR_PANEL_CARD_DISCONNECTED_STYLE
+    if reading:
+        return _DMMR_PANEL_CARD_ACTIVE_STYLE
+    return _DMMR_PANEL_CARD_MUTED_STYLE
+
+
+def _dmmr_panel_badge_style(state: str) -> str:
+    normalized = str(state or "").strip().lower()
+    if normalized == "read":
+        return _DMMR_PANEL_BADGE_READ_STYLE
+    if normalized == "muted":
+        return _DMMR_PANEL_BADGE_MUTED_STYLE
+    return _DMMR_PANEL_BADGE_OFF_STYLE
 
 
 class _DMMRCurrentMonitorSpinBox(LabviewDoubleSpinBox):
@@ -474,7 +614,7 @@ class DMMRDevice(Device):
 
     name = "DMMR"
     version = "0.1.0"
-    supportedVersion = "0.8"
+    supportedVersion = "1.0.1"
     pluginType = PLUGINTYPE.INPUTDEVICE
     unit = "A"
     useMonitors = True
@@ -506,6 +646,9 @@ class DMMRDevice(Device):
             self.closeCommunicationAction.setText(shutdown_tooltip)
             self.closeCommunicationAction.setVisible(False)
         self.controller = DMMRController(controllerParent=self)
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
 
     def finalizeInit(self) -> None:
         super().finalizeInit()
@@ -519,6 +662,9 @@ class DMMRDevice(Device):
             self.advancedAction.setToolTip(self.advancedAction.toolTipFalse)
         self._ensure_local_on_action()
         self._ensure_status_widgets()
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
         self._update_channel_column_visibility()
         self._sync_acquisition_controls()
 
@@ -584,6 +730,364 @@ class DMMRDevice(Device):
             action.state = self.isOn()
         finally:
             action.blockSignals(False)
+
+    def _hide_channel_table(self) -> None:
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return
+        hide = getattr(tree, "hide", None)
+        if callable(hide):
+            hide()
+            return
+        set_visible = getattr(tree, "setVisible", None)
+        if callable(set_visible):
+            set_visible(False)
+
+    def _hide_channel_table_actions(self) -> None:
+        """Hide generic channel-table actions superseded by the DMMR panel."""
+        for action_name in (
+            "advancedAction",
+            "importAction",
+            "exportAction",
+            "saveAction",
+            "duplicateChannelAction",
+            "deleteChannelAction",
+            "moveChannelUpAction",
+            "moveChannelDownAction",
+            "copyAction",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None and hasattr(action, "setVisible"):
+                action.setVisible(False)
+
+    def _panel_channels(self) -> "list[DMMRChannel]":
+        return sorted(
+            [channel for channel in self.getChannels() if channel.real],
+            key=lambda channel: channel.module_address(),
+        )
+
+    def _channel_by_module(self, module: int) -> "DMMRChannel | None":
+        for channel in self.getChannels():
+            if channel.real and channel.module_address() == module:
+                return channel
+        return None
+
+    def _channel_display_checked(self, channel: Any | None) -> bool:
+        if channel is None:
+            return False
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "DISPLAY", "Display"))
+                if parameter is not None:
+                    return _coerce_bool(
+                        getattr(parameter, "value", getattr(channel, "display", False)),
+                        _coerce_bool(getattr(channel, "display", False), False),
+                    )
+        return _coerce_bool(getattr(channel, "display", False), False)
+
+    def _channel_enabled_checked(self, channel: Any | None) -> bool:
+        if channel is None:
+            return False
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "ENABLED", "Enabled"))
+                if parameter is not None:
+                    return _coerce_bool(
+                        getattr(parameter, "value", getattr(channel, "enabled", False)),
+                        _coerce_bool(getattr(channel, "enabled", False), False),
+                    )
+        return _coerce_bool(getattr(channel, "enabled", False), False)
+
+    def _clear_channel_panel_layout(self, layout: Any) -> None:
+        if layout is None:
+            return
+        count = getattr(layout, "count", None)
+        take_at = getattr(layout, "takeAt", None)
+        if not callable(count) or not callable(take_at):
+            return
+        while count():
+            item = take_at(0)
+            if item is None:
+                continue
+            child_layout = getattr(item, "layout", lambda: None)()
+            if child_layout is not None:
+                self._clear_channel_panel_layout(child_layout)
+            widget = getattr(item, "widget", lambda: None)()
+            if widget is not None:
+                if hasattr(widget, "setParent"):
+                    widget.setParent(None)
+                delete_later = getattr(widget, "deleteLater", None)
+                if callable(delete_later):
+                    delete_later()
+
+    def _set_channel_panel_checkbox(self, checkbox: Any, *, checked: bool, enabled: bool) -> None:
+        if checkbox is None:
+            return
+        block_signals = getattr(checkbox, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_checked = getattr(checkbox, "setChecked", None)
+            if callable(set_checked):
+                set_checked(bool(checked))
+            else:
+                checkbox.checked = bool(checked)
+            set_enabled = getattr(checkbox, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
+            else:
+                checkbox.enabled = bool(enabled)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _set_channel_panel_button(self, button: Any, *, checked: bool, enabled: bool) -> None:
+        if button is None:
+            return
+        block_signals = getattr(button, "blockSignals", None)
+        if callable(block_signals):
+            block_signals(True)
+        try:
+            set_checked = getattr(button, "setChecked", None)
+            if callable(set_checked):
+                set_checked(bool(checked))
+            else:
+                button.checked = bool(checked)
+            set_enabled = getattr(button, "setEnabled", None)
+            if callable(set_enabled):
+                set_enabled(bool(enabled))
+            else:
+                button.enabled = bool(enabled)
+        finally:
+            if callable(block_signals):
+                block_signals(False)
+
+    def _channel_panel_display_toggled(self, module: int, checked: bool) -> None:
+        channel = self._channel_by_module(module)
+        if channel is None:
+            return
+
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "DISPLAY", "Display"))
+                if parameter is not None:
+                    if hasattr(parameter, "setValueWithoutEvents"):
+                        parameter.setValueWithoutEvents(bool(checked))
+                    else:
+                        parameter.value = bool(checked)
+        channel.display = bool(checked)
+        display_changed = getattr(channel, "displayChanged", None)
+        if callable(display_changed):
+            display_changed()
+        self._update_channel_panel()
+
+    def _channel_panel_read_toggled(self, module: int, checked: bool) -> None:
+        channel = self._channel_by_module(module)
+        if channel is None:
+            return
+
+        getter = getattr(channel, "getParameterByName", None)
+        if callable(getter):
+            with contextlib.suppress(Exception):
+                parameter = getter(getattr(channel, "ENABLED", "Enabled"))
+                if parameter is not None:
+                    if hasattr(parameter, "setValueWithoutEvents"):
+                        parameter.setValueWithoutEvents(bool(checked))
+                    else:
+                        parameter.value = bool(checked)
+        channel.enabled = bool(checked)
+        enabled_changed = getattr(channel, "enabledChanged", None)
+        if callable(enabled_changed):
+            enabled_changed()
+        self._update_channel_panel()
+
+    def _channel_panel_snapshot(self, module: int) -> dict[str, Any]:
+        controller = getattr(self, "controller", None)
+        channel = self._channel_by_module(module)
+        raw_state = str(getattr(self, "main_state", "Disconnected") or "Disconnected")
+        connected = raw_state not in {"Disconnected", _DMMR_COMMUNICATION_LOST_STATE}
+        is_on = getattr(self, "isOn", None)
+        device_on = connected and callable(is_on) and bool(is_on())
+        read_checked = self._channel_enabled_checked(channel)
+        current_value = (
+            (getattr(controller, "values", {}) or {}).get(module, np.nan)
+            if device_on and read_checked
+            else np.nan
+        )
+        current_text, raw_text = _format_si_current(current_value)
+        if not device_on:
+            state_text = "OFF" if connected else "Disconnected"
+            current_text = "n/a"
+            raw_text = "n/a"
+        elif not read_checked:
+            state_text = "Muted"
+            current_text = "Muted"
+            raw_text = "Read disabled"
+        else:
+            state_text = "Read"
+
+        return {
+            "title": f"Module {module}",
+            "state_text": state_text,
+            "state_style": _dmmr_panel_badge_style(state_text),
+            "card_style": _dmmr_panel_card_style(
+                connected=connected,
+                reading=bool(device_on and read_checked),
+            ),
+            "current_text": current_text,
+            "current_tooltip": raw_text,
+            "read_checked": read_checked,
+            "read_enabled": channel is not None,
+            "display_checked": self._channel_display_checked(channel),
+            "display_enabled": channel is not None,
+        }
+
+    def _rebuild_channel_panel_cards(self) -> None:
+        grid = getattr(self, "channelPanelGrid", None)
+        if grid is None:
+            return
+
+        from PyQt6.QtWidgets import (
+            QCheckBox,
+            QFrame,
+            QGridLayout,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+            QSizePolicy,
+            QVBoxLayout,
+        )
+
+        self._clear_channel_panel_layout(grid)
+        self.channelPanelCards = {}
+        channels = self._panel_channels()
+        if not channels:
+            empty_label = QLabel("No detected modules yet.")
+            empty_label.setStyleSheet(_DMMR_PANEL_EMPTY_STYLE)
+            grid.addWidget(empty_label, 0, 0)
+            self.channelPanelSignature = ()
+            return
+
+        for index, channel in enumerate(channels):
+            module = channel.module_address()
+            card = QFrame()
+            card.setSizePolicy(
+                QSizePolicy.Policy.Preferred,
+                QSizePolicy.Policy.Fixed,
+            )
+            card.setMinimumWidth(_DMMR_PANEL_CARD_MIN_WIDTH)
+            card.setMaximumWidth(_DMMR_PANEL_CARD_MAX_WIDTH)
+
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 12, 12, 12)
+            card_layout.setSpacing(8)
+
+            header_layout = QHBoxLayout()
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(8)
+
+            title_label = QLabel(f"Module {module}")
+            title_label.setStyleSheet(_DMMR_PANEL_TITLE_STYLE)
+            state_badge = QLabel("n/a")
+            header_layout.addWidget(title_label)
+            header_layout.addStretch(1)
+            header_layout.addWidget(state_badge)
+            card_layout.addLayout(header_layout)
+
+            current_name = QLabel("Current")
+            current_name.setStyleSheet(_DMMR_PANEL_CURRENT_LABEL_STYLE)
+            current_value = QLabel("NaN")
+            current_value.setStyleSheet(_DMMR_PANEL_CURRENT_VALUE_STYLE)
+            card_layout.addWidget(current_name)
+            card_layout.addWidget(current_value)
+
+            controls_layout = QHBoxLayout()
+            controls_layout.setContentsMargins(0, 0, 0, 0)
+            controls_layout.setSpacing(10)
+
+            read_button = QPushButton("Read")
+            read_button.setCheckable(True)
+            read_button.setStyleSheet(_DMMR_PANEL_READ_BUTTON_STYLE)
+            read_button.clicked.connect(
+                lambda checked, module=module: self._channel_panel_read_toggled(
+                    module,
+                    checked,
+                )
+            )
+            display_box = QCheckBox("Display")
+            display_box.toggled.connect(
+                lambda checked, module=module: self._channel_panel_display_toggled(
+                    module,
+                    checked,
+                )
+            )
+            controls_layout.addWidget(read_button)
+            controls_layout.addStretch(1)
+            controls_layout.addWidget(display_box)
+            card_layout.addLayout(controls_layout)
+
+            row = index // _DMMR_PANEL_GRID_COLUMNS
+            column = index % _DMMR_PANEL_GRID_COLUMNS
+            grid.addWidget(card, row, column)
+            self.channelPanelCards[module] = {
+                "card": card,
+                "title": title_label,
+                "state_badge": state_badge,
+                "current_value": current_value,
+                "read_button": read_button,
+                "display_box": display_box,
+            }
+
+        self.channelPanelSignature = tuple(
+            channel.module_address() for channel in channels
+        )
+
+    def _ensure_channel_panel(self) -> None:
+        """Replace the generic channel table with compact DMMR module cards."""
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        if not hasattr(self, "channelPanel"):
+            from PyQt6.QtWidgets import (
+                QGridLayout,
+                QHBoxLayout,
+                QVBoxLayout,
+                QWidget,
+            )
+
+            panel = QWidget()
+            panel_layout = QVBoxLayout(panel)
+            panel_layout.setContentsMargins(12, 12, 12, 12)
+            panel_layout.setSpacing(12)
+
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(0)
+            row_layout.addStretch(1)
+
+            host = QWidget()
+            grid = QGridLayout(host)
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(12)
+            row_layout.addWidget(host)
+            row_layout.addStretch(1)
+            panel_layout.addWidget(row)
+
+            self.channelPanel = panel
+            self.channelPanelHost = host
+            self.channelPanelGrid = grid
+            self.channelPanelCards = {}
+            self.channelPanelSignature = None
+            self.addContentWidget(panel)
+
+        signature = tuple(channel.module_address() for channel in self._panel_channels())
+        if getattr(self, "channelPanelSignature", None) != signature:
+            self._rebuild_channel_panel_cards()
+        self._update_channel_panel()
 
     def _display_main_state(self) -> str:
         """Return the operator-facing state shown in the toolbar badge."""
@@ -693,6 +1197,7 @@ class DMMRDevice(Device):
         summary = getattr(self, "statusSummaryLabel", None)
         self._sync_acquisition_controls()
         if badge is None or summary is None:
+            self._update_channel_panel()
             return
 
         badge_text = self._display_main_state()
@@ -710,6 +1215,47 @@ class DMMRDevice(Device):
             summary.setText(summary_text)
         if hasattr(summary, "setToolTip"):
             summary.setToolTip(tooltip)
+        self._update_channel_panel()
+
+    def _update_channel_panel(self) -> None:
+        cards = getattr(self, "channelPanelCards", None)
+        if not isinstance(cards, dict):
+            return
+
+        signature = tuple(channel.module_address() for channel in self._panel_channels())
+        if getattr(self, "channelPanelSignature", None) != signature:
+            self._rebuild_channel_panel_cards()
+            cards = getattr(self, "channelPanelCards", None)
+            if not isinstance(cards, dict):
+                return
+
+        for module, widgets in cards.items():
+            snapshot = self._channel_panel_snapshot(module)
+            for key in ("title", "current_value"):
+                widget = widgets.get(key)
+                if widget is not None and hasattr(widget, "setText"):
+                    widget.setText(str(snapshot["current_text" if key == "current_value" else key]))
+            current_widget = widgets.get("current_value")
+            if current_widget is not None and hasattr(current_widget, "setToolTip"):
+                current_widget.setToolTip(str(snapshot["current_tooltip"]))
+            state_badge = widgets.get("state_badge")
+            if state_badge is not None and hasattr(state_badge, "setText"):
+                state_badge.setText(str(snapshot["state_text"]))
+            if state_badge is not None and hasattr(state_badge, "setStyleSheet"):
+                state_badge.setStyleSheet(snapshot["state_style"])
+            card = widgets.get("card")
+            if card is not None and hasattr(card, "setStyleSheet"):
+                card.setStyleSheet(snapshot["card_style"])
+            self._set_channel_panel_button(
+                widgets.get("read_button"),
+                checked=bool(snapshot["read_checked"]),
+                enabled=bool(snapshot["read_enabled"]),
+            )
+            self._set_channel_panel_checkbox(
+                widgets.get("display_box"),
+                checked=bool(snapshot["display_checked"]),
+                enabled=bool(snapshot["display_enabled"]),
+            )
 
     def _set_channel_headers_from_template(self) -> None:
         """Apply channel headers even when no concrete channel exists yet."""
@@ -804,7 +1350,10 @@ class DMMRDevice(Device):
                 self.tree.scheduleDelayedItemsLayout()
             if hasattr(self, "advancedAction"):
                 self.toggleAdvanced(advanced=self.advancedAction.state)
+            self._hide_channel_table()
+            self._hide_channel_table_actions()
             self._update_channel_column_visibility()
+            self._ensure_channel_panel()
             self.estimateStorage()
             self.pluginManager.DeviceManager.globalUpdate(inout=self.inout)
         finally:
@@ -844,6 +1393,9 @@ class DMMRDevice(Device):
                 self._set_channel_headers_from_template()
                 if hasattr(self, "advancedAction"):
                     self.toggleAdvanced(advanced=self.advancedAction.state)
+                self._hide_channel_table()
+                self._hide_channel_table_actions()
+                self._ensure_channel_panel()
                 if self.tree is not None:
                     self.tree.scheduleDelayedItemsLayout()
                 self.pluginManager.DeviceManager.globalUpdate(inout=self.inout)
@@ -854,6 +1406,9 @@ class DMMRDevice(Device):
             return
 
         super().loadConfiguration(file=file, useDefaultFile=False, append=append)
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
 
     def toggleAdvanced(self, advanced: "bool | None" = False) -> None:
         """Handle advanced columns without hiding DMMR channels."""
@@ -861,7 +1416,10 @@ class DMMRDevice(Device):
             super().toggleAdvanced(advanced=advanced)
             for channel in self.getChannels():
                 channel.setHidden(False)
+            self._hide_channel_table()
+            self._hide_channel_table_actions()
             self._update_channel_column_visibility()
+            self._ensure_channel_panel()
             return
 
         if advanced is not None:
@@ -882,6 +1440,9 @@ class DMMRDevice(Device):
         for index, item in enumerate(self._default_channel_template().values()):
             if item.get(_PARAMETER_ADVANCED_KEY, False):
                 self.tree.setColumnHidden(index, not self.advancedAction.state)
+        self._hide_channel_table()
+        self._hide_channel_table_actions()
+        self._ensure_channel_panel()
 
     def estimateStorage(self) -> None:
         """Avoid division by zero before the first DMMR channel discovery."""
@@ -984,7 +1545,18 @@ class DMMRDevice(Device):
         if hasattr(action, "setEnabled"):
             action.setEnabled(enabled)
             return
-        setattr(action, "enabled", enabled)
+        with contextlib.suppress(AttributeError):
+            setattr(action, "enabled", enabled)
+
+    def _set_action_visible(self, action: Any | None, visible: bool) -> None:
+        """Update QAction-like visibility while tolerating lightweight test doubles."""
+        if action is None:
+            return
+        if hasattr(action, "setVisible"):
+            action.setVisible(visible)
+            return
+        with contextlib.suppress(AttributeError):
+            setattr(action, "visible", visible)
 
     def _force_recording_action_state(self, state: bool) -> None:
         """Force the acquisition action state without re-entering its callbacks."""
@@ -1034,19 +1606,49 @@ class DMMRDevice(Device):
                 setattr(live_display, "initCommunicationAction", action)
         return close_action, init_action
 
+    def _communication_open(self) -> bool:
+        """Return whether a transport/driver exists, even after a partial startup failure."""
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False
+        if getattr(controller, "device", None) is not None:
+            return True
+        return bool(getattr(controller, "initialized", False))
+
     def _sync_display_communication_controls(self) -> None:
         """Enable display-side communication actions only when applicable."""
         close_action, init_action = self._display_communication_actions()
         controller = getattr(self, "controller", None)
-        initializing = bool(getattr(controller, "initializing", False))
-        initialized = bool(getattr(controller, "initialized", False))
-        self._set_action_enabled(close_action, initialized and not initializing)
-        self._set_action_enabled(init_action, (not initialized) and (not initializing))
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        communication_open = self._communication_open()
+        self._set_action_enabled(close_action, communication_open and not busy)
+        self._set_action_enabled(init_action, (not communication_open) and (not busy))
+
+    def _sync_toolbar_communication_controls(self) -> None:
+        """Expose a disconnect action when communication is open but the local ON action is OFF."""
+        close_action = getattr(self, "closeCommunicationAction", None)
+        if close_action is None:
+            return
+        controller = getattr(self, "controller", None)
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        can_close = self._communication_open() and not busy
+        is_on = False
+        is_on_fn = getattr(self, "isOn", None)
+        if callable(is_on_fn):
+            is_on = bool(is_on_fn())
+        has_local_on_action = getattr(self, "onAction", None) is not None
+        self._set_action_enabled(close_action, can_close)
+        self._set_action_visible(close_action, can_close and (not has_local_on_action or not is_on))
 
     def _sync_acquisition_controls(self) -> None:
         """Disable manual acquisition controls until the DMMR is actually ready."""
         ready, _reason = self._acquisition_readiness()
         self._sync_display_communication_controls()
+        self._sync_toolbar_communication_controls()
         self._set_action_enabled(getattr(self, "recordingAction", None), ready)
         self._set_action_enabled(
             getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
@@ -1117,6 +1719,7 @@ class DMMRDevice(Device):
         if self.useOnOffLogic and hasattr(self, "onAction"):
             self.onAction.state = False if shutdown_confirmed else True
             self._sync_local_on_action()
+            self._sync_toolbar_communication_controls()
             self._update_status_widgets()
         if not shutdown_confirmed:
             self.print(
@@ -1140,6 +1743,7 @@ class DMMRDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._sync_toolbar_communication_controls()
         self._update_status_widgets()
 
     def setOn(self, on: "bool | None" = None) -> None:
@@ -1491,8 +2095,10 @@ class DMMRController(DeviceController):
         self.initialized = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
-        self._closing = False
+        self._transition_lock = Lock()
+        self._close_lock = Lock()
         self._forced_close_state: str | None = None
+        self._consecutive_transport_failures = 0
 
     def initializeValues(self, reset: bool = False) -> None:
         if getattr(self, "values", None) is None or reset:
@@ -1667,7 +2273,6 @@ class DMMRController(DeviceController):
             try:
                 with self._controller_lock_section(
                     f"Could not acquire lock to read DMMR module {module}.",
-                    already_acquired=True,
                 ):
                     device = self.device
                     if device is None:
@@ -1689,6 +2294,9 @@ class DMMRController(DeviceController):
                     f"Failed to read DMMR module {module}: {exc}",
                     flag=PRINT.ERROR,
                 )
+                if _transport_failure_is_fatal(exc):
+                    self._handle_transport_loss()
+                    return
                 continue
 
             if status == getattr(device, "NO_ERR", status):
@@ -1699,7 +2307,6 @@ class DMMRController(DeviceController):
                 try:
                     with self._controller_lock_section(
                         "Could not acquire lock to recover DMMR polling mode.",
-                        already_acquired=True,
                     ):
                         device = self.device
                         if device is None:
@@ -1855,9 +2462,9 @@ class DMMRController(DeviceController):
             self._sync_status_to_gui()
 
     def closeCommunication(self, *, final_state: str | None = None) -> None:
-        if self._closing:
+        close_lock = self._close_guard()
+        if not close_lock.acquire(blocking=False):
             return
-        self._closing = True
         try:
             self._end_transition()
             # Signal the acquisition loop to stop early so it releases the
@@ -1873,24 +2480,28 @@ class DMMRController(DeviceController):
             if callable(base_close):
                 base_close()
             if final_state is None:
-                is_on = getattr(self.controllerParent, "isOn", None)
-                final_state = (
-                    _DMMR_COMMUNICATION_LOST_STATE
-                    if callable(is_on) and bool(is_on())
-                    else "Disconnected"
-                )
+                final_state = self._forced_close_state
+                if final_state is None:
+                    is_on = getattr(self.controllerParent, "isOn", None)
+                    final_state = (
+                        _DMMR_COMMUNICATION_LOST_STATE
+                        if callable(is_on) and bool(is_on())
+                        else "Disconnected"
+                    )
             self.main_state = final_state
             self.detected_module_ids = []
             self.detected_modules_text = ""
-            self.device_state_summary = "n/a"
-            self.voltage_state_summary = "n/a"
-            self.temperature_state_summary = "n/a"
+            summary_value = "n/a" if final_state == "Disconnected" else "Unknown"
+            self.device_state_summary = summary_value
+            self.voltage_state_summary = summary_value
+            self.temperature_state_summary = summary_value
             self._sync_status_to_gui()
             self._dispose_device()
             self.initialized = False
+            self._clear_transport_failures()
             self._forced_close_state = None
         finally:
-            self._closing = False
+            close_lock.release()
 
     def shutdownCommunication(self) -> bool:
         """Run the DMMR shutdown sequence before releasing communication resources."""
@@ -1905,7 +2516,14 @@ class DMMRController(DeviceController):
         self.print("Starting DMMR shutdown sequence.")
         shutdown_confirmed = False
         try:
-            device.shutdown(timeout_s=float(self.controllerParent.connect_timeout_s))
+            with self._controller_lock_section(
+                "Could not acquire lock to shut down the DMMR."
+            ):
+                device = self.device
+                if device is None:
+                    shutdown_confirmed = True
+                else:
+                    device.shutdown(timeout_s=float(self.controllerParent.connect_timeout_s))
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
             self._update_state()
@@ -1933,17 +2551,35 @@ class DMMRController(DeviceController):
             self.device_state_summary = "n/a"
             self.voltage_state_summary = "n/a"
             self.temperature_state_summary = "n/a"
+            self._clear_transport_failures()
             return
 
         timeout_s = float(self.controllerParent.poll_timeout_s)
         try:
-            status, _state_hex, state_name = self.device.get_state(timeout_s=timeout_s)
+            with self._controller_lock_section(
+                "Could not acquire lock to refresh the DMMR state."
+            ):
+                device = self.device
+                if device is None:
+                    self.main_state = "Disconnected"
+                    self.device_state_summary = "n/a"
+                    self.voltage_state_summary = "n/a"
+                    self.temperature_state_summary = "n/a"
+                    self._clear_transport_failures()
+                    return
+                status, _state_hex, state_name = device.get_state(timeout_s=timeout_s)
+        except TimeoutError:
+            self.errorCount += 1
+            return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
-            lowered_exception = str(exc).lower()
-            transport_unusable = "unusable" in lowered_exception
+            failure_count = self._note_transport_failure()
+            transport_unusable = _transport_failure_is_fatal(exc)
+            transport_lost = transport_unusable or (
+                failure_count >= _DMMR_TRANSPORT_FAILURE_THRESHOLD
+            )
             self.main_state = (
-                _DMMR_COMMUNICATION_LOST_STATE if transport_unusable else "State error"
+                _DMMR_COMMUNICATION_LOST_STATE if transport_lost else "State error"
             )
             self.print(f"Failed to read DMMR state: {exc}", flag=PRINT.ERROR)
             self.device_state_summary = self._safe_query_state("get_device_state") or "Unknown"
@@ -1954,17 +2590,18 @@ class DMMRController(DeviceController):
             # loop and trigger closeCommunication via the framework's
             # thread-safe signal so the GUI updates on the main thread and the
             # COM port is released for potential re-initialization.
-            if transport_unusable:
+            if transport_lost:
                 self._handle_transport_loss()
             return
 
-        if status == self.device.NO_ERR:
+        self._clear_transport_failures()
+        if status == device.NO_ERR:
             self.main_state = state_name
         else:
             self.main_state = "State error"
             self.errorCount += 1
             self.print(
-                f"Failed to read DMMR state: {self._format_status(status)}",
+                f"Failed to read DMMR state: {self._format_status(status, device=device)}",
                 flag=PRINT.ERROR,
             )
 
@@ -1982,14 +2619,22 @@ class DMMRController(DeviceController):
         ):
             return
 
+        self.main_state = _DMMR_COMMUNICATION_LOST_STATE
+        self.device_state_summary = "Unknown"
+        self.voltage_state_summary = "Unknown"
+        self.temperature_state_summary = "Unknown"
         self._forced_close_state = _DMMR_COMMUNICATION_LOST_STATE
         self.acquiring = False
         self.initialized = False
+        self._clear_transport_failures()
         self._end_transition()
         self._restore_off_ui_state()
         self._dispose_device()
         self._sync_status_to_gui()
-        self.signalComm.closeCommunicationSignal.emit()
+        close_signal = getattr(getattr(self, "signalComm", None), "closeCommunicationSignal", None)
+        emit = getattr(close_signal, "emit", None)
+        if callable(emit):
+            emit()
 
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
@@ -1997,20 +2642,41 @@ class DMMRController(DeviceController):
         self.controllerParent.device_state_summary = self.device_state_summary
         self.controllerParent.voltage_state_summary = self.voltage_state_summary
         self.controllerParent.temperature_state_summary = self.temperature_state_summary
-        # Defer Qt widget updates to the main thread so that status badges
-        # update reliably even when _sync_status_to_gui is called from the
-        # acquisition thread (e.g. via the framework error-count auto-close).
-        update_fn = getattr(self.controllerParent, "_update_status_widgets", None)
-        if callable(update_fn):
-            try:
-                from PyQt6.QtWidgets import QApplication
-                if QApplication.instance() is not None:
-                    from PyQt6.QtCore import QTimer
-                    QTimer.singleShot(0, update_fn)
-                else:
-                    update_fn()
-            except ImportError:
-                update_fn()
+        def _refresh_gui() -> None:
+            sync_acquisition_controls = getattr(
+                self.controllerParent,
+                "_sync_acquisition_controls",
+                None,
+            )
+            if callable(sync_acquisition_controls):
+                sync_acquisition_controls()
+            update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
+            if callable(update_status_widgets):
+                update_status_widgets()
+
+        _invoke_gui_callback(_refresh_gui)
+
+    def _transition_guard(self) -> Lock:
+        lock = getattr(self, "_transition_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._transition_lock = lock
+        return lock
+
+    def _close_guard(self) -> Lock:
+        lock = getattr(self, "_close_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._close_lock = lock
+        return lock
+
+    def _note_transport_failure(self) -> int:
+        failures = int(getattr(self, "_consecutive_transport_failures", 0)) + 1
+        self._consecutive_transport_failures = failures
+        return failures
+
+    def _clear_transport_failures(self) -> None:
+        self._consecutive_transport_failures = 0
 
     def _dispose_device(self) -> None:
         import gc
@@ -2028,6 +2694,8 @@ class DMMRController(DeviceController):
         finally:
             with contextlib.suppress(Exception):
                 device.close()
+            with contextlib.suppress(Exception):
+                device._set_port_claimed(False)
         # Force the Python GC to release the DMMR DLL instance so that the
         # underlying serial port handle is freed.  Without this the DLL may
         # keep the COM port locked and prevent re-initialization on the same
@@ -2124,7 +2792,12 @@ class DMMRController(DeviceController):
         already_acquired: bool = False,
     ):
         """Acquire the controller lock without swallowing hardware exceptions."""
-        acquire_timeout = getattr(self.lock, "acquire_timeout", None)
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            lock = Lock()
+            self.lock = lock
+
+        acquire_timeout = getattr(lock, "acquire_timeout", None)
         if callable(acquire_timeout):
             with acquire_timeout(
                 1,
@@ -2136,8 +2809,8 @@ class DMMRController(DeviceController):
                 yield
             return
 
-        acquire = getattr(self.lock, "acquire", None)
-        release = getattr(self.lock, "release", None)
+        acquire = getattr(lock, "acquire", None)
+        release = getattr(lock, "release", None)
         if callable(acquire) and callable(release):
             if already_acquired:
                 yield
@@ -2158,16 +2831,18 @@ class DMMRController(DeviceController):
 
     def _begin_transition(self, target_on: bool) -> bool:
         """Mark a global DMMR ON/OFF transition as active."""
-        if self.transitioning:
-            return False
-        self.transitioning = True
-        self.transition_target_on = bool(target_on)
-        return True
+        with self._transition_guard():
+            if self.transitioning:
+                return False
+            self.transitioning = True
+            self.transition_target_on = bool(target_on)
+            return True
 
     def _end_transition(self) -> None:
         """Clear transition bookkeeping after a global DMMR ON/OFF sequence."""
-        self.transitioning = False
-        self.transition_target_on = None
+        with self._transition_guard():
+            self.transitioning = False
+            self.transition_target_on = None
 
     def _format_exception(self, exc: Exception) -> str:
         message = str(exc).strip()

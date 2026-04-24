@@ -8,7 +8,7 @@ including the AMX driver files and vendor DLL.
 
 ## Requirements
 
-- ESIBD Explorer `0.8.x`
+- ESIBD Explorer `1.0.1`
 - Windows for real hardware communication
 - No separate `ESIBD_core` installation is required for the plugin itself
 
@@ -31,11 +31,20 @@ including the AMX driver files and vendor DLL.
 - `Connect timeout (s)`: timeout used to establish the transport.
 - `Startup timeout (s)`: timeout used for ON/OFF startup and shutdown sequences.
 - `Poll timeout (s)`: timeout used for periodic housekeeping reads.
-- `Standby config`: optional standby slot loaded on ON. Use `-1` to skip.
 - `Operating config`: operating slot loaded on ON. Use `-1` only when you
   want to connect first and choose a config later before enabling the AMX.
 - `Available configs`: live list of config slots reported by the connected AMX.
-- `Frequency (kHz)`: oscillator frequency applied after startup.
+- `Frequency (kHz)`: oscillator frequency. The same value is exposed directly
+  in the plugin toolbar for routine operation.
+
+Toolbar notes:
+
+- `Signal`: saved AMX config selector. This is the operator-facing signal or
+  routing shape.
+- `Load now`: immediately loads the selected signal while the AMX is ON.
+- `Freq`: oscillator frequency in kHz. Changes apply immediately while the AMX
+  is ON and are reused on the next startup.
+- channel rows: choose which pulsers are ON and set their pulse width in us.
 
 Runtime timing notes:
 
@@ -53,14 +62,14 @@ will exist on the current unit.
 
 Important points:
 
-- `Standby config` is optional.
 - `Operating config` is effectively required to bring the AMX to `STATE_ON`.
 - Set `Operating config = -1` only when you want the plugin to initialize
   communication first, inspect the available controller configs, and choose one
   before enabling the AMX.
-- The plugin `OFF` action parks the controller in the selected `Standby config`
-  when a valid standby slot is available, then disconnects. There is no
-  separate shutdown-config selector anymore.
+- The signal shape/routing is intentionally not rebuilt from low-level switch
+  controls in the plugin UI. It is chosen by loading a saved AMX config.
+- The plugin `OFF` action disables or parks the controller with a confirmed
+  shutdown path, then disconnects. There is no separate shutdown-config selector.
 - Before choosing a config index, query the controller with the AMX wrapper
   notebook or `cgc.amx.AMX.list_configs()`.
 - In the Python wrapper, `cgc.amx.AMX.initialize()` can be called without an

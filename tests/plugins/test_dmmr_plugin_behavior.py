@@ -697,7 +697,7 @@ def test_controller_marks_communication_lost_and_requests_forced_close_when_tran
     assert controller.signalComm.closeCommunicationSignal.last_emit == ((), {})
 
 
-def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
+def test_controller_read_numbers_acquires_lock_for_state_and_module_polling():
     module = _load_module()
 
     class FakeDevice:
@@ -774,13 +774,94 @@ def test_controller_read_numbers_reuses_acquisition_lock_without_deadlock():
 
     controller.readNumbers()
 
-    assert lock.calls[0] == (
-        1,
-        "Could not acquire lock to read DMMR module 3.",
-        True,
-    )
+    assert lock.calls == [
+        (1, "Could not acquire lock to refresh the DMMR state.", False),
+        (1, "Could not acquire lock to read DMMR module 3.", False),
+    ]
     assert device.calls == [(3, 2.5)]
     assert controller.values == {3: 3.2e-12}
+
+
+def test_controller_marks_communication_lost_after_repeated_generic_state_failures():
+    module = _load_module()
+    ui_states = []
+
+    class FakeDevice:
+        def get_state(self, timeout_s=None):
+            raise RuntimeError("serial timeout while reading state")
+
+        def get_device_state(self, timeout_s=None):
+            raise RuntimeError("serial timeout")
+
+        def get_voltage_state(self, timeout_s=None):
+            raise RuntimeError("serial timeout")
+
+        def get_temperature_state(self, timeout_s=None):
+            raise RuntimeError("serial timeout")
+
+        def disconnect(self):
+            return True
+
+        def close(self):
+            return None
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.0,
+        _set_on_ui_state=lambda on: ui_states.append(on),
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.acquiring = True
+    controller.transitioning = True
+    controller.transition_target_on = True
+
+    controller._update_state()
+    assert controller.main_state == "State error"
+    assert controller.device is not None
+
+    controller._update_state()
+    assert controller.main_state == "State error"
+    assert controller.device is not None
+
+    controller._update_state()
+
+    assert controller.main_state == module._DMMR_COMMUNICATION_LOST_STATE
+    assert controller.device is None
+    assert controller.acquiring is False
+    assert controller.signalComm.closeCommunicationSignal.last_emit == ((), {})
+    assert ui_states == [False]
+
+
+def test_close_communication_preserves_forced_communication_lost_state():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        isOn=lambda: False,
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        voltage_state_summary="",
+        temperature_state_summary="",
+    )
+
+    controller = module.DMMRController(parent)
+    controller._forced_close_state = module._DMMR_COMMUNICATION_LOST_STATE
+
+    controller.closeCommunication()
+
+    assert controller.main_state == module._DMMR_COMMUNICATION_LOST_STATE
+    assert controller.device_state_summary == "Unknown"
+    assert controller.voltage_state_summary == "Unknown"
+    assert controller.temperature_state_summary == "Unknown"
 
 
 def test_controller_read_numbers_keeps_partial_results_on_timeout():

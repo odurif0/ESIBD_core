@@ -240,6 +240,24 @@ def test_connect_warns_when_product_id_looks_like_another_instrument(monkeypatch
     assert "HV-PSU-CTRL-2D" in caplog.text
 
 
+def test_connect_fails_and_closes_when_identity_probe_gets_wrong_command(monkeypatch):
+    amx, dll = make_amx(monkeypatch)
+    dll.COM_HVAMX4ED_Open.return_value = AMXBase.NO_ERR
+    dll.COM_HVAMX4ED_SetBaudRate.return_value = AMXBase.NO_ERR
+    dll.COM_HVAMX4ED_Close.return_value = AMXBase.NO_ERR
+    monkeypatch.setattr(
+        AMXBase,
+        "get_product_id",
+        lambda self: (self.ERR_COMMAND_WRONG, ""),
+    )
+
+    with pytest.raises(RuntimeError, match="did not respond to the AMX identity probe"):
+        amx.connect()
+
+    assert amx.connected is False
+    dll.COM_HVAMX4ED_Close.assert_called_once()
+
+
 def test_connect_identity_probe_uses_timeout_safe_wrapper(monkeypatch):
     amx, _dll = make_amx(monkeypatch)
     backend = object.__getattribute__(amx, "_backend")

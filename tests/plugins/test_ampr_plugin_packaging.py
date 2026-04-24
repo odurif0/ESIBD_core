@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
+import inspect
 import sys
 import types
 from enum import Enum
@@ -323,6 +325,98 @@ def test_plugin_runtime_forces_inline_backend():
     runtime_driver_common = sys.modules[f"{runtime_module_name}._driver_common"]
 
     assert runtime_driver_common.supports_process_backend() is False
+
+
+def test_plugin_runtime_shutdown_attempts_all_outputs_before_raising():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+    driver_class = module._get_ampr_driver_class()
+    backend = object.__new__(driver_class._PROCESS_CONTROLLER_CLASS)
+    calls = []
+
+    backend.scan_modules = lambda timeout_s=None: {
+        2: {"product_no": 132401, "hw_type": 222308},
+        3: {"product_id": "Dual Voltage Source 500V"},
+    }
+
+    def fake_set_module_voltage(module_id, channel_id, voltage, timeout_s=None):
+        calls.append(("set_module_voltage", module_id, channel_id, voltage, timeout_s))
+        if module_id == 2 and channel_id == 2:
+            return 99
+        return backend.NO_ERR
+
+    def fake_enable_psu(enabled, timeout_s=None):
+        calls.append(("enable_psu", enabled, timeout_s))
+        return backend.NO_ERR, enabled
+
+    backend.set_module_voltage = fake_set_module_voltage
+    backend.enable_psu = fake_enable_psu
+    backend.disconnect = lambda: calls.append(("disconnect",)) or True
+    backend.format_status = lambda status: f"ERR{status}"
+
+    with pytest.raises(RuntimeError, match=r"set_module_voltage\(2, 2, 0.0\): ERR99"):
+        backend.shutdown(timeout_s=1.5)
+
+    assert calls == [
+        ("set_module_voltage", 2, 1, 0.0, 1.5),
+        ("set_module_voltage", 2, 2, 0.0, 1.5),
+        ("set_module_voltage", 2, 3, 0.0, 1.5),
+        ("set_module_voltage", 2, 4, 0.0, 1.5),
+        ("set_module_voltage", 3, 1, 0.0, 1.5),
+        ("set_module_voltage", 3, 2, 0.0, 1.5),
+        ("enable_psu", False, 1.5),
+        ("disconnect",),
+    ]
+
+
+@pytest.mark.parametrize("plugin_path", [PLUGIN_A_PATH, PLUGIN_B_PATH])
+def test_plugin_process_backend_calls_methods_with_rpc_timeout(monkeypatch, plugin_path):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path(
+        f"{plugin_path.parent.name}_plugin_test",
+        plugin_path,
+    )
+    driver_class = module._get_ampr_driver_class()
+    runtime_root = driver_class.__module__.rsplit(".", 2)[0]
+    driver_common = importlib.import_module(f"{runtime_root}._driver_common")
+    controller_process = importlib.import_module(f"{runtime_root}._controller_process")
+    calls = []
+
+    signature = inspect.signature(controller_process.ControllerProcessProxy.call_method)
+    assert "rpc_timeout_s" in signature.parameters
+    assert "timeout_s" not in signature.parameters
+
+    class FakeProxy:
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def call_method(self, method_name, *args, rpc_timeout_s, **kwargs):
+            calls.append((method_name, args, rpc_timeout_s, kwargs))
+            return "ok"
+
+        def close(self):
+            return None
+
+    class FakeController:
+        def __init__(self, **kwargs):
+            return None
+
+        def connect(self, timeout_s=None):
+            return True
+
+    monkeypatch.setattr(driver_common, "supports_process_backend", lambda *_args: True)
+    monkeypatch.setattr(driver_common, "ControllerProcessProxy", FakeProxy)
+    monkeypatch.setattr(driver_class, "_PROCESS_CONTROLLER_CLASS", FakeController)
+
+    ampr = driver_class("ampr_process", com=8)
+    result = ampr.connect(timeout_s=2.0)
+
+    assert result == "ok"
+    assert calls == [("connect", (), 15.0, {"timeout_s": 2.0})]
 
 
 def test_plugin_icon_is_a_valid_png_asset():
@@ -1034,6 +1128,57 @@ def test_set_on_ignores_reentrant_request_while_transition_is_running():
     ]
 
 
+def test_close_communication_uses_controller_initialized_for_shutdown():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    shutdown_calls = []
+    close_calls = []
+    device = object.__new__(module.AMPRDevice)
+    device.useOnOffLogic = True
+    device.onAction = types.SimpleNamespace(state=True)
+    device.initialized = False
+    device.shutdownCommunication = lambda: shutdown_calls.append(True)
+    device.controller = types.SimpleNamespace(
+        initialized=True,
+        _forced_close_state=None,
+        closeCommunication=lambda **_kwargs: close_calls.append(True),
+    )
+
+    module.AMPRDevice.closeCommunication(device)
+
+    assert shutdown_calls == [True]
+    assert close_calls == []
+
+
+def test_shutdown_communication_keeps_ui_on_when_shutdown_is_unconfirmed():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module()
+
+    device = object.__new__(module.AMPRDevice)
+    device.useOnOffLogic = True
+    device.onAction = types.SimpleNamespace(state=False)
+    device.recording = True
+    device.controller = types.SimpleNamespace(shutdownCommunication=lambda: False)
+    sync_states = []
+    warnings = []
+    device.stopAcquisition = lambda: None
+    device._sync_local_on_action = lambda: sync_states.append(device.onAction.state)
+    device._sync_acquisition_controls = lambda: None
+    device.print = lambda message, flag=None: warnings.append((message, flag))
+
+    module.AMPRDevice.shutdownCommunication(device)
+
+    assert device.onAction.state is True
+    assert sync_states == [True]
+    assert any("shutdown could not be confirmed" in message for message, _ in warnings)
+    assert device.recording is False
+
+
 def test_status_widgets_summarize_global_ampr_state():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -1149,6 +1294,8 @@ def test_ampr_a_and_ampr_b_load_as_distinct_autonomous_plugins(monkeypatch):
 
     assert module_a.AMPRDevice.name == "AMPR_A"
     assert module_b.AMPRDevice.name == "AMPR_B"
+    assert module_a.AMPRDevice.supportedVersion == "1.0.1"
+    assert module_b.AMPRDevice.supportedVersion == "1.0.1"
     assert module_a._BUNDLED_RUNTIME_DIRNAME == "runtime"
     assert module_b._BUNDLED_RUNTIME_DIRNAME == "runtime"
     assert VENDOR_A_ROOT.name == "runtime"
@@ -1226,8 +1373,8 @@ def test_ampr_recording_action_reflects_device_readiness():
     module.AMPRDevice._sync_acquisition_controls(device)
     assert device.recordingAction.enabled is False
     assert device.liveDisplay.recordingAction.enabled is False
-    assert display_close.enabled is False
-    assert display_init.enabled is True
+    assert display_close.enabled is True
+    assert display_init.enabled is False
 
     device.controller.initialized = True
     device.controller.main_state = "ST_ON"
@@ -1236,6 +1383,64 @@ def test_ampr_recording_action_reflects_device_readiness():
     assert device.liveDisplay.recordingAction.enabled is True
     assert display_close.enabled is True
     assert display_init.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("module_name", "plugin_path"),
+    [
+        ("ampr_a_plugin_test", PLUGIN_A_PATH),
+        ("ampr_b_plugin_test", PLUGIN_B_PATH),
+    ],
+)
+def test_ampr_partial_startup_exposes_toolbar_disconnect_action(module_name, plugin_path):
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path(module_name, plugin_path)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.visible = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setVisible(self, visible):
+            self.visible = visible
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.AMPRDevice)
+    device.name = module.AMPRDevice.name
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.closeCommunicationAction = FakeAction()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.liveDisplay = types.SimpleNamespace(recordingAction=FakeAction())
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=False,
+        transitioning=False,
+        main_state="Connected",
+    )
+    device.isOn = lambda: False
+
+    module.AMPRDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is True
+    assert device.closeCommunicationAction.visible is True
+    assert device.recordingAction.enabled is False
+    assert device.liveDisplay.recordingAction.enabled is False
+
+    device.controller.device = None
+    device.controller.initialized = False
+    module.AMPRDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is False
+    assert device.closeCommunicationAction.visible is False
 
 
 def test_ampr_toggle_recording_rejects_unready_device():

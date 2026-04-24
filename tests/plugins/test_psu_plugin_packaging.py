@@ -192,6 +192,7 @@ def test_psu_plugin_exposes_expected_metadata():
     assert ICON_PATH.exists()
     assert module.providePlugins() == [module.PSUDevice]
     assert module.PSUDevice.name == "PSU"
+    assert module.PSUDevice.supportedVersion == "1.0.1"
     assert module.PSUDevice.unit == "V"
     assert module.PSUDevice.useMonitors is True
     assert module.PSUDevice.useOnOffLogic is True
@@ -211,7 +212,7 @@ def test_psu_plugin_loads_driver_from_private_runtime():
     assert driver_class.__module__.startswith("_esibd_bundled_psu_runtime_")
 
 
-def test_psu_plugin_exposes_available_configs_setting():
+def test_psu_plugin_exposes_simple_config_settings():
     _clear_test_modules()
     _install_esibd_stubs()
 
@@ -232,9 +233,53 @@ def test_psu_plugin_exposes_available_configs_setting():
         else:
             module.Device.getDefaultSettings = original_settings
 
+    assert "PSU/Standby config" not in settings
+    assert settings["PSU/Operating config"][module.Parameter.VALUE] == -1
+    assert "without enabling outputs" in settings["PSU/Operating config"][
+        module.Parameter.TOOLTIP
+    ]
     assert settings["PSU/Available configs"][module.Parameter.VALUE] == "n/a"
     assert "reported by the controller after connect" in settings["PSU/Available configs"][
         module.Parameter.TOOLTIP
+    ]
+
+
+def test_psu_runtime_initialize_without_standby_loads_only_operating_config():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+    driver_class = module._get_psu_driver_class()
+    backend = object.__new__(driver_class._PROCESS_CONTROLLER_CLASS)
+    calls = []
+    backend.device_id = "psu_test"
+    backend.connected = False
+    backend.logger = types.SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+
+    def fake_connect(timeout_s=None):
+        calls.append(("connect", timeout_s))
+        backend.connected = True
+
+    backend.connect = fake_connect
+    backend.load_config = lambda config_number, timeout_s=None: calls.append(
+        ("load_config", config_number, timeout_s)
+    )
+    backend.get_device_enabled = lambda timeout_s=None: calls.append(
+        ("get_device_enabled", timeout_s)
+    ) or False
+    backend.get_output_enabled = lambda timeout_s=None: calls.append(
+        ("get_output_enabled", timeout_s)
+    ) or (False, False)
+
+    result = backend.initialize(timeout_s=2.0, operating_config=7)
+
+    assert result == {"operating_config": 7}
+    assert calls == [
+        ("connect", 2.0),
+        ("load_config", 7, 2.0),
     ]
 
 
@@ -331,6 +376,124 @@ def test_load_configuration_bootstraps_transient_channels_when_ini_is_missing(tm
     assert global_updates == ["IN"]
 
 
+def test_init_gui_recreates_bootstrap_rows_when_table_is_still_empty():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    applied = []
+    device = object.__new__(module.PSUDevice)
+    device.name = "PSU"
+    device.channels = []
+    device.available_configs = []
+    device.initAction = types.SimpleNamespace(setVisible=lambda visible: None)
+    device.closeCommunicationAction = types.SimpleNamespace(
+        triggered=types.SimpleNamespace(
+            disconnect=lambda: None,
+            connect=lambda callback: None,
+        ),
+        setToolTip=lambda tooltip: None,
+        setText=lambda text: None,
+        setVisible=lambda visible: None,
+    )
+    device._bootstrap_channel_items = lambda: [
+        {"Name": "PSU_CH0", "CH": "0", "Real": True, "Enabled": False, "Output": "OFF"},
+        {"Name": "PSU_CH1", "CH": "1", "Real": True, "Enabled": False, "Output": "OFF"},
+    ]
+    device._apply_channel_items = lambda items, persist=True: applied.append((items, persist))
+    device._hide_channel_table = lambda: None
+    device._hide_channel_table_actions = lambda: None
+    device._ensure_channel_panel = lambda: None
+    device._update_channel_column_visibility = lambda: None
+
+    original_init_gui = getattr(module.Device, "initGUI", None)
+    module.Device.initGUI = lambda self: None
+    try:
+        module.PSUDevice.initGUI(device)
+    finally:
+        if original_init_gui is None:
+            delattr(module.Device, "initGUI")
+        else:
+            module.Device.initGUI = original_init_gui
+
+    assert isinstance(device.controller, module.PSUController)
+    assert applied == [
+        (
+            [
+                {"Name": "PSU_CH0", "CH": "0", "Real": True, "Enabled": False, "Output": "OFF"},
+                {"Name": "PSU_CH1", "CH": "1", "Real": True, "Enabled": False, "Output": "OFF"},
+            ],
+            False,
+        )
+    ]
+
+
+def test_init_gui_hides_tree_and_table_actions_before_showing_panel():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    visibility_calls = []
+    panel_calls = []
+
+    class FakeTree:
+        def hide(self):
+            visibility_calls.append("tree")
+
+    class FakeAction:
+        def __init__(self, name):
+            self.name = name
+
+        def setVisible(self, visible):
+            visibility_calls.append((self.name, visible))
+
+    device = object.__new__(module.PSUDevice)
+    device.name = "PSU"
+    device.tree = FakeTree()
+    device.channels = [{"fake": True}]
+    device.available_configs = []
+    device.initAction = FakeAction("init")
+    device.closeCommunicationAction = types.SimpleNamespace(
+        triggered=types.SimpleNamespace(
+            disconnect=lambda: None,
+            connect=lambda callback: None,
+        ),
+        setToolTip=lambda tooltip: None,
+        setText=lambda text: None,
+        setVisible=lambda visible: visibility_calls.append(("close", visible)),
+    )
+    device.advancedAction = FakeAction("advanced")
+    device.importAction = FakeAction("import")
+    device.exportAction = FakeAction("export")
+    device.saveAction = FakeAction("save")
+    device.duplicateChannelAction = FakeAction("duplicate")
+    device.deleteChannelAction = FakeAction("delete")
+    device.moveChannelUpAction = FakeAction("up")
+    device.moveChannelDownAction = FakeAction("down")
+    device._ensure_bootstrap_channels_present = lambda: None
+    device._ensure_channel_panel = lambda: panel_calls.append(True)
+    device._update_channel_column_visibility = lambda: None
+
+    original_init_gui = getattr(module.Device, "initGUI", None)
+    module.Device.initGUI = lambda self: None
+    try:
+        module.PSUDevice.initGUI(device)
+    finally:
+        if original_init_gui is None:
+            delattr(module.Device, "initGUI")
+        else:
+            module.Device.initGUI = original_init_gui
+
+    assert isinstance(device.controller, module.PSUController)
+    assert "tree" in visibility_calls
+    assert ("advanced", False) in visibility_calls
+    assert ("duplicate", False) in visibility_calls
+    assert ("delete", False) in visibility_calls
+    assert panel_calls == [True]
+
+
 def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
     _clear_test_modules()
     _install_esibd_stubs()
@@ -361,6 +524,8 @@ def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
     device.closeCommunicationAction = object()
     device._ensure_status_widgets = lambda: None
     device._ensure_config_selectors = lambda: None
+    device._hide_channel_table_actions = lambda: None
+    device._ensure_channel_panel = lambda: None
     device._update_channel_column_visibility = lambda: None
     device.makeIcon = lambda name, path=None, desaturate=False: f"local:{name}"
     device.onAction = types.SimpleNamespace(state=True)
@@ -397,6 +562,85 @@ def test_finalize_init_adds_local_on_action_and_set_on_keeps_it_synced():
     assert device.deviceOnAction.state is False
     assert device.deviceOnAction.blocked == [True, False, True, False]
     assert toggle_calls == [True]
+
+
+def test_channel_panel_snapshot_formats_psu_readbacks_for_fixed_channels():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    display_parameter = types.SimpleNamespace(value=True)
+    channel = types.SimpleNamespace(
+        real=True,
+        display=True,
+        DISPLAY="Display",
+        channel_number=lambda: 1,
+        getParameterByName=lambda name: display_parameter if name == "Display" else None,
+    )
+
+    device = object.__new__(module.PSUDevice)
+    device.main_state = "ST_ON"
+    device.channels = [channel]
+    device.controller = types.SimpleNamespace(
+        output_enabled_by_channel={0: False, 1: True},
+        values={1: 345.6},
+        current_values={1: 0.0123},
+        voltage_setpoints={1: "350 V"},
+        current_setpoints={1: "0.015 A"},
+    )
+
+    snapshot = module.PSUDevice._channel_panel_snapshot(device, 1)
+
+    assert snapshot["title"] == "CH1"
+    assert snapshot["output_state"] == "ON"
+    assert snapshot["display_enabled"] is True
+    assert snapshot["display_checked"] is True
+    assert snapshot["voltage_set"] == "350 V"
+    assert snapshot["voltage_monitor"] == "345.6 V"
+    assert snapshot["current_set"] == "0.015 A"
+    assert snapshot["current_monitor"] == "0.0123 A"
+    assert "#3182ce" in snapshot["card_style"]
+
+
+def test_channel_panel_display_toggle_updates_underlying_channel():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    parameter_updates = []
+    display_changed = []
+
+    class FakeParameter:
+        def __init__(self):
+            self.value = True
+
+        def setValueWithoutEvents(self, value):
+            self.value = value
+            parameter_updates.append(value)
+
+    parameter = FakeParameter()
+    channel = types.SimpleNamespace(
+        real=True,
+        display=True,
+        DISPLAY="Display",
+        channel_number=lambda: 0,
+        getParameterByName=lambda name: parameter if name == "Display" else None,
+        displayChanged=lambda: display_changed.append(True),
+    )
+
+    update_calls = []
+    device = object.__new__(module.PSUDevice)
+    device.channels = [channel]
+    device._update_channel_panel = lambda: update_calls.append(True)
+
+    module.PSUDevice._channel_panel_display_toggled(device, 0, False)
+
+    assert parameter_updates == [False]
+    assert channel.display is False
+    assert display_changed == [True]
+    assert update_calls == [True]
 
 
 def test_psu_set_on_ui_state_updates_both_actions_and_status_widgets():
@@ -462,6 +706,57 @@ def test_psu_set_on_initializes_communication_when_turning_on():
 
     assert init_calls == [True]
     assert toggle_calls == []
+
+
+def test_psu_partial_startup_exposes_toolbar_disconnect_action():
+    _clear_test_modules()
+    _install_esibd_stubs()
+
+    module = _import_plugin_module_from_path("psu_plugin_test", PLUGIN_PATH)
+
+    class FakeAction:
+        def __init__(self):
+            self.state = False
+            self.enabled = None
+            self.visible = None
+            self.blocks = []
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+        def setVisible(self, visible):
+            self.visible = visible
+
+        def blockSignals(self, blocked):
+            self.blocks.append(blocked)
+
+    device = object.__new__(module.PSUDevice)
+    device.name = "PSU"
+    device.recording = False
+    device.recordingAction = FakeAction()
+    device.closeCommunicationAction = FakeAction()
+    device.onAction = types.SimpleNamespace(state=False)
+    device.liveDisplay = types.SimpleNamespace(recordingAction=FakeAction())
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initializing=False,
+        initialized=False,
+        transitioning=False,
+        main_state="Connected",
+    )
+    device.isOn = lambda: False
+
+    module.PSUDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is True
+    assert device.closeCommunicationAction.visible is True
+    assert device.recordingAction.enabled is False
+    assert device.liveDisplay.recordingAction.enabled is False
+
+    device.controller.device = None
+    device.controller.initialized = False
+    module.PSUDevice._sync_acquisition_controls(device)
+    assert device.closeCommunicationAction.enabled is False
+    assert device.closeCommunicationAction.visible is False
 
 
 def test_psu_toggle_recording_rejects_disconnected_device():
@@ -558,17 +853,25 @@ def test_status_widgets_summarize_global_psu_state():
     device.main_state = "Disconnected"
     device.output_summary = "CH0=OFF, CH1=OFF"
     device.available_configs_text = "0:Standby; 1:Operate"
-    device.controller = types.SimpleNamespace(device_state_summary="OK")
+    device.controller = types.SimpleNamespace(
+        device_state_summary="OK",
+        values={},
+        current_values={},
+        output_enabled_by_channel={},
+    )
 
     module.PSUDevice._ensure_status_widgets(device)
 
-    assert len(device.titleBar.inserted) == 2
+    assert len(device.titleBar.inserted) == 3
     assert device.statusBadgeLabel.text == "Disconnected"
-    assert device.statusSummaryLabel.text == "HV outputs: CH0=OFF +1 | Device flags: OK"
+    assert device.statusSummaryLabel.text == "CH0 OFF | CH1 OFF"
+    assert device.diagnosticsSummaryLabel.text == "Temp: CH0 n/a | CH1 n/a"
     tooltip = device.statusBadgeLabel.tooltips[-1]
     assert "State: Disconnected" in tooltip
     assert "HV outputs: CH0=OFF, CH1=OFF" in tooltip
     assert "Device flags: OK" in tooltip
+    assert "Readbacks: CH0 OFF | CH1 OFF" in tooltip
+    assert "Diagnostics: Temp: CH0 n/a | CH1 n/a" in tooltip
     assert "Available configs: 0:Standby; 1:Operate" in tooltip
     assert "#718096" in device.statusBadgeLabel.styles[-1]
 
@@ -616,14 +919,23 @@ def test_status_widgets_show_hardware_state_when_psu_state_is_harmonized():
     device.hardware_main_state = "STATE_ERR_PSU_DIS"
     device.output_summary = "CH0=OFF, CH1=OFF"
     device.available_configs_text = "0:Standby; 9:Operate"
-    device.controller = types.SimpleNamespace(device_state_summary="DEVST_PSU_DIS")
+    device.controller = types.SimpleNamespace(
+        device_state_summary="DEVST_PSU_DIS",
+        values={0: 12.0, 1: 0.0},
+        current_values={0: 0.12, 1: 0.0},
+        output_enabled_by_channel={0: True, 1: False},
+    )
 
     module.PSUDevice._ensure_status_widgets(device)
 
     assert device.statusBadgeLabel.text == "ST_STBY"
+    assert device.statusSummaryLabel.text == "CH0 ON 12 V / 0.12 A | CH1 OFF 0 V / 0 A"
+    assert "Temp:" in device.diagnosticsSummaryLabel.text
+    assert "CH0" in device.diagnosticsSummaryLabel.text
     tooltip = device.statusBadgeLabel.tooltips[-1]
     assert "State: ST_STBY" in tooltip
     assert "Hardware state: STATE_ERR_PSU_DIS" in tooltip
+    assert "Readbacks: CH0 ON 12 V / 0.12 A | CH1 OFF 0 V / 0 A" in tooltip
     assert "#b7791f" in device.statusBadgeLabel.styles[-1]
 
 
@@ -683,6 +995,22 @@ def test_config_controls_show_available_configs():
         def blockSignals(self, _blocked):
             return None
 
+    class FakeButton:
+        def __init__(self, text=""):
+            self.text = text
+            self.tooltips = []
+            self.enabled = True
+            self.clicked = FakeSignal()
+
+        def setMinimumWidth(self, _width):
+            return None
+
+        def setToolTip(self, tooltip):
+            self.tooltips.append(tooltip)
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
     class FakeLabel:
         def __init__(self, text=""):
             self.text = text
@@ -722,12 +1050,21 @@ def test_config_controls_show_available_configs():
     device.available_configs_text = "1:Standby; 7:Operate 5 kV"
     device.standby_config = 1
     device.operating_config = 7
+    device.controller = types.SimpleNamespace(
+        device=object(),
+        initialized=True,
+        initializing=False,
+        transitioning=False,
+        _operating_config_ready=lambda: (True, "", 7),
+    )
+    device.isOn = lambda: True
     device._create_config_selector_widget = lambda: FakeCombo()
+    device._create_config_button_widget = lambda text: FakeButton(text)
     device._update_status_widgets = lambda: None
 
     module.PSUDevice._ensure_config_selectors(device)
 
-    assert len(device.titleBar.inserted) == 2
+    assert len(device.titleBar.inserted) == 4
     assert device.operatingConfigLabel.text == "Config:"
     assert device.operatingConfigCombo.items == [
         ("Skip (-1)", -1),
@@ -736,6 +1073,9 @@ def test_config_controls_show_available_configs():
     ]
     assert device.operatingConfigCombo.currentIndex() == 2
     assert "Available PSU configs:" in device.operatingConfigCombo.tooltips[-1]
+    assert device.loadOperatingConfigButton.text == "Load now"
+    assert device.loadOperatingConfigButton.enabled is True
+    assert device.savePanelToggleButton.text == "Save..."
 
 
 def test_psu_plugin_fails_cleanly_when_runtime_is_missing(tmp_path):
@@ -767,6 +1107,9 @@ def test_channel_init_gui_handles_legacy_config_without_active_flag():
     channel.ACTIVE = "Active"
     channel.ENABLED = "Enabled"
     channel.REAL = "Real"
+    channel.VALUE = "Value"
+    channel.MIN = "Min"
+    channel.MAX = "Max"
 
     module.PSUChannel.initGUI(
         channel,
@@ -783,6 +1126,9 @@ def test_channel_init_gui_handles_legacy_config_without_active_flag():
     assert channel.active is True
     assert channel.enabled is False
     assert channel.real is True
+    assert channel.value == 0.0
+    assert channel.min == 0.0
+    assert channel.max == 0.0
 
 
 def test_channel_default_headers_match_psu_table_conventions():
@@ -794,10 +1140,11 @@ def test_channel_default_headers_match_psu_table_conventions():
     channel = object.__new__(module.PSUChannel)
     defaults = module.PSUChannel.getDefaultChannel(channel)
 
-    assert defaults[channel.MONITOR][module.Parameter.HEADER] == "Vmon"
+    assert defaults[channel.MONITOR][module.Parameter.HEADER] == "Vget"
     assert defaults[channel.ID][module.Parameter.HEADER] == "CH "
     assert defaults[channel.OUTPUT_STATE][module.Parameter.HEADER] == "On"
-    assert defaults[channel.CURRENT_MONITOR][module.Parameter.HEADER] == "Imon"
+    assert defaults[channel.CURRENT_SET][module.Parameter.HEADER] == "Ilim"
+    assert defaults[channel.CURRENT_MONITOR][module.Parameter.HEADER] == "Iget"
     assert defaults[channel.SCALING][module.Parameter.VALUE] == "normal"
 
 
@@ -985,7 +1332,7 @@ def test_channel_real_changed_skips_framework_handler_until_enabled_exists():
     channel.OUTPUT_STATE = "Output"
     channel.VOLTAGE_SET = "Vset"
     channel.CURRENT_SET = "Iset"
-    channel.CURRENT_MONITOR = "Imon"
+    channel.CURRENT_MONITOR = "Iget"
     channel.ENABLED = "Enabled"
     channel.real = True
 

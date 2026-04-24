@@ -632,6 +632,127 @@ def test_read_numbers_reads_voltages_only_once_st_on_is_reached():
     }
 
 
+def test_read_numbers_acquires_lock_for_ampr_module_polling():
+    module = _load_module()
+
+    class FakeTimeoutLock:
+        def __init__(self):
+            self.calls = []
+
+        class _Section:
+            def __init__(self, owner, timeout, timeout_message):
+                self.owner = owner
+                self.payload = (timeout, timeout_message)
+
+            def __enter__(self):
+                self.owner.calls.append(self.payload)
+                return True
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def acquire_timeout(self, timeout, timeoutMessage=""):
+            return self._Section(self, timeout, timeoutMessage)
+
+    class FakeChannel:
+        real = True
+
+        def module_address(self):
+            return 2
+
+        def channel_number(self):
+            return 1
+
+    class FakeDevice:
+        def get_module_voltages(self, module):
+            assert module == 2
+            return {1: {"measured": 11.0}}
+
+    controller = module.AMPRController(
+        types.SimpleNamespace(
+            getChannels=lambda: [FakeChannel()],
+            getConfiguredModules=lambda: [2],
+        )
+    )
+    controller.lock = FakeTimeoutLock()
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.detected_module_ids = [2]
+    controller.errorCount = 0
+    controller.main_state = "Disconnected"
+    controller._update_state = lambda: setattr(controller, "main_state", "ST_ON")
+
+    module.AMPRController.readNumbers(controller)
+
+    assert controller.lock.calls == [
+        (1, "Could not acquire lock to read AMPR module 2.")
+    ]
+    assert controller.values == {(2, 1): 11.0}
+
+
+def test_update_state_marks_communication_lost_after_repeated_generic_failures():
+    module = _load_module()
+    ui_states = []
+    close_emits = []
+
+    class FakeDevice:
+        def get_state(self):
+            raise RuntimeError("serial timeout while reading state")
+
+        def get_device_state(self):
+            raise RuntimeError("serial timeout")
+
+        def get_voltage_state(self):
+            raise RuntimeError("serial timeout")
+
+        def get_interlock_state(self):
+            raise RuntimeError("serial timeout")
+
+        def disconnect(self):
+            return True
+
+        def close(self):
+            return None
+
+    parent = types.SimpleNamespace(
+        _set_on_ui_state=lambda on: ui_states.append(on),
+        _update_status_widgets=lambda: None,
+        main_state="",
+        detected_modules="",
+        device_state_summary="",
+        interlock_state_summary="",
+        voltage_state_summary="",
+    )
+
+    controller = module.AMPRController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.acquiring = True
+    controller.transitioning = True
+    controller.transition_target_on = True
+    controller.errorCount = 0
+    controller.print = lambda *args, **kwargs: None
+    controller.signalComm = types.SimpleNamespace(
+        closeCommunicationSignal=types.SimpleNamespace(emit=lambda: close_emits.append(True))
+    )
+
+    controller._update_state()
+    assert controller.main_state == "State error"
+    assert controller.device is not None
+
+    controller._update_state()
+    assert controller.main_state == "State error"
+    assert controller.device is not None
+
+    controller._update_state()
+
+    assert controller.main_state == module._AMPR_COMMUNICATION_LOST_STATE
+    assert controller.device is None
+    assert controller.acquiring is False
+    assert close_emits == [True]
+    assert ui_states == [False]
+
+
 def test_fake_numbers_does_not_invent_ampr_monitors():
     module = _load_module()
 
@@ -1528,7 +1649,7 @@ def test_shutdown_communication_runs_full_device_shutdown():
         controller._dispose_device = lambda: disposed.append(True)
         controller.print = lambda message, flag=None: logs.append((message, flag))
 
-        module.AMPRController.shutdownCommunication(controller)
+        shutdown_confirmed = module.AMPRController.shutdownCommunication(controller)
     finally:
         if original_close is None:
             delattr(module.DeviceController, "closeCommunication")
@@ -1536,6 +1657,7 @@ def test_shutdown_communication_runs_full_device_shutdown():
             module.DeviceController.closeCommunication = original_close
 
     assert device.calls == ["shutdown"]
+    assert shutdown_confirmed is True
     assert controller.super_close_called is True
     assert logs == [
         ("Starting AMPR shutdown sequence.", None),
@@ -1583,7 +1705,7 @@ def test_shutdown_communication_logs_diagnostics_on_failure():
         controller._dispose_device = lambda: disposed.append(True)
         controller.print = lambda message, flag=None: logs.append((message, flag))
 
-        module.AMPRController.shutdownCommunication(controller)
+        shutdown_confirmed = module.AMPRController.shutdownCommunication(controller)
     finally:
         if original_close is None:
             delattr(module.DeviceController, "closeCommunication")
@@ -1591,11 +1713,17 @@ def test_shutdown_communication_logs_diagnostics_on_failure():
             module.DeviceController.closeCommunication = original_close
 
     assert controller.errorCount == 1
+    assert shutdown_confirmed is False
+    assert controller.main_state == module._AMPR_SHUTDOWN_UNCONFIRMED_STATE
     assert logs == [
         ("Starting AMPR shutdown sequence.", None),
         (
             "AMPR shutdown failed: RuntimeError: boom "
             "(main state: ST_ERR_PSU_DIS; device state: DEVICE_OK; voltage state: VOLTAGE_OK; interlock state: OK)",
+            module.PRINT.ERROR,
+        ),
+        (
+            "AMPR shutdown could not be confirmed before disconnect: RuntimeError: boom.",
             module.PRINT.ERROR,
         ),
     ]

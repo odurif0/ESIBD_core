@@ -304,13 +304,15 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
 
     class FakeDevice:
         def __init__(self):
-            self.initialize_calls = []
+            self.connected = True
+            self.connect_calls = []
             self.frequency_calls = []
             self.enable_calls = []
             self.load_calls = []
 
-        def initialize(self, timeout_s=None, **kwargs):
-            self.initialize_calls.append((timeout_s, kwargs))
+        def connect(self, timeout_s=None):
+            self.connect_calls.append(timeout_s)
+            self.connected = True
 
         def load_config(self, config_index, timeout_s=None):
             self.load_calls.append((config_index, timeout_s))
@@ -365,8 +367,8 @@ def test_controller_toggle_on_refreshes_loaded_config_after_initialize():
 
     controller.toggleOn()
 
-    assert controller.device.initialize_calls == [(7.5, {"operating_config": 9})]
-    assert controller.device.load_calls == []
+    assert controller.device.connect_calls == []
+    assert controller.device.load_calls == [(9, 7.5)]
     assert controller.device.frequency_calls == [(2.0, 7.5)]
     assert controller.device.enable_calls == [(True, 7.5)]
     assert controller.loaded_config_text == "9:Operate [memory]"
@@ -381,14 +383,16 @@ def test_controller_toggle_on_waits_for_state_on_after_enable():
 
     class FakeDevice:
         def __init__(self):
-            self.initialize_calls = []
+            self.connected = True
+            self.connect_calls = []
             self.load_calls = []
             self.frequency_calls = []
             self.enable_calls = []
             self.snapshot_calls = 0
 
-        def initialize(self, timeout_s=None, **kwargs):
-            self.initialize_calls.append((timeout_s, kwargs))
+        def connect(self, timeout_s=None):
+            self.connect_calls.append(timeout_s)
+            self.connected = True
 
         def load_config(self, config_index, timeout_s=None):
             self.load_calls.append((config_index, timeout_s))
@@ -459,13 +463,85 @@ def test_controller_toggle_on_waits_for_state_on_after_enable():
     finally:
         module.time.sleep = original_sleep
 
-    assert controller.device.initialize_calls == [(7.5, {"operating_config": 9})]
-    assert controller.device.load_calls == []
+    assert controller.device.connect_calls == []
+    assert controller.device.load_calls == [(9, 7.5)]
     assert controller.device.frequency_calls == [(2.0, 7.5)]
     assert controller.device.enable_calls == [(True, 7.5)]
     assert messages == [("AMX timing enabled.", None)]
     assert controller.main_state == "STATE_ON"
     assert controller.device_enabled_state == "ON"
+
+
+def test_controller_toggle_on_reconnects_transport_before_loading_operating_config():
+    module = _load_module()
+
+    class FakeDevice:
+        def __init__(self):
+            self.connected = False
+            self.connect_calls = []
+            self.load_calls = []
+            self.frequency_calls = []
+            self.enable_calls = []
+
+        def connect(self, timeout_s=None):
+            self.connect_calls.append(timeout_s)
+            self.connected = True
+
+        def load_config(self, config_index, timeout_s=None):
+            self.load_calls.append((config_index, timeout_s))
+
+        def set_frequency_khz(self, value, timeout_s=None):
+            self.frequency_calls.append((value, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            self.enable_calls.append((enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            return {
+                "device_enabled": True,
+                "main_state": {"name": "STATE_ON"},
+                "device_state": {"flags": ["DEVST_OK"]},
+                "controller_state": {"flags": []},
+                "oscillator": {"period": 100000},
+                "pulsers": [],
+            }
+
+        def get_status(self):
+            return {
+                "memory_config": 9,
+                "memory_config_name": "Operate",
+                "memory_config_source": "memory",
+            }
+
+    parent = types.SimpleNamespace(
+        name="AMX",
+        startup_timeout_s=7.5,
+        poll_timeout_s=2.5,
+        frequency_khz=2.0,
+        operating_config=9,
+        standby_config=0,
+        getChannels=lambda: [],
+        isOn=lambda: True,
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+        loaded_config_text="",
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.available_configs = [
+        {"index": 0, "name": "Standby", "active": True, "valid": True},
+        {"index": 9, "name": "Operate", "active": True, "valid": True},
+    ]
+
+    controller.toggleOn()
+
+    assert controller.device.connect_calls == [7.5]
+    assert controller.device.load_calls == [(9, 7.5)]
 
 
 def test_controller_toggle_on_requires_operating_config():
@@ -520,10 +596,7 @@ def test_controller_defaults_standby_to_slot_zero_when_available():
         {"index": 9, "name": "Operate", "active": True, "valid": True},
     ]
 
-    assert controller._startup_kwargs() == {
-        "standby_config": 0,
-        "operating_config": 9,
-    }
+    assert controller._resolved_safety_config("standby_config") == 0
     assert controller._shutdown_kwargs() == {
         "standby_config": 0,
         "disable_device": False,
@@ -562,7 +635,7 @@ def test_controller_ignores_slot_zero_when_it_is_not_a_standby_config():
         {"index": 9, "name": "Operate", "active": True, "valid": True},
     ]
 
-    assert controller._startup_kwargs() == {"operating_config": 9}
+    assert controller._resolved_safety_config("standby_config") == -1
     assert controller._shutdown_kwargs() == {}
 
 
@@ -578,7 +651,7 @@ def test_controller_skips_implicit_slot_zero_when_unavailable():
         {"index": 9, "name": "Operate", "active": True, "valid": True},
     ]
 
-    assert controller._startup_kwargs() == {"operating_config": 9}
+    assert controller._resolved_safety_config("standby_config") == -1
     assert controller._shutdown_kwargs() == {}
 
 
@@ -685,6 +758,52 @@ def test_controller_close_communication_syncs_after_device_is_disposed():
     assert sync_states == [(True, False)]
 
 
+def test_controller_init_complete_resumes_pending_on_request():
+    module = _load_module()
+
+    toggle_calls = []
+    sync_calls = []
+    parent = types.SimpleNamespace(
+        isOn=lambda: True,
+        getChannels=lambda: [],
+        _sync_channels=lambda: sync_calls.append("channels"),
+        _update_config_controls=lambda: sync_calls.append("config"),
+        _update_status_widgets=lambda: sync_calls.append("status"),
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = object()
+    controller.toggleOnFromThread = lambda parallel=True: toggle_calls.append(parallel)
+
+    controller.initComplete()
+
+    assert controller.initialized is True
+    assert sync_calls
+    assert toggle_calls == [True]
+
+
+def test_controller_init_complete_does_not_toggle_when_ui_is_off():
+    module = _load_module()
+
+    toggle_calls = []
+    parent = types.SimpleNamespace(
+        isOn=lambda: False,
+        getChannels=lambda: [],
+        _sync_channels=lambda: None,
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+
+    controller = module.AMXController(parent)
+    controller.device = object()
+    controller.toggleOnFromThread = lambda parallel=True: toggle_calls.append(parallel)
+
+    controller.initComplete()
+
+    assert controller.initialized is True
+    assert toggle_calls == []
+
+
 def test_controller_shutdown_uses_full_software_shutdown():
     module = _load_module()
 
@@ -715,6 +834,66 @@ def test_controller_shutdown_uses_full_software_shutdown():
 
     assert controller.device is None
     assert device.shutdown_calls == [(7.5, {})]
+
+
+def test_controller_shutdown_failure_marks_state_unconfirmed():
+    module = _load_module()
+
+    class FakeDevice:
+        def shutdown(self, timeout_s=None, **kwargs):
+            raise RuntimeError("boom")
+
+        def disconnect(self):
+            return None
+
+        def close(self):
+            return None
+
+    messages = []
+    parent = types.SimpleNamespace(
+        startup_timeout_s=7.5,
+        _update_config_controls=lambda: None,
+        _update_status_widgets=lambda: None,
+    )
+    controller = module.AMXController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: messages.append((message, flag))
+
+    shutdown_confirmed = controller.shutdownCommunication()
+
+    assert shutdown_confirmed is False
+    assert controller.device is None
+    assert controller.main_state == module._AMX_SHUTDOWN_UNCONFIRMED_STATE
+    assert controller.device_enabled_state == "Unknown"
+    assert messages == [
+        ("Starting AMX shutdown sequence.", None),
+        ("AMX shutdown failed: boom", module.PRINT.ERROR),
+        (
+            "AMX shutdown could not be confirmed before disconnect: boom.",
+            module.PRINT.ERROR,
+        ),
+    ]
+
+
+def test_device_shutdown_keeps_ui_on_when_shutdown_is_unconfirmed():
+    module = _load_module()
+
+    device = object.__new__(module.AMXDevice)
+    device.useOnOffLogic = True
+    device.onAction = types.SimpleNamespace(state=False)
+    device.controller = types.SimpleNamespace(shutdownCommunication=lambda: False)
+    sync_states = []
+    warnings = []
+    device._sync_local_on_action = lambda: sync_states.append(device.onAction.state)
+    device._update_status_widgets = lambda: None
+    device.print = lambda message, flag=None: warnings.append((message, flag))
+
+    module.AMXDevice.shutdownCommunication(device)
+
+    assert device.onAction.state is True
+    assert sync_states == [True]
+    assert any("shutdown could not be confirmed" in message for message, _ in warnings)
 
 
 def test_controller_shutdown_parks_standby_before_disconnect_when_available():
@@ -796,7 +975,7 @@ def test_amx_controller_lock_section_uses_raw_lock_and_propagates_errors():
     assert controller.lock.acquire_timeout_calls == []
 
 
-def test_amx_controller_read_numbers_marks_lock_as_already_acquired():
+def test_amx_controller_read_numbers_acquires_lock_for_housekeeping():
     module = _load_module()
 
     class FakeDevice:
@@ -824,11 +1003,53 @@ def test_amx_controller_read_numbers_marks_lock_as_already_acquired():
     lock_calls = []
 
     @contextlib.contextmanager
-    def fake_lock_section(timeout_message, *, already_acquired=False):
-        lock_calls.append((timeout_message, already_acquired))
+    def fake_lock_section(
+        timeout_message,
+        *,
+        already_acquired=False,
+        timeout_s=1.0,
+        log_timeout=True,
+    ):
+        lock_calls.append((timeout_message, already_acquired, timeout_s, log_timeout))
         yield
 
     controller._controller_lock_section = fake_lock_section
     controller.readNumbers()
 
-    assert lock_calls == [("Could not acquire lock to read AMX housekeeping.", True)]
+    assert lock_calls == [
+        ("Could not acquire lock to read AMX housekeeping.", False, 0.0, False)
+    ]
+
+
+def test_amx_controller_read_numbers_skips_busy_poll_without_error():
+    module = _load_module()
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        getChannels=lambda: [],
+        main_state="",
+        device_enabled_state="",
+        available_configs_text="",
+    )
+    controller = module.AMXController(parent)
+    controller.device = object()
+    controller.initialized = True
+    controller.errorCount = 0
+    printed = []
+    initialize_calls = []
+    lock_timeout_message = "Could not acquire lock to read AMX housekeeping."
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+    controller.initializeValues = lambda reset=False: initialize_calls.append(reset)
+
+    @contextlib.contextmanager
+    def busy_lock_section(*_args, **_kwargs):
+        raise TimeoutError(lock_timeout_message)
+        yield
+
+    controller._controller_lock_section = busy_lock_section
+
+    controller.readNumbers()
+
+    assert controller.errorCount == 0
+    assert printed == []
+    assert initialize_calls == []

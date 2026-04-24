@@ -1027,6 +1027,25 @@ def test_shutdown_disables_measurement_before_disconnect(monkeypatch):
     backend.disconnect.assert_called_once_with()
 
 
+def test_shutdown_treats_not_connected_as_already_disconnected(monkeypatch):
+    dmmr, _dll = make_dmmr(monkeypatch)
+    backend = object.__getattribute__(dmmr, "_backend")
+    backend.connected = True
+    monkeypatch.setattr(
+        backend,
+        "set_automatic_current",
+        Mock(return_value=backend.ERR_NOT_CONNECTED),
+    )
+    monkeypatch.setattr(backend, "set_enable", Mock())
+    monkeypatch.setattr(backend, "disconnect", Mock(return_value=True))
+
+    assert backend.shutdown() is True
+
+    backend.set_automatic_current.assert_called_once_with(False, timeout_s=5.0)
+    backend.set_enable.assert_not_called()
+    backend.disconnect.assert_called_once_with()
+
+
 def test_set_module_auto_range_uses_timeout_safe_wrapper(monkeypatch):
     dmmr, _dll = make_dmmr(monkeypatch)
     backend = object.__getattribute__(dmmr, "_backend")

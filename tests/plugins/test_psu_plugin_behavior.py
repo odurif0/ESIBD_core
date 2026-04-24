@@ -259,12 +259,28 @@ def test_controller_read_numbers_maps_housekeeping_snapshot():
                     {
                         "channel": 0,
                         "enabled": True,
+                        "dropout_v": 1.25,
+                        "adc": {"temp_adc_c": 36.5},
+                        "rails": {
+                            "volt_24vp_v": 24.2,
+                            "volt_12vp_v": 12.1,
+                            "volt_12vn_v": -12.0,
+                            "volt_ref_v": 2.5,
+                        },
                         "voltage": {"measured_v": 25.0, "set_v": 30.0},
                         "current": {"measured_a": 0.4, "set_a": 0.5},
                     },
                     {
                         "channel": 1,
                         "enabled": False,
+                        "dropout_v": 0.0,
+                        "adc": {"temp_adc_c": 31.0},
+                        "rails": {
+                            "volt_24vp_v": 24.0,
+                            "volt_12vp_v": 12.0,
+                            "volt_12vn_v": -12.0,
+                            "volt_ref_v": 2.5,
+                        },
                         "voltage": {"measured_v": 0.0, "set_v": 0.0},
                         "current": {"measured_a": 0.0, "set_a": 0.0},
                     },
@@ -302,6 +318,12 @@ def test_controller_read_numbers_maps_housekeeping_snapshot():
     assert controller.output_enabled_by_channel == {0: True, 1: False}
     assert controller.voltage_setpoints == {0: "30 V", 1: "0 V"}
     assert controller.current_setpoints == {0: "0.5 A", 1: "0 A"}
+    assert controller.adc_temperatures == {0: 36.5, 1: 31.0}
+    assert controller.dropout_values == {0: 1.25, 1: 0.0}
+    assert controller.rail_summaries == {
+        0: "24Vp 24.2 V, 12Vp 12.1 V, 12Vn -12 V, Ref 2.5 V",
+        1: "24Vp 24 V, 12Vp 12 V, 12Vn -12 V, Ref 2.5 V",
+    }
     assert parent.main_state == "ST_ON"
     assert parent.hardware_main_state == "STATE_ON"
     assert parent.output_summary == "CH0=ON, CH1=OFF"
@@ -374,7 +396,7 @@ def test_controller_read_numbers_reports_snapshot_apply_failures_explicitly():
     controller.initialized = True
     controller.print = lambda message, flag=None: printed.append((message, flag))
     controller.initializeValues = lambda reset=False: resets.append(reset)
-    controller._apply_snapshot = lambda snapshot: (_ for _ in ()).throw(
+    controller._apply_snapshot = lambda snapshot, **_kwargs: (_ for _ in ()).throw(
         IndexError("list index out of range")
     )
 
@@ -484,7 +506,7 @@ def test_psu_controller_lock_section_uses_raw_lock_and_propagates_errors():
     assert controller.lock.acquire_timeout_calls == []
 
 
-def test_psu_controller_read_numbers_marks_lock_as_already_acquired():
+def test_psu_controller_read_numbers_acquires_lock_for_housekeeping():
     module = _load_module()
 
     class FakeDevice:
@@ -517,7 +539,123 @@ def test_psu_controller_read_numbers_marks_lock_as_already_acquired():
     controller._controller_lock_section = fake_lock_section
     controller.readNumbers()
 
-    assert lock_calls == [("Could not acquire lock to read PSU housekeeping.", True)]
+    assert lock_calls == [("Could not acquire lock to read PSU housekeeping.", False)]
+
+
+def test_controller_read_numbers_refreshes_live_readbacks_between_housekeeping_polls(
+    monkeypatch,
+):
+    module = _load_module()
+    monotonic_values = iter([10.0, 10.7])
+    monkeypatch.setattr(module.time, "monotonic", lambda: next(monotonic_values))
+
+    calls = []
+
+    class FakeDevice:
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": True,
+                "output_enabled": (True, False),
+                "main_state": {"name": "STATE_ON"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "channels": [
+                    {
+                        "channel": 0,
+                        "enabled": True,
+                        "voltage": {"measured_v": 25.0, "set_v": 30.0},
+                        "current": {"measured_a": 0.4, "set_a": 0.5},
+                    },
+                    {
+                        "channel": 1,
+                        "enabled": False,
+                        "voltage": {"measured_v": 0.0, "set_v": 0.0},
+                        "current": {"measured_a": 0.0, "set_a": 0.0},
+                    },
+                ],
+            }
+
+        def get_device_enabled(self, timeout_s=None):
+            calls.append(("get_device_enabled", timeout_s))
+            return True
+
+        def get_output_enabled(self, timeout_s=None):
+            calls.append(("get_output_enabled", timeout_s))
+            return (False, True)
+
+        def get_channel_voltage(self, channel, timeout_s=None):
+            calls.append(("get_channel_voltage", channel, timeout_s))
+            return {0: 22.0, 1: 4.5}[channel]
+
+        def get_channel_current(self, channel, timeout_s=None):
+            calls.append(("get_channel_current", channel, timeout_s))
+            return {0: 0.22, 1: 0.045}[channel]
+
+    class FakeChannel:
+        def __init__(self, channel):
+            self._channel = channel
+            self.real = True
+
+        def channel_number(self):
+            return self._channel
+
+    parent = types.SimpleNamespace(
+        poll_timeout_s=2.5,
+        getChannels=lambda: [FakeChannel(0), FakeChannel(1)],
+        main_state="",
+        output_summary="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+
+    controller.readNumbers()
+    controller.readNumbers()
+
+    assert calls == [
+        ("collect_housekeeping", 2.5),
+        ("get_device_enabled", 2.5),
+        ("get_output_enabled", 2.5),
+        ("get_channel_voltage", 0, 2.5),
+        ("get_channel_current", 0, 2.5),
+        ("get_channel_voltage", 1, 2.5),
+        ("get_channel_current", 1, 2.5),
+        ("get_device_enabled", 2.5),
+        ("get_output_enabled", 2.5),
+        ("get_channel_voltage", 0, 2.5),
+        ("get_channel_current", 0, 2.5),
+        ("get_channel_voltage", 1, 2.5),
+        ("get_channel_current", 1, 2.5),
+    ]
+    assert controller.values == {0: 22.0, 1: 4.5}
+    assert controller.current_values == {0: 0.22, 1: 0.045}
+    assert controller.output_enabled_by_channel == {0: False, 1: True}
+    assert controller.voltage_setpoints == {0: "30 V", 1: "0 V"}
+    assert controller.current_setpoints == {0: "0.5 A", 1: "0 A"}
+    assert parent.output_summary == "CH0=OFF, CH1=ON"
+
+
+def test_channel_panel_diagnostics_snapshot_formats_compact_summary():
+    module = _load_module()
+
+    device = object.__new__(module.PSUDevice)
+    device.controller = types.SimpleNamespace(
+        device_state_summary="DEVICE_OK",
+        adc_temperatures={0: 35.0, 1: 31.5},
+        dropout_values={0: 1.2, 1: 0.4},
+        rail_summaries={
+            0: "24Vp 24.1 V, 12Vp 12 V",
+            1: "24Vp 24 V, 12Vp 12.1 V",
+        },
+    )
+
+    snapshot = module.PSUDevice._channel_panel_diagnostics_snapshot(device)
+
+    assert snapshot["text"] == "CH0 Tadc 35 C, Dropout 1.2 V | CH1 Tadc 31.5 C, Dropout 0.4 V"
+    assert "Device flags: DEVICE_OK" in snapshot["tooltip"]
+    assert "CH0 rails: 24Vp 24.1 V, 12Vp 12 V" in snapshot["tooltip"]
+    assert "CH1 rails: 24Vp 24 V, 12Vp 12.1 V" in snapshot["tooltip"]
 
 
 def test_format_current_text_handles_nan():
@@ -532,6 +670,169 @@ def test_format_voltage_text_handles_nan():
 
     assert module._format_voltage_text(np.nan) == "n/a"
     assert module._format_voltage_text(25.0) == "25 V"
+
+
+def test_readback_feedback_keeps_disabled_outputs_visually_checked():
+    module = _load_module()
+
+    assert module._psu_feedback_style("default")
+    assert (
+        module._voltage_feedback_state(enabled=False, measured_v=0.0, set_v=5000.0)
+        == "ok"
+    )
+    assert (
+        module._voltage_feedback_state(enabled=False, measured_v=0.5, set_v=5000.0)
+        == "warn"
+    )
+    assert (
+        module._voltage_feedback_state(enabled=False, measured_v=2.0, set_v=5000.0)
+        == "error"
+    )
+    assert (
+        module._current_limit_feedback_state(
+            enabled=False,
+            measured_a=0.0,
+            limit_a=1.0,
+        )
+        == "ok"
+    )
+    assert (
+        module._current_limit_feedback_state(
+            enabled=False,
+            measured_a=0.005,
+            limit_a=1.0,
+        )
+        == "warn"
+    )
+    assert (
+        module._current_limit_feedback_state(
+            enabled=False,
+            measured_a=0.02,
+            limit_a=1.0,
+        )
+        == "error"
+    )
+
+
+def test_manual_panel_sync_updates_controls_without_live_apply():
+    module = _load_module()
+    emitted = []
+
+    class FakeControl:
+        def __init__(self, *, checked=False, value=0.0):
+            self.checked = checked
+            self._value = value
+            self.blocked = False
+
+        def blockSignals(self, blocked):
+            self.blocked = bool(blocked)
+
+        def setChecked(self, checked):
+            self.checked = bool(checked)
+            if not self.blocked:
+                emitted.append(("checked", checked))
+
+        def isChecked(self):
+            return self.checked
+
+        def setValue(self, value):
+            self._value = float(value)
+            if not self.blocked:
+                emitted.append(("value", value))
+
+        def value(self):
+            return self._value
+
+    device = object.__new__(module.PSUDevice)
+    device.controller = types.SimpleNamespace(
+        output_enabled_by_channel={0: True, 1: False},
+        full_range_by_channel={0: True, 1: False},
+        voltage_setpoint_values={0: 12.5, 1: 22.5},
+        current_limit_values={0: 0.125, 1: 0.25},
+    )
+    device.manualPanelControls = {
+        0: {
+            "output_enabled": FakeControl(),
+            "full_range": FakeControl(),
+            "voltage": FakeControl(),
+            "current_limit": FakeControl(),
+        },
+        1: {
+            "output_enabled": FakeControl(checked=True),
+            "full_range": FakeControl(checked=True),
+            "voltage": FakeControl(),
+            "current_limit": FakeControl(),
+        },
+    }
+
+    module.PSUDevice._sync_manual_panel_from_controller(device)
+
+    assert emitted == []
+    assert device.manualPanelControls[0]["output_enabled"].isChecked() is True
+    assert device.manualPanelControls[1]["output_enabled"].isChecked() is False
+    assert device.manualPanelControls[0]["full_range"].isChecked() is True
+    assert device.manualPanelControls[1]["full_range"].isChecked() is False
+    assert device.manualPanelControls[0]["voltage"].value() == 12.5
+    assert device.manualPanelControls[1]["voltage"].value() == 22.5
+    assert device.manualPanelControls[0]["current_limit"].value() == 0.125
+    assert device.manualPanelControls[1]["current_limit"].value() == 0.25
+
+
+def test_manual_panel_change_applies_values_immediately():
+    module = _load_module()
+    calls = []
+
+    class FakeControl:
+        def __init__(self, *, checked=False, value=0.0):
+            self.checked = checked
+            self._value = value
+
+        def isChecked(self):
+            return self.checked
+
+        def value(self):
+            return self._value
+
+    controller = types.SimpleNamespace(
+        device=object(),
+        initialized=True,
+        initializing=False,
+        transitioning=False,
+        full_range_supported_by_channel={0: True, 1: True},
+        applyManualStateFromThread=lambda state, parallel=True: calls.append(
+            (state, parallel)
+        ),
+    )
+    device = object.__new__(module.PSUDevice)
+    device.controller = controller
+    device.manualPanelControls = {
+        0: {
+            "output_enabled": FakeControl(checked=True),
+            "full_range": FakeControl(checked=True),
+            "voltage": FakeControl(value=10.0),
+            "current_limit": FakeControl(value=0.1),
+        },
+        1: {
+            "output_enabled": FakeControl(checked=False),
+            "full_range": FakeControl(checked=False),
+            "voltage": FakeControl(value=20.0),
+            "current_limit": FakeControl(value=0.2),
+        },
+    }
+
+    module.PSUDevice._manual_panel_changed(device)
+
+    assert calls == [
+        (
+            {
+                "output_enabled": {0: True, 1: False},
+                "full_range_enabled": {0: True, 1: False},
+                "voltage_values": {0: 10.0, 1: 20.0},
+                "current_limit_values": {0: 0.1, 1: 0.2},
+            },
+            True,
+        )
+    ]
 
 
 def test_toggle_on_uses_config_startup_only():
@@ -592,6 +893,592 @@ def test_toggle_on_uses_config_startup_only():
     assert calls == [
         ("initialize", 9.0, {"standby_config": 1, "operating_config": 2}),
         ("collect_housekeeping", 5.0),
+    ]
+
+
+def test_toggle_on_without_startup_configs_enters_manual_standby():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def set_output_enabled(self, ch0, ch1, timeout_s=None):
+            calls.append(("set_output_enabled", ch0, ch1, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            calls.append(("set_device_enabled", enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": False,
+                "output_enabled": (False, False),
+                "main_state": {"name": "STATE_ERR_PSU_DIS"},
+                "device_state": {"flags": ["DEVST_PSU_DIS"]},
+                "channels": [],
+            }
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        standby_config=-1,
+        operating_config=-1,
+        isOn=lambda: True,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+    controller._begin_transition(True)
+
+    controller.toggleOn()
+
+    assert calls == [
+        ("set_output_enabled", False, False, 9.0),
+        ("set_device_enabled", False, 9.0),
+        ("collect_housekeeping", 5.0),
+    ]
+    assert controller.loaded_state_text == "Manual outputs OFF"
+    assert parent.loaded_state_text == "Manual outputs OFF"
+    assert printed == [
+        (
+            "PSU communication initialized without a startup config. "
+            "Outputs remain OFF until manual values are applied.",
+            None,
+        )
+    ]
+
+
+def test_apply_manual_state_updates_outputs_ranges_and_limits():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def set_output_enabled(self, ch0, ch1, timeout_s=None):
+            calls.append(("set_output_enabled", ch0, ch1, timeout_s))
+
+        def set_output_full_range(self, ch0, ch1, timeout_s=None):
+            calls.append(("set_output_full_range", ch0, ch1, timeout_s))
+
+        def set_channel_voltage(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_voltage", channel, value, timeout_s))
+
+        def set_channel_current(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_current", channel, value, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            calls.append(("set_device_enabled", enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": True,
+                "output_enabled": (True, False),
+                "main_state": {"name": "STATE_ON"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "channels": [
+                    {
+                        "channel": 0,
+                        "enabled": True,
+                        "full_range": {"enabled": True, "supported": True},
+                        "voltage": {"measured_v": 10.0, "set_v": 10.0},
+                        "current": {"measured_a": 0.1, "set_a": 0.25},
+                    },
+                    {
+                        "channel": 1,
+                        "enabled": False,
+                        "full_range": {"enabled": False, "supported": True},
+                        "voltage": {"measured_v": 20.0, "set_v": 20.0},
+                        "current": {"measured_a": 0.0, "set_a": 0.5},
+                    },
+                ],
+            }
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        poll_timeout_s=5.0,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.applyManualState(
+        {
+            "output_enabled": {0: True, 1: False},
+            "full_range_enabled": {0: True, 1: False},
+            "voltage_values": {0: 10.0, 1: 20.0},
+            "current_limit_values": {0: 0.25, 1: 0.5},
+        }
+    )
+
+    assert calls == [
+        ("set_output_enabled", False, False, 9.0),
+        ("set_output_full_range", True, False, 9.0),
+        ("set_channel_voltage", 0, 10.0, 9.0),
+        ("set_channel_current", 0, 0.25, 9.0),
+        ("set_channel_voltage", 1, 20.0, 9.0),
+        ("set_channel_current", 1, 0.5, 9.0),
+        ("set_device_enabled", True, 9.0),
+        ("set_output_enabled", True, False, 9.0),
+        ("collect_housekeeping", 5.0),
+    ]
+    assert controller.loaded_state_text == "Manual (unsaved)"
+    assert parent.loaded_state_text == "Manual (unsaved)"
+    assert printed == [("Applied PSU manual values.", None)]
+
+
+def test_apply_manual_state_warns_but_continues_on_setpoint_readback_lag():
+    module = _load_module()
+    printed = []
+
+    class FakeDevice:
+        def set_output_enabled(self, _ch0, _ch1, timeout_s=None):
+            return None
+
+        def set_channel_voltage(self, _channel, _value, timeout_s=None):
+            return None
+
+        def set_channel_current(self, _channel, _value, timeout_s=None):
+            return None
+
+        def get_channel_current_limits(self, _channel, timeout_s=None):
+            return 0.0, 1.0
+
+        def set_device_enabled(self, _enabled, timeout_s=None):
+            return None
+
+        def collect_housekeeping(self, timeout_s=None):
+            return {
+                "device_enabled": False,
+                "output_enabled": (False, False),
+                "main_state": {"name": "ST_STBY"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "channels": [],
+            }
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        poll_timeout_s=5.0,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        loaded_state_text="",
+    )
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.applyManualState(
+        {
+            "output_enabled": {0: False, 1: False},
+            "voltage_values": {0: 0.0, 1: 0.0},
+            "current_limit_values": {0: 0.01, 1: 0.0},
+        }
+    )
+
+    assert printed[0][1] == module.PRINT.WARNING
+    assert "current limit readback 0 A does not match requested 0.01 A" in printed[0][0]
+    assert printed[-1] == ("Applied PSU manual values.", None)
+
+
+def test_shutdown_with_config_still_forces_safe_disable_before_disconnect():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def load_config(self, config_index, timeout_s=None):
+            calls.append(("load_config", config_index, timeout_s))
+
+        def set_channel_current(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_current", channel, value, timeout_s))
+
+        def set_channel_voltage(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_voltage", channel, value, timeout_s))
+
+        def set_output_enabled(self, ch0, ch1, timeout_s=None):
+            calls.append(("set_output_enabled", ch0, ch1, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            calls.append(("set_device_enabled", enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": False,
+                "output_enabled": (False, False),
+                "main_state": {"name": "STATE_ERR_PSU_DIS"},
+                "device_state": {"flags": ["DEVST_PSU_DIS"]},
+                "channels": [],
+            }
+
+        def disconnect(self):
+            calls.append(("disconnect",))
+
+        def close(self):
+            calls.append(("close",))
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        poll_timeout_s=2.5,
+        shutdown_config=5,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        available_configs_text="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    result = controller.shutdownCommunication()
+
+    assert result is True
+    assert calls == [
+        ("load_config", 5, 9.0),
+        ("set_channel_current", 0, 0.0, 9.0),
+        ("set_channel_voltage", 0, 0.0, 9.0),
+        ("set_channel_current", 1, 0.0, 9.0),
+        ("set_channel_voltage", 1, 0.0, 9.0),
+        ("set_output_enabled", False, False, 9.0),
+        ("set_device_enabled", False, 9.0),
+        ("collect_housekeeping", 2.5),
+        ("disconnect",),
+        ("close",),
+    ]
+    assert controller.main_state == "Disconnected"
+    assert controller.device is None
+    assert printed == [
+        ("Starting PSU shutdown sequence.", None),
+        ("PSU shutdown sequence completed.", None),
+    ]
+
+
+def test_shutdown_unconfirmed_keeps_attention_state_after_disconnect():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def set_channel_current(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_current", channel, value, timeout_s))
+
+        def set_channel_voltage(self, channel, value, timeout_s=None):
+            calls.append(("set_channel_voltage", channel, value, timeout_s))
+
+        def set_output_enabled(self, ch0, ch1, timeout_s=None):
+            calls.append(("set_output_enabled", ch0, ch1, timeout_s))
+
+        def set_device_enabled(self, enabled, timeout_s=None):
+            calls.append(("set_device_enabled", enabled, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": True,
+                "output_enabled": (True, False),
+                "main_state": {"name": "STATE_ON"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "channels": [],
+            }
+
+        def disconnect(self):
+            calls.append(("disconnect",))
+
+        def close(self):
+            calls.append(("close",))
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        poll_timeout_s=2.5,
+        shutdown_config=-1,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        available_configs_text="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    result = controller.shutdownCommunication()
+
+    assert result is False
+    assert calls == [
+        ("set_channel_current", 0, 0.0, 9.0),
+        ("set_channel_voltage", 0, 0.0, 9.0),
+        ("set_channel_current", 1, 0.0, 9.0),
+        ("set_channel_voltage", 1, 0.0, 9.0),
+        ("set_output_enabled", False, False, 9.0),
+        ("set_device_enabled", False, 9.0),
+        ("collect_housekeeping", 2.5),
+        ("disconnect",),
+        ("close",),
+    ]
+    assert controller.main_state == module._PSU_SHUTDOWN_UNCONFIRMED_STATE
+    assert controller.hardware_main_state == module._PSU_SHUTDOWN_UNCONFIRMED_STATE
+    assert controller.output_state_summary == "Unknown"
+    assert controller.device is None
+    assert printed == [
+        ("Starting PSU shutdown sequence.", None),
+        (
+            "PSU shutdown could not be confirmed before disconnect: "
+            "outputs still enabled (CH0=ON, CH1=OFF).",
+            module.PRINT.ERROR,
+        ),
+    ]
+
+
+def test_save_current_config_refreshes_available_list_and_loaded_state():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def __init__(self):
+            self.saved = False
+
+        def save_config(
+            self,
+            config_number,
+            *,
+            name=None,
+            active=None,
+            valid=None,
+            timeout_s=None,
+        ):
+            calls.append(
+                ("save_config", config_number, name, active, valid, timeout_s)
+            )
+            self.saved = True
+
+        def list_configs(self, timeout_s=None):
+            calls.append(("list_configs", timeout_s))
+            if not self.saved:
+                return []
+            return [
+                {"index": 7, "name": "Manual 10 V / 1 A", "active": True, "valid": True},
+            ]
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        connect_timeout_s=2.5,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        available_configs_text="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.saveCurrentConfig(
+        config_index=7,
+        config_name="Manual 10 V / 1 A",
+        active=True,
+        valid=True,
+    )
+
+    assert calls == [
+        ("list_configs", 2.5),
+        ("save_config", 7, "Manual 10 V / 1 A", True, True, 9.0),
+        ("list_configs", 2.5),
+    ]
+    assert controller.available_configs == [
+        {"index": 7, "name": "Manual 10 V / 1 A", "active": True, "valid": True},
+    ]
+    assert controller.loaded_state_text == "Config 7: Manual 10 V / 1 A"
+    assert parent.available_configs_text == "7:Manual 10 V / 1 A"
+    assert parent.loaded_state_text == "Config 7: Manual 10 V / 1 A"
+    assert printed == [("Saved PSU config 7.", None)]
+
+
+def test_save_current_config_refuses_existing_config_slot():
+    module = _load_module()
+    calls = []
+    printed = []
+
+    class FakeDevice:
+        def save_config(
+            self,
+            config_number,
+            *,
+            name=None,
+            active=None,
+            valid=None,
+            timeout_s=None,
+        ):
+            calls.append(
+                ("save_config", config_number, name, active, valid, timeout_s)
+            )
+
+        def list_configs(self, timeout_s=None):
+            calls.append(("list_configs", timeout_s))
+            return [
+                {"index": 7, "name": "Existing", "active": True, "valid": True},
+            ]
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        connect_timeout_s=2.5,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+        available_configs_text="",
+        loaded_state_text="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.saveCurrentConfig(
+        config_index=7,
+        config_name="Overwrite attempt",
+        active=True,
+        valid=True,
+    )
+
+    assert calls == [("list_configs", 2.5)]
+    assert parent.available_configs_text == "7:Existing"
+    assert printed == [
+        (
+            "Cannot save PSU config 7: this slot already exists. Choose an empty slot.",
+            module.PRINT.WARNING,
+        )
+    ]
+
+
+def test_load_operating_config_now_loads_selected_psu_config():
+    module = _load_module()
+    calls = []
+    printed = []
+    sync_calls = []
+
+    class FakeDevice:
+        def load_config(self, config_number, timeout_s=None):
+            calls.append(("load_config", config_number, timeout_s))
+
+        def collect_housekeeping(self, timeout_s=None):
+            calls.append(("collect_housekeeping", timeout_s))
+            return {
+                "device_enabled": True,
+                "output_enabled": (True, True),
+                "main_state": {"name": "ST_ON"},
+                "device_state": {"flags": ["DEVICE_OK"]},
+                "channels": [
+                    {
+                        "channel": 0,
+                        "enabled": True,
+                        "full_range": {"enabled": True, "supported": True},
+                        "voltage": {"measured_v": 12.0, "set_v": 12.5},
+                        "current": {"measured_a": 0.05, "set_a": 0.125},
+                    },
+                    {
+                        "channel": 1,
+                        "enabled": True,
+                        "full_range": {"enabled": False, "supported": True},
+                        "voltage": {"measured_v": 22.0, "set_v": 22.5},
+                        "current": {"measured_a": 0.1, "set_a": 0.25},
+                    },
+                ],
+            }
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        operating_config=7,
+        isOn=lambda: True,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = FakeDevice()
+    controller.initialized = True
+    controller.available_configs = [
+        {"index": 1, "name": "Standby", "active": True, "valid": True},
+        {"index": 7, "name": "Operate 5 kV", "active": True, "valid": True},
+    ]
+    parent._sync_manual_panel_from_controller = lambda: sync_calls.append(
+        (
+            dict(controller.voltage_setpoint_values),
+            dict(controller.current_limit_values),
+        )
+    )
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.loadOperatingConfigNow()
+
+    assert calls == [
+        ("load_config", 7, 9.0),
+        ("collect_housekeeping", 5.0),
+    ]
+    assert sync_calls == [
+        ({0: 12.5, 1: 22.5}, {0: 0.125, 1: 0.25}),
+    ]
+    assert printed == [("Loaded PSU config 7.", None)]
+
+
+def test_load_operating_config_now_rejects_invalid_config_slot():
+    module = _load_module()
+    printed = []
+
+    parent = types.SimpleNamespace(
+        name="PSU",
+        startup_timeout_s=9.0,
+        operating_config=7,
+        isOn=lambda: True,
+        getChannels=lambda: [],
+        main_state="",
+        output_summary="",
+    )
+
+    controller = module.PSUController(parent)
+    controller.device = object()
+    controller.initialized = True
+    controller.available_configs = [
+        {"index": 7, "name": "Operate 5 kV", "active": True, "valid": False},
+    ]
+    controller.print = lambda message, flag=None: printed.append((message, flag))
+
+    controller.loadOperatingConfigNow()
+
+    assert printed == [
+        (
+            "Cannot load PSU config: config 7 is marked invalid on the controller.",
+            module.PRINT.WARNING,
+        )
     ]
 
 

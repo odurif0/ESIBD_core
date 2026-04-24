@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
+from threading import Lock
 from typing import Any, cast
 
 import numpy as np
@@ -42,6 +43,9 @@ _CHANNELS_PER_MODULE_OPTIONS = {2, 4}
 _AMPR_ABS_VOLTAGE_LIMIT = 1000.0
 _AMPR_MIN_ROW_HEIGHT = 28
 _AMPR_RAMP_STEP_S = 0.1
+_AMPR_COMMUNICATION_LOST_STATE = "Communication lost"
+_AMPR_SHUTDOWN_UNCONFIRMED_STATE = "Shutdown unconfirmed"
+_AMPR_TRANSPORT_FAILURE_THRESHOLD = 3
 _AMPR_POWER_ON_ICON = "switch-medium_on.png"
 _AMPR_POWER_OFF_ICON = "switch-medium_off.png"
 _AMPR_CHANNEL_ON_LABEL = "HV ON"
@@ -107,6 +111,68 @@ def _compact_status_text(value: Any, default: str = "n/a") -> str:
     if len(parts) <= 1:
         return text
     return f"{parts[0]} +{len(parts) - 1}"
+
+
+def _transport_failure_is_fatal(exc: Exception) -> bool:
+    """Return True when an exception clearly indicates a dead AMPR transport."""
+    text = str(exc).strip().lower()
+    if not text:
+        return False
+    return any(
+        token in text
+        for token in (
+            "unusable",
+            "transport is unusable",
+            "transport became unusable",
+            "marked unusable",
+            "worker became unusable",
+        )
+    )
+
+
+def _invoke_gui_callback(callback: Any) -> None:
+    """Run GUI updates directly in tests and queue them on the Qt GUI thread."""
+    if not callable(callback):
+        return
+    try:
+        from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+        from PyQt6.QtWidgets import QApplication
+    except ImportError:
+        callback()
+        return
+
+    app = QApplication.instance()
+    if app is None:
+        callback()
+        return
+
+    try:
+        if QThread.currentThread() == app.thread():
+            callback()
+            return
+
+        dispatcher = getattr(_invoke_gui_callback, "_dispatcher", None)
+        if dispatcher is None:
+            class _CallbackDispatcher(QObject):
+                callbackRequested = pyqtSignal(object)
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.callbackRequested.connect(
+                        self._run,
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+
+                def _run(self, queued_callback: Any) -> None:
+                    if callable(queued_callback):
+                        queued_callback()
+
+            dispatcher = _CallbackDispatcher()
+            dispatcher.moveToThread(app.thread())
+            setattr(_invoke_gui_callback, "_dispatcher", dispatcher)
+        dispatcher.callbackRequested.emit(callback)
+    except Exception:
+        callback()
 
 
 def _action_label(action: Any) -> str:
@@ -462,7 +528,7 @@ class AMPRDevice(Device):
 
     name = "AMPR_A"
     version = "0.1.0"
-    supportedVersion = "0.8"
+    supportedVersion = "1.0.1"
     pluginType = PLUGINTYPE.INPUTDEVICE
     unit = "V"
     useMonitors = True
@@ -644,7 +710,12 @@ class AMPRDevice(Device):
             background = "#b7791f"
         elif state == "Disconnected":
             background = "#718096"
-        elif state == "ST_OVERLOAD" or state.startswith("ST_ERR") or "error" in state.lower():
+        elif (
+            state == "ST_OVERLOAD"
+            or state.startswith("ST_ERR")
+            or "error" in state.lower()
+            or "lost" in state.lower()
+        ):
             background = "#c53030"
         else:
             background = "#4a5568"
@@ -968,7 +1039,18 @@ class AMPRDevice(Device):
         if hasattr(action, "setEnabled"):
             action.setEnabled(enabled)
             return
-        setattr(action, "enabled", enabled)
+        with contextlib.suppress(AttributeError):
+            setattr(action, "enabled", enabled)
+
+    def _set_action_visible(self, action: Any | None, visible: bool) -> None:
+        """Update QAction-like visibility while tolerating lightweight test doubles."""
+        if action is None:
+            return
+        if hasattr(action, "setVisible"):
+            action.setVisible(visible)
+            return
+        with contextlib.suppress(AttributeError):
+            setattr(action, "visible", visible)
 
     def _force_recording_action_state(self, state: bool) -> None:
         """Force the acquisition action state without re-entering its callbacks."""
@@ -1018,19 +1100,49 @@ class AMPRDevice(Device):
                 setattr(live_display, "initCommunicationAction", action)
         return close_action, init_action
 
+    def _communication_open(self) -> bool:
+        """Return whether a transport/driver exists, even after a partial startup failure."""
+        controller = getattr(self, "controller", None)
+        if controller is None:
+            return False
+        if getattr(controller, "device", None) is not None:
+            return True
+        return bool(getattr(controller, "initialized", False))
+
     def _sync_display_communication_controls(self) -> None:
         """Enable display-side communication actions only when applicable."""
         close_action, init_action = self._display_communication_actions()
         controller = getattr(self, "controller", None)
-        initializing = bool(getattr(controller, "initializing", False))
-        initialized = bool(getattr(controller, "initialized", False))
-        self._set_action_enabled(close_action, initialized and not initializing)
-        self._set_action_enabled(init_action, (not initialized) and (not initializing))
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        communication_open = self._communication_open()
+        self._set_action_enabled(close_action, communication_open and not busy)
+        self._set_action_enabled(init_action, (not communication_open) and (not busy))
+
+    def _sync_toolbar_communication_controls(self) -> None:
+        """Expose a disconnect action when communication is open but the local ON action is OFF."""
+        close_action = getattr(self, "closeCommunicationAction", None)
+        if close_action is None:
+            return
+        controller = getattr(self, "controller", None)
+        busy = bool(getattr(controller, "initializing", False)) or bool(
+            getattr(controller, "transitioning", False)
+        )
+        can_close = self._communication_open() and not busy
+        is_on = False
+        is_on_fn = getattr(self, "isOn", None)
+        if callable(is_on_fn):
+            is_on = bool(is_on_fn())
+        has_local_on_action = getattr(self, "onAction", None) is not None
+        self._set_action_enabled(close_action, can_close)
+        self._set_action_visible(close_action, can_close and (not has_local_on_action or not is_on))
 
     def _sync_acquisition_controls(self) -> None:
         """Disable manual acquisition controls until the AMPR is actually ready."""
         ready, _reason = self._acquisition_readiness()
         self._sync_display_communication_controls()
+        self._sync_toolbar_communication_controls()
         self._set_action_enabled(getattr(self, "recordingAction", None), ready)
         self._set_action_enabled(
             getattr(getattr(self, "liveDisplay", None), "recordingAction", None),
@@ -1058,35 +1170,57 @@ class AMPRDevice(Device):
 
     def closeCommunication(self) -> None:
         """Close communication safely even if plugin finalization failed early."""
+        controller = getattr(self, "controller", None)
+        forced_close_state = getattr(controller, "_forced_close_state", None)
         if self.useOnOffLogic and not hasattr(self, "onAction"):
             self.stopAcquisition()
-            if self.controller:
-                self.controller.closeCommunication()
+            if controller:
+                close_kwargs = (
+                    {"final_state": forced_close_state}
+                    if forced_close_state
+                    else {}
+                )
+                controller.closeCommunication(**close_kwargs)
             self.recording = False
             self._sync_acquisition_controls()
             return
 
-        if self.controller and getattr(self, "initialized", False):
+        if controller and getattr(controller, "initialized", False) and not forced_close_state:
             self.shutdownCommunication()
             return
 
         if self.useOnOffLogic and hasattr(self, "onAction"):
             self.onAction.state = False
             self._sync_local_on_action()
+            self._sync_toolbar_communication_controls()
         self.stopAcquisition()
-        if self.controller:
-            self.controller.closeCommunication()
+        if controller:
+            close_kwargs = (
+                {"final_state": forced_close_state}
+                if forced_close_state
+                else {}
+            )
+            controller.closeCommunication(**close_kwargs)
         self.recording = False
         self._sync_acquisition_controls()
 
     def shutdownCommunication(self) -> None:
         """Run the full AMPR hardware shutdown sequence from the toolbar action."""
-        if self.useOnOffLogic and hasattr(self, "onAction"):
-            self.onAction.state = False
-            self._sync_local_on_action()
+        shutdown_confirmed = True
+        controller = getattr(self, "controller", None)
         self.stopAcquisition()
-        if self.controller:
-            self.controller.shutdownCommunication()
+        if controller:
+            shutdown_confirmed = bool(controller.shutdownCommunication())
+        if self.useOnOffLogic and hasattr(self, "onAction"):
+            self.onAction.state = False if shutdown_confirmed else True
+            self._sync_local_on_action()
+            self._sync_toolbar_communication_controls()
+        if not shutdown_confirmed:
+            self.print(
+                "AMPR shutdown could not be confirmed; UI remains ON until "
+                "the hardware state is verified.",
+                flag=PRINT.WARNING,
+            )
         self.recording = False
         self._sync_acquisition_controls()
 
@@ -1104,6 +1238,7 @@ class AMPRDevice(Device):
             else:
                 action.state = state
         self._sync_local_on_action()
+        self._sync_toolbar_communication_controls()
         self._update_status_widgets()
 
     def setOn(self, on: "bool | None" = None) -> None:
@@ -1511,6 +1646,9 @@ class AMPRController(DeviceController):
         self.ramping = False
         self.transitioning = False
         self.transition_target_on: bool | None = None
+        self._transition_lock = Lock()
+        self._forced_close_state: str | None = None
+        self._consecutive_transport_failures = 0
 
     def initializeValues(self, reset: bool = False) -> None:
         if getattr(self, "values", None) is None or reset:
@@ -1603,6 +1741,9 @@ class AMPRController(DeviceController):
             return
 
         self._update_state()
+        if self.main_state == _AMPR_COMMUNICATION_LOST_STATE or self.device is None:
+            self.initializeValues(reset=True)
+            return
         if self.main_state != "ST_ON":
             self.initializeValues(reset=True)
             return
@@ -1622,10 +1763,22 @@ class AMPRController(DeviceController):
 
         for module in poll_modules:
             try:
-                voltages = self.device.get_module_voltages(module)
+                with self._controller_lock_section(
+                    f"Could not acquire lock to read AMPR module {module}."
+                ):
+                    device = self.device
+                    if device is None:
+                        return
+                    voltages = device.get_module_voltages(module)
+            except TimeoutError:
+                self.errorCount += 1
+                continue
             except Exception as exc:  # noqa: BLE001
                 self.errorCount += 1
                 self.print(f"Failed to read module {module}: {exc}", flag=PRINT.ERROR)
+                if _transport_failure_is_fatal(exc):
+                    self._handle_transport_loss()
+                    return
                 continue
 
             for channel_id, voltage_data in voltages.items():
@@ -1797,8 +1950,10 @@ class AMPRController(DeviceController):
                         f"AMPR ramp-down before shutdown failed: {self._format_exception(exc)}",
                         flag=PRINT.ERROR,
                     )
-                self.shutdownCommunication()
-                if shutdown_after_ramp_error:
+                shutdown_confirmed = self.shutdownCommunication()
+                if not shutdown_confirmed:
+                    self._restore_on_ui_state()
+                if shutdown_after_ramp_error or not shutdown_confirmed:
                     return
                 return
         except Exception as exc:  # noqa: BLE001
@@ -1840,48 +1995,78 @@ class AMPRController(DeviceController):
                 start_acquisition()
             self.print("AMPR PSU turned ON. State: ST_ON.")
 
-    def closeCommunication(self) -> None:
+    def closeCommunication(self, *, final_state: str | None = None) -> None:
         base_close = getattr(super(), "closeCommunication", None)
         if callable(base_close):
             base_close()
-        self.main_state = "Disconnected"
+        if final_state is None:
+            final_state = getattr(self, "_forced_close_state", None) or "Disconnected"
+        self.main_state = final_state
         self.detected_module_ids = []
         self.detected_modules_text = ""
         if hasattr(self, "controllerParent"):
             self.controllerParent.module_channel_counts = {}
             self.controllerParent.module_voltage_limits = {}
-        self.device_state_summary = "n/a"
-        self.interlock_state_summary = "n/a"
-        self.voltage_state_summary = "n/a"
+        summary_value = "n/a" if final_state == "Disconnected" else "Unknown"
+        self.device_state_summary = summary_value
+        self.interlock_state_summary = summary_value
+        self.voltage_state_summary = summary_value
         self._sync_status_to_gui()
         self._dispose_device()
         self.initialized = False
+        self._clear_transport_failures()
+        self._forced_close_state = None
 
-    def shutdownCommunication(self) -> None:
+    def shutdownCommunication(self) -> bool:
         """Run the AMPR shutdown sequence before releasing communication resources."""
         device = self.device
         if device is None:
             self.closeCommunication()
-            return
+            return True
 
         if getattr(self, "acquiring", False):
             self.stopAcquisition()
             self.acquiring = False
         self.print("Starting AMPR shutdown sequence.")
+        shutdown_confirmed = False
+        confirmation_reason = "shutdown confirmation was not completed"
         try:
-            device.shutdown()
+            with self._controller_lock_section(
+                "Could not acquire lock to shut down the AMPR."
+            ):
+                device = self.device
+                if device is None:
+                    shutdown_confirmed = True
+                else:
+                    device.shutdown()
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
-            self._update_state()
+            confirmation_reason = self._format_exception(exc)
+            with contextlib.suppress(Exception):
+                self._update_state()
             self.print(
                 f"AMPR shutdown failed: {self._format_exception(exc)}"
                 f"{self._runtime_diagnostics(device=device)}",
                 flag=PRINT.ERROR,
             )
         else:
+            shutdown_confirmed = True
             self.print("AMPR shutdown sequence completed.")
         finally:
-            self.closeCommunication()
+            if not shutdown_confirmed:
+                self.print(
+                    "AMPR shutdown could not be confirmed before disconnect: "
+                    f"{confirmation_reason}.",
+                    flag=PRINT.ERROR,
+                )
+            self.closeCommunication(
+                final_state=(
+                    "Disconnected"
+                    if shutdown_confirmed
+                    else _AMPR_SHUTDOWN_UNCONFIRMED_STATE
+                )
+            )
+        return shutdown_confirmed
 
     def _refresh_module_scan(self) -> None:
         if self.device is None:
@@ -2007,13 +2192,35 @@ class AMPRController(DeviceController):
             self.device_state_summary = "n/a"
             self.interlock_state_summary = "n/a"
             self.voltage_state_summary = "n/a"
+            self._clear_transport_failures()
             return
 
         try:
-            status, _state_hex, state_name = self.device.get_state()
+            with self._controller_lock_section(
+                "Could not acquire lock to refresh the AMPR state."
+            ):
+                device = self.device
+                if device is None:
+                    self.main_state = "Disconnected"
+                    self.device_state_summary = "n/a"
+                    self.interlock_state_summary = "n/a"
+                    self.voltage_state_summary = "n/a"
+                    self._clear_transport_failures()
+                    return
+                status, _state_hex, state_name = device.get_state()
+        except TimeoutError:
+            self.errorCount += 1
+            return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
-            self.main_state = "State error"
+            failure_count = self._note_transport_failure()
+            transport_unusable = _transport_failure_is_fatal(exc)
+            transport_lost = transport_unusable or (
+                failure_count >= _AMPR_TRANSPORT_FAILURE_THRESHOLD
+            )
+            self.main_state = (
+                _AMPR_COMMUNICATION_LOST_STATE if transport_lost else "State error"
+            )
             self.print(f"Failed to read AMPR state: {exc}", flag=PRINT.ERROR)
             self.device_state_summary = (
                 self._safe_query_state("get_device_state") or "Unknown"
@@ -2024,15 +2231,18 @@ class AMPRController(DeviceController):
             self.voltage_state_summary = (
                 self._safe_query_state("get_voltage_state") or "Unknown"
             )
+            if transport_lost:
+                self._handle_transport_loss()
             return
 
-        if status == self.device.NO_ERR:
+        self._clear_transport_failures()
+        if status == device.NO_ERR:
             self.main_state = state_name
         else:
             self.main_state = "State error"
             self.errorCount += 1
             self.print(
-                f"Failed to read AMPR state: {self._format_status(status)}",
+                f"Failed to read AMPR state: {self._format_status(status, device=device)}",
                 flag=PRINT.ERROR,
             )
         self.device_state_summary = self._safe_query_state("get_device_state") or "Unknown"
@@ -2041,16 +2251,70 @@ class AMPRController(DeviceController):
         )
         self.voltage_state_summary = self._safe_query_state("get_voltage_state") or "Unknown"
 
+    def _handle_transport_loss(self) -> None:
+        """Force immediate AMPR teardown after repeated transport failures."""
+        if (
+            getattr(self, "_forced_close_state", None) == _AMPR_COMMUNICATION_LOST_STATE
+            and self.device is None
+        ):
+            return
+
+        self.main_state = _AMPR_COMMUNICATION_LOST_STATE
+        self.device_state_summary = "Unknown"
+        self.interlock_state_summary = "Unknown"
+        self.voltage_state_summary = "Unknown"
+        self._forced_close_state = _AMPR_COMMUNICATION_LOST_STATE
+        self.acquiring = False
+        self.initialized = False
+        self.ramping = False
+        self._clear_transport_failures()
+        self._end_transition()
+        self._restore_off_ui_state()
+        self._dispose_device()
+        self._sync_status_to_gui()
+        close_signal = getattr(getattr(self, "signalComm", None), "closeCommunicationSignal", None)
+        emit = getattr(close_signal, "emit", None)
+        if callable(emit):
+            emit()
+
     def _sync_status_to_gui(self) -> None:
         self.controllerParent.main_state = self.main_state
         self.controllerParent.detected_modules = self.detected_modules_text
         self.controllerParent.device_state_summary = self.device_state_summary
         self.controllerParent.interlock_state_summary = self.interlock_state_summary
         self.controllerParent.voltage_state_summary = self.voltage_state_summary
-        if hasattr(self.controllerParent, "_update_status_widgets"):
-            self.controllerParent._update_status_widgets()
+        def _refresh_gui() -> None:
+            sync_acquisition_controls = getattr(
+                self.controllerParent,
+                "_sync_acquisition_controls",
+                None,
+            )
+            if callable(sync_acquisition_controls):
+                sync_acquisition_controls()
+            update_status_widgets = getattr(self.controllerParent, "_update_status_widgets", None)
+            if callable(update_status_widgets):
+                update_status_widgets()
+
+        _invoke_gui_callback(_refresh_gui)
+
+    def _transition_guard(self) -> Lock:
+        lock = getattr(self, "_transition_lock", None)
+        if lock is None:
+            lock = Lock()
+            self._transition_lock = lock
+        return lock
+
+    def _note_transport_failure(self) -> int:
+        failures = int(getattr(self, "_consecutive_transport_failures", 0)) + 1
+        self._consecutive_transport_failures = failures
+        return failures
+
+    def _clear_transport_failures(self) -> None:
+        self._consecutive_transport_failures = 0
 
     def _dispose_device(self) -> None:
+        import gc
+
         device = self.device
         self.device = None
         self.initialized = False
@@ -2066,6 +2330,10 @@ class AMPRController(DeviceController):
                 device.close()
             except Exception:  # noqa: BLE001
                 pass
+            with contextlib.suppress(Exception):
+                device._set_port_claimed(False)
+        del device
+        gc.collect()
 
     def _format_status(self, status: int, device: Any | None = None) -> str:
         device = self.device if device is None else device
@@ -2120,11 +2388,28 @@ class AMPRController(DeviceController):
         if callable(sync_local):
             sync_local()
 
+    def _restore_on_ui_state(self) -> None:
+        """Restore toolbar ON/OFF widgets back to ON after a failed shutdown."""
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(True)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = True
+        sync_local = getattr(self.controllerParent, "_sync_local_on_action", None)
+        if callable(sync_local):
+            sync_local()
+
     @contextlib.contextmanager
     def _controller_lock_section(self, timeout_message: str):
         """Acquire the controller lock without swallowing hardware exceptions."""
-        acquire = getattr(self.lock, "acquire", None)
-        release = getattr(self.lock, "release", None)
+        lock = getattr(self, "lock", None)
+        if lock is None:
+            lock = Lock()
+            self.lock = lock
+
+        acquire = getattr(lock, "acquire", None)
+        release = getattr(lock, "release", None)
         if callable(acquire) and callable(release):
             if not acquire(timeout=1):
                 self.print(timeout_message, flag=PRINT.ERROR)
@@ -2135,23 +2420,25 @@ class AMPRController(DeviceController):
                 release()
             return
 
-        with self.lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
+        with lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
             if not lock_acquired:
                 raise TimeoutError(timeout_message)
             yield
 
     def _begin_transition(self, target_on: bool) -> bool:
         """Mark a global AMPR ON/OFF transition as active."""
-        if self.transitioning:
-            return False
-        self.transitioning = True
-        self.transition_target_on = bool(target_on)
-        return True
+        with self._transition_guard():
+            if self.transitioning:
+                return False
+            self.transitioning = True
+            self.transition_target_on = bool(target_on)
+            return True
 
     def _end_transition(self) -> None:
         """Clear transition bookkeeping after a global AMPR ON/OFF sequence."""
-        self.transitioning = False
-        self.transition_target_on = None
+        with self._transition_guard():
+            self.transitioning = False
+            self.transition_target_on = None
 
     def _channel_target_voltages(
         self,

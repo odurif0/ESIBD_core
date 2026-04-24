@@ -152,7 +152,7 @@ class ControllerProcessProxy:
         self,
         method_name: str,
         *args,
-        timeout_s: float,
+        rpc_timeout_s: float,
         **kwargs,
     ):
         return self._request(
@@ -162,7 +162,7 @@ class ControllerProcessProxy:
                 "args": args,
                 "kwargs": kwargs,
             },
-            timeout_s=timeout_s,
+            timeout_s=rpc_timeout_s,
             action=f"{method_name}()",
         )
 
