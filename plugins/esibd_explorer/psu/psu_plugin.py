@@ -98,6 +98,7 @@ _PSU_PANEL_DIAGNOSTICS_MAX_WIDTH = 612
 _PSU_PANEL_OPERATOR_MAX_WIDTH = 820
 _PSU_LIVE_READBACK_REFRESH_PERIOD_S = 0.0
 _PSU_HOUSEKEEPING_REFRESH_PERIOD_S = 2.0
+_PSU_MANUAL_NUMERIC_DEBOUNCE_MS = 250
 _PSU_FEEDBACK_OK_STYLE = "background-color: #2f855a; color: #ffffff; margin:0px; padding:0px 4px;"
 _PSU_FEEDBACK_WARN_STYLE = "background-color: #dd6b20; color: #ffffff; margin:0px; padding:0px 4px;"
 _PSU_FEEDBACK_ERROR_STYLE = "background-color: #c53030; color: #ffffff; margin:0px; padding:0px 4px;"
@@ -1191,12 +1192,19 @@ class PSUDevice(Device):
             "current_limit_values": current_limit_values,
         }
 
-    def _manual_panel_changed(self, *_args: Any) -> None:
+    def _manual_panel_changed(self, *_args: Any, debounce: bool = False) -> None:
         if getattr(self, "_manualPanelSyncing", False):
             return
         ready, _reason = self._manual_controls_ready()
         if not ready:
             return
+        if debounce:
+            self._schedule_manual_panel_apply()
+            return
+        self._cancel_manual_panel_apply()
+        self._apply_manual_panel_state()
+
+    def _apply_manual_panel_state(self) -> None:
         controller = getattr(self, "controller", None)
         if controller is None:
             return
@@ -1209,8 +1217,36 @@ class PSUDevice(Device):
             return
         controller.applyManualState(state)
 
+    def _manual_panel_apply_timer(self) -> Any | None:
+        timer = getattr(self, "_manualPanelApplyTimer", None)
+        if timer is not None:
+            return timer
+        try:
+            from PyQt6.QtCore import QTimer
+        except Exception:
+            return None
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(self._apply_manual_panel_state)
+        self._manualPanelApplyTimer = timer
+        return timer
+
+    def _schedule_manual_panel_apply(self) -> None:
+        timer = self._manual_panel_apply_timer()
+        if timer is None:
+            self._apply_manual_panel_state()
+            return
+        timer.start(_PSU_MANUAL_NUMERIC_DEBOUNCE_MS)
+
+    def _cancel_manual_panel_apply(self) -> None:
+        timer = getattr(self, "_manualPanelApplyTimer", None)
+        stop = getattr(timer, "stop", None)
+        if callable(stop):
+            stop()
+
     def _sync_manual_panel_from_controller(self) -> None:
         def _sync() -> None:
+            self._cancel_manual_panel_apply()
             controls = getattr(self, "manualPanelControls", None)
             if not isinstance(controls, dict):
                 return
@@ -1581,14 +1617,18 @@ class PSUDevice(Device):
             output_label = QLabel("Output")
             output_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
             output_box = QCheckBox("ON")
-            output_box.toggled.connect(self._manual_panel_changed)
+            output_box.toggled.connect(
+                lambda _checked: self._manual_panel_changed(debounce=False)
+            )
             range_label = QLabel("Range")
             range_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
             range_box = QCheckBox("Full")
             range_box.setToolTip(
                 "Full range enables maximum voltage. Half range lowers voltage capability and allows higher current."
             )
-            range_box.toggled.connect(self._manual_panel_changed)
+            range_box.toggled.connect(
+                lambda _checked: self._manual_panel_changed(debounce=False)
+            )
             voltage_label = QLabel("Vset")
             voltage_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
             voltage_widget = self._create_manual_numeric_widget(
@@ -1597,7 +1637,9 @@ class PSUDevice(Device):
                 step=0.1,
                 maximum=10000.0,
             )
-            voltage_widget.valueChanged.connect(self._manual_panel_changed)
+            voltage_widget.valueChanged.connect(
+                lambda _value: self._manual_panel_changed(debounce=True)
+            )
             current_label = QLabel("Ilim")
             current_label.setStyleSheet(_PSU_PANEL_METRIC_NAME_STYLE)
             current_widget = self._create_manual_numeric_widget(
@@ -1606,7 +1648,9 @@ class PSUDevice(Device):
                 step=0.01,
                 maximum=10000.0,
             )
-            current_widget.valueChanged.connect(self._manual_panel_changed)
+            current_widget.valueChanged.connect(
+                lambda _value: self._manual_panel_changed(debounce=True)
+            )
 
             control_layout.addWidget(output_label, 0, 0)
             control_layout.addWidget(output_box, 0, 1)
@@ -3213,6 +3257,9 @@ class PSUController(DeviceController):
         self.transitioning = False
         self.transition_target_on: bool | None = None
         self._transition_lock = Lock()
+        self._manual_apply_state_lock = Lock()
+        self._manual_apply_pending_state: dict[str, Any] | None = None
+        self._manual_apply_worker_running = False
         self.values: dict[int, float] = {}
         self.current_values: dict[int, float] = {}
         self.output_enabled_by_channel: dict[int, bool] = {}
@@ -3930,6 +3977,7 @@ class PSUController(DeviceController):
             )
             return
 
+        self._discard_pending_manual_state_apply()
         timeout_s = float(getattr(self.controllerParent, "startup_timeout_s", 10.0))
         try:
             with self._controller_lock_section(
@@ -4021,14 +4069,41 @@ class PSUController(DeviceController):
 
     def applyManualStateFromThread(self, manual_state: dict[str, Any], parallel: bool = True) -> None:
         if parallel:
+            self._queue_manual_state_apply(manual_state)
+            return
+        self.applyManualState(manual_state)
+
+    def _copy_manual_state(self, manual_state: dict[str, Any]) -> dict[str, Any]:
+        copied: dict[str, Any] = {}
+        for key, value in manual_state.items():
+            copied[key] = dict(value) if isinstance(value, dict) else value
+        return copied
+
+    def _queue_manual_state_apply(self, manual_state: dict[str, Any]) -> None:
+        with self._manual_apply_state_lock:
+            self._manual_apply_pending_state = self._copy_manual_state(manual_state)
+            if self._manual_apply_worker_running:
+                return
+            self._manual_apply_worker_running = True
             Thread(
-                target=self.applyManualState,
-                args=(manual_state,),
+                target=self._manual_state_apply_worker,
                 name=f"{self.controllerParent.name} applyManualStateThread",
                 daemon=True,
             ).start()
-            return
-        self.applyManualState(manual_state)
+
+    def _discard_pending_manual_state_apply(self) -> None:
+        with self._manual_apply_state_lock:
+            self._manual_apply_pending_state = None
+
+    def _manual_state_apply_worker(self) -> None:
+        while True:
+            with self._manual_apply_state_lock:
+                manual_state = self._manual_apply_pending_state
+                self._manual_apply_pending_state = None
+                if manual_state is None:
+                    self._manual_apply_worker_running = False
+                    return
+            self.applyManualState(manual_state)
 
     def applyManualState(self, manual_state: dict[str, Any]) -> None:
         device = self.device
@@ -4240,6 +4315,7 @@ class PSUController(DeviceController):
             self._end_transition()
             return
 
+        self._discard_pending_manual_state_apply()
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
             stop_acquisition()
@@ -4307,6 +4383,7 @@ class PSUController(DeviceController):
             self.closeCommunication()
             return True
 
+        self._discard_pending_manual_state_apply()
         stop_acquisition = getattr(self, "stopAcquisition", None)
         if callable(stop_acquisition):
             stop_acquisition()

@@ -1053,3 +1053,162 @@ def test_amx_controller_read_numbers_skips_busy_poll_without_error():
     assert controller.errorCount == 0
     assert printed == []
     assert initialize_calls == []
+
+
+def test_frequency_widget_change_is_debounced_until_timer_fires():
+    module = _load_module()
+    calls = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.starts = []
+
+        def start(self, timeout_ms):
+            self.starts.append(timeout_ms)
+
+        def stop(self):
+            calls.append("timer_stopped")
+
+    controller = types.SimpleNamespace(
+        initialized=True,
+        applyGlobalSettingsFromThread=lambda parallel=True: calls.append(
+            ("apply_global", parallel)
+        ),
+    )
+    device = object.__new__(module.AMXDevice)
+    device.name = "AMX"
+    device.frequency_khz = 2.0
+    device.controller = controller
+    device.loading = False
+    device.isOn = lambda: True
+    device.getChannels = lambda: []
+    device._globalSettingsApplyTimer = FakeTimer()
+    device._update_status_widgets = lambda: calls.append("status")
+
+    module.AMXDevice._frequency_widget_changed(device, 4.0)
+
+    assert device.frequency_khz == 4.0
+    assert device._globalSettingsApplyTimer.starts == [
+        module._AMX_NUMERIC_DEBOUNCE_MS,
+    ]
+    assert calls == ["status"]
+
+    module.AMXDevice._apply_global_settings_now(device)
+
+    assert calls == ["status", ("apply_global", True)]
+
+
+def test_amx_channel_value_change_is_debounced_until_timer_fires():
+    module = _load_module()
+    calls = []
+
+    class FakeTimer:
+        def __init__(self):
+            self.starts = []
+
+        def start(self, timeout_ms):
+            self.starts.append(timeout_ms)
+
+        def stop(self):
+            calls.append("timer_stopped")
+
+    channel = object.__new__(module.AMXChannel)
+    channel.channelParent = types.SimpleNamespace(
+        loading=False,
+        controller=types.SimpleNamespace(
+            applyValueFromThread=lambda channel, parallel=True: calls.append(
+                ("apply_value", channel.pulser_number(), parallel)
+            )
+        ),
+    )
+    channel.id = 2
+    channel._valueApplyTimer = FakeTimer()
+    channel._update_duty_label = lambda: calls.append("duty")
+    channel._sync_monitor_feedback = lambda: calls.append("feedback")
+    channel.applyValue = lambda apply=True: calls.append(("legacy_apply", apply))
+
+    module.AMXChannel.valueChanged(channel)
+
+    assert channel._valueApplyTimer.starts == [module._AMX_NUMERIC_DEBOUNCE_MS]
+    assert calls == ["duty", "feedback"]
+
+    module.AMXChannel._apply_value_now(channel)
+
+    assert calls == ["duty", "feedback", ("apply_value", 2, True)]
+
+
+def test_amx_global_settings_queue_keeps_latest_pending_request(monkeypatch):
+    module = _load_module()
+    created_threads = []
+    applied = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            created_threads.append(self)
+
+        def start(self):
+            return None
+
+    parent = types.SimpleNamespace(name="AMX")
+    controller = module.AMXController(parent)
+    controller.applyGlobalSettings = lambda: applied.append("global")
+    monkeypatch.setattr(module, "Thread", FakeThread)
+
+    controller.applyGlobalSettingsFromThread(parallel=True)
+    controller.applyGlobalSettingsFromThread(parallel=True)
+    controller.applyGlobalSettingsFromThread(parallel=True)
+
+    assert len(created_threads) == 1
+
+    created_threads[0].target()
+
+    assert applied == ["global"]
+    assert controller._global_apply_worker_running is False
+
+
+def test_amx_channel_timing_queue_keeps_latest_per_pulser(monkeypatch):
+    module = _load_module()
+    created_threads = []
+    applied = []
+
+    class FakeThread:
+        def __init__(self, *, target, name=None, daemon=None):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            created_threads.append(self)
+
+        def start(self):
+            return None
+
+    class FakeChannel:
+        def __init__(self, pulser, value):
+            self.id = pulser
+            self.value = value
+
+        def pulser_number(self):
+            return self.id
+
+    parent = types.SimpleNamespace(name="AMX")
+    controller = module.AMXController(parent)
+    controller.applyValue = lambda channel: applied.append(
+        (channel.pulser_number(), channel.value)
+    )
+    monkeypatch.setattr(module, "Thread", FakeThread)
+
+    first = FakeChannel(1, 1.0)
+    latest = FakeChannel(1, 2.0)
+    other = FakeChannel(2, 3.0)
+    controller.applyValueFromThread(first, parallel=True)
+    controller.applyValueFromThread(latest, parallel=True)
+    controller.applyValueFromThread(other, parallel=True)
+
+    assert len(created_threads) == 1
+
+    created_threads[0].target()
+
+    assert applied == [(1, 2.0), (2, 3.0)]
+    assert controller._channel_apply_worker_running is False
