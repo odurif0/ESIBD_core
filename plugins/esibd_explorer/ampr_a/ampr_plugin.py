@@ -2352,7 +2352,7 @@ class AMPRController(DeviceController):
         if getter is None:
             return None
         try:
-            status, _state_hex, state = getter()
+            status, _state_hex, state = getter(timeout_s=float(self.controllerParent.poll_timeout_s))
         except Exception:  # noqa: BLE001
             return None
         if status != getattr(device, "NO_ERR", status):
@@ -2401,7 +2401,14 @@ class AMPRController(DeviceController):
             sync_local()
 
     @contextlib.contextmanager
-    def _controller_lock_section(self, timeout_message: str):
+    def _controller_lock_section(
+        self,
+        timeout_message: str,
+        *,
+        already_acquired: bool = False,
+        timeout_s: float = 1.0,
+        log_timeout: bool = True,
+    ):
         """Acquire the controller lock without swallowing hardware exceptions."""
         lock = getattr(self, "lock", None)
         if lock is None:
@@ -2411,8 +2418,12 @@ class AMPRController(DeviceController):
         acquire = getattr(lock, "acquire", None)
         release = getattr(lock, "release", None)
         if callable(acquire) and callable(release):
-            if not acquire(timeout=1):
-                self.print(timeout_message, flag=PRINT.ERROR)
+            if already_acquired:
+                yield
+                return
+            if not acquire(timeout=float(timeout_s)):
+                if log_timeout:
+                    self.print(timeout_message, flag=PRINT.ERROR)
                 raise TimeoutError(timeout_message)
             try:
                 yield
@@ -2420,7 +2431,10 @@ class AMPRController(DeviceController):
                 release()
             return
 
-        with lock.acquire_timeout(1, timeoutMessage=timeout_message) as lock_acquired:
+        with lock.acquire_timeout(
+            float(timeout_s),
+            timeoutMessage=timeout_message if log_timeout else "",
+        ) as lock_acquired:
             if not lock_acquired:
                 raise TimeoutError(timeout_message)
             yield

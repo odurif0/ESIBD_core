@@ -2790,6 +2790,8 @@ class DMMRController(DeviceController):
         timeout_message: str,
         *,
         already_acquired: bool = False,
+        timeout_s: float = 1.0,
+        log_timeout: bool = True,
     ):
         """Acquire the controller lock without swallowing hardware exceptions."""
         lock = getattr(self, "lock", None)
@@ -2800,11 +2802,13 @@ class DMMRController(DeviceController):
         acquire_timeout = getattr(lock, "acquire_timeout", None)
         if callable(acquire_timeout):
             with acquire_timeout(
-                1,
-                timeoutMessage=timeout_message,
+                float(timeout_s),
+                timeoutMessage=timeout_message if log_timeout else "",
                 already_acquired=already_acquired,
             ) as lock_acquired:
                 if not lock_acquired:
+                    if log_timeout:
+                        self.print(timeout_message, flag=PRINT.ERROR)
                     raise TimeoutError(timeout_message)
                 yield
             return
@@ -2815,8 +2819,9 @@ class DMMRController(DeviceController):
             if already_acquired:
                 yield
                 return
-            if not acquire(timeout=1):
-                self.print(timeout_message, flag=PRINT.ERROR)
+            if not acquire(timeout=float(timeout_s)):
+                if log_timeout:
+                    self.print(timeout_message, flag=PRINT.ERROR)
                 raise TimeoutError(timeout_message)
             try:
                 yield

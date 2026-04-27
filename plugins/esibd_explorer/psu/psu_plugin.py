@@ -4390,7 +4390,9 @@ class PSUController(DeviceController):
                     start_acquisition()
                 self.print(message)
             else:
-                self.shutdownCommunication()
+                shutdown_confirmed = self.shutdownCommunication()
+                if not shutdown_confirmed:
+                    self._restore_on_ui_state()
                 return
         except Exception as exc:  # noqa: BLE001
             self.errorCount += 1
@@ -4579,6 +4581,15 @@ class PSUController(DeviceController):
         if hasattr(self.controllerParent, "onAction"):
             self.controllerParent.onAction.state = False
 
+    def _restore_on_ui_state(self) -> None:
+        """Restore toolbar ON/OFF widgets back to ON after a failed shutdown."""
+        sync_on_state = getattr(self.controllerParent, "_set_on_ui_state", None)
+        if callable(sync_on_state):
+            sync_on_state(True)
+            return
+        if hasattr(self.controllerParent, "onAction"):
+            self.controllerParent.onAction.state = True
+
     @contextlib.contextmanager
     def _controller_lock_section(
         self,
@@ -4631,4 +4642,7 @@ class PSUController(DeviceController):
             self.transition_target_on = None
 
     def _format_exception(self, exc: Exception) -> str:
-        return str(exc).strip()
+        message = str(exc).strip()
+        if message:
+            return f"{type(exc).__name__}: {message}"
+        return repr(exc)
