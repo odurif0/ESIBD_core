@@ -1,6 +1,6 @@
 # ESIBD Explorer Plugins
 
-Ready-to-use plugin bundle for [ESIBD Explorer](https://github.com/odurif0/esibd-explorer).
+Ready-to-use plugin bundle for [ESIBD Explorer](https://github.com/ioneater/ESIBD-Explorer).
 
 One plugin for one device.
 
