@@ -1,50 +1,74 @@
-# ESIBD_core
+# ESIBD Explorer Plugins
 
-Base repository for ESIBD instrumentation drivers.
+Ready-to-use plugin bundle for [ESIBD Explorer](https://github.com/odurif0/esibd-explorer).
 
-## Scope
+## Available Plugins
 
-This repository is intended to host multiple instrument drivers over time.
+| Plugin   | Description |
+|----------|-------------|
+| `ampr_a` | Drives AMPR_A high-voltage channels and monitors output voltages |
+| `ampr_b` | Drives AMPR_B high-voltage channels and monitors output voltages |
+| `psu`    | Drives the 2 PSU outputs and monitors voltage/current readbacks |
+| `dmmr`   | Reads DMMR module currents and monitors live picoammeter values |
+| `amx`    | Drives AMX frequency and pulser timing and monitors pulser readbacks |
 
-Current package families:
-- `cgc`
+> **AMPR_A vs AMPR_B**: identical hardware driver, different plugin identity — use
+> both when operating two AMPR controllers simultaneously in ESIBD Explorer.
 
-Current implemented CGC instruments:
-- `cgc.ampr`
-- `cgc.amx`
-- `cgc.dmmr`
-- `cgc.psu`
+## Quick Start
+
+1. **Download the latest release** `esibd-explorer-plugins-v0.1.0.zip` from the
+   [Releases page](https://github.com/odurif0/esibd-explorer-plugins/releases).
+
+2. **Extract the zip** into your ESIBD Explorer `plugins` folder.
+   The extracted directory structure should look like this:
+
+   ```
+   <ESIBD Explorer>/plugins/
+   ├── ampr_a/
+   ├── ampr_b/
+   ├── psu/
+   ├── dmmr/
+   └── amx/
+   ```
+
+3. **Set the `plugin path`** in ESIBD Explorer to point at that `plugins` folder,
+   then restart.
+
+4. **Enable** the plugins you need in the Plugin Manager.
+
+## Requirements
+
+- ESIBD Explorer `1.0.1` or later on Windows
 
 ## Repository Layout
 
-- `src/<manufacturer>/`: driver packages for each manufacturer
-- `src/cgc/`: CGC instrument family
-- `plugins/esibd_explorer/`: external ESIBD Explorer plugins backed by this repository
-- `tests/<manufacturer>/`: regression tests grouped by manufacturer
-- `docs/examples/<manufacturer>/`: small usage examples grouped by manufacturer
-- `docs/notebooks/<manufacturer>/`: manual documentation and hardware-test notebooks
-
-## Instrument-Specific Documentation
-
-- CGC family: [`src/cgc/README.md`](src/cgc/README.md)
-- AMPR: [`src/cgc/ampr/README.md`](src/cgc/ampr/README.md)
-- AMX: [`src/cgc/amx/README.md`](src/cgc/amx/README.md)
-- DMMR: [`src/cgc/dmmr/README.md`](src/cgc/dmmr/README.md)
-- PSU: [`src/cgc/psu/README.md`](src/cgc/psu/README.md)
-- ESIBD Explorer AMPR_A plugin (self-contained): [`plugins/esibd_explorer/ampr_a/README.md`](plugins/esibd_explorer/ampr_a/README.md)
-- ESIBD Explorer AMPR_B plugin (self-contained): [`plugins/esibd_explorer/ampr_b/README.md`](plugins/esibd_explorer/ampr_b/README.md)
-- CGC notebooks: [`docs/notebooks/cgc/README.md`](docs/notebooks/cgc/README.md)
-
-## Installation
-
-### Install
-
-```powershell
-python -m pip install --no-cache-dir git+https://github.com/odurif0/ESIBD_core.git
+```
+esibd-explorer-plugins/
+├── README.md
+├── ampr_a/            # AMPR_A plugin (self-contained)
+├── ampr_b/            # AMPR_B plugin (self-contained)
+├── psu/               # PSU plugin (self-contained)
+├── dmmr/              # DMMR plugin (self-contained)
+├── amx/               # AMX plugin (self-contained)
+└── tests/             # Plugin packaging and behavior tests
 ```
 
-### Update
+Each plugin is self-contained with its own `vendor/runtime/` subtree. To copy a
+plugin elsewhere, move its entire directory — the embedded runtime must travel
+with it.
+
+## Running Tests
 
 ```powershell
-python -m pip install --force-reinstall --no-cache-dir git+https://github.com/odurif0/ESIBD_core.git
+pytest tests/
 ```
+
+Tests validate plugin packaging, runtime integrity, and behavior contracts
+against the ESIBD Explorer plugin API without requiring a running Explorer
+instance.
+
+## Portability
+
+To use a single plugin on another machine, copy its entire directory (including
+`vendor/`). The plugin has no dependency on the rest of this repository.
