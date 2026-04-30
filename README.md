@@ -31,7 +31,10 @@ One plugin for one device.
    └── amx/
    ```
 
-3. **Enable** the plugins you need in the Plugin Manager. That's it!
+3. **Enable** the plugins you need in the Plugin Manager.
+
+4. **Select the correct COM port** in the plugin settings for each device
+   you want to control. That's it!
 
 ## Requirements
 
